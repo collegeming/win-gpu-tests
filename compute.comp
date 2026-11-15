@@ -1,0 +1,12 @@
+#version 450
+// Minimal compute kernel for the Windows ARM64 panvk bring-up test.
+// Dispatch 4 workgroups of 64 invocations over 256 uints and add one to each.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer B {
+    uint v[];
+};
+
+void main() {
+    v[gl_GlobalInvocationID.x] += 1u;
+}

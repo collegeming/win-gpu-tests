@@ -13,4 +13,14 @@ prints `name=0/1` for every feature DXVK 2.7 marks as required, followed by a
 different path as argv[1].  Exit code is 0 when the DXVK requirement set is
 met, 2 when something is missing, 1 on a probe error.
 
+`test_vk_compute.cpp` is a loader-free Vulkan compute round trip.  It creates a
+device on queue family 0, allocates a 256-uint storage buffer, runs the kernel
+in `compute.comp` (`v[i] += 1`) over four workgroups of 64 invocations, submits
+with a fence, waits, maps the memory back and verifies every element.  It uses
+a `HOST_VISIBLE|HOST_COHERENT` buffer when available and falls back to a
+device-local buffer plus a host-visible staging buffer with `vkCmdCopyBuffer`.
+`compute_spirv.h` is generated in CI from `compute.comp` by the `spirv` job
+(`glslangValidator -V --target-env vulkan1.0` then `xxd -i`); regenerate it
+locally with those two commands, it is not checked in.
+
 Build-only; no device credentials.

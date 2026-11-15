@@ -6,15 +6,43 @@ on:
     paths:
       - 'test_d3d11.cpp'
       - 'test_vk_features.cpp'
+      - 'test_vk_compute.cpp'
+      - 'compute.comp'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
   contents: read
 jobs:
+  spirv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends glslang-tools
+      - name: Compile compute.comp to SPIR-V
+        run: |
+          set -euo pipefail
+          glslangValidator --version
+          glslangValidator -V --target-env vulkan1.0 compute.comp -o compute.spv
+          xxd -i -n compute_spirv compute.spv > compute_spirv.h
+          ls -l compute.spv compute_spirv.h
+          head -2 compute_spirv.h
+          tail -1 compute_spirv.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compute-spirv
+          path: compute_spirv.h
+          if-no-files-found: error
   build:
+    needs: spirv
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: compute-spirv
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
@@ -30,6 +58,13 @@ jobs:
           cl /nologo /EHsc /O2 /std:c++17 /I third_party\vulkan\include test_vk_features.cpp /Fe:vk_features_arm64.exe
           if errorlevel 1 exit /b 1
           powershell -NoProfile -Command "$h=Get-FileHash .\vk_features_arm64.exe -Algorithm SHA256; $h.Hash | Tee-Object SHA256SUMS-vk.txt; $b=[IO.File]::ReadAllBytes((Resolve-Path .\vk_features_arm64.exe)); $e=[BitConverter]::ToInt32($b,0x3c); 'machine=0x{0:x4}' -f [BitConverter]::ToUInt16($b,$e+4)"
+      - name: Build Vulkan compute test
+        shell: cmd
+        run: |
+          powershell -NoProfile -Command "'spirv header: ' + (Get-FileHash .\compute_spirv.h -Algorithm SHA256).Hash"
+          cl /nologo /EHsc /O2 /std:c++17 /I third_party\vulkan\include test_vk_compute.cpp /Fe:vk_compute_arm64.exe
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -Command "$h=Get-FileHash .\vk_compute_arm64.exe -Algorithm SHA256; $h.Hash | Tee-Object SHA256SUMS-compute.txt; $b=[IO.File]::ReadAllBytes((Resolve-Path .\vk_compute_arm64.exe)); $e=[BitConverter]::ToInt32($b,0x3c); 'machine=0x{0:x4}' -f [BitConverter]::ToUInt16($b,$e+4)"
       - uses: actions/upload-artifact@v4
         with:
           name: test-d3d11-arm64
@@ -43,4 +78,11 @@ jobs:
           path: |
             vk_features_arm64.exe
             SHA256SUMS-vk.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-vk-compute-arm64
+          path: |
+            vk_compute_arm64.exe
+            SHA256SUMS-compute.txt
           if-no-files-found: error
