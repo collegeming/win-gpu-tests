@@ -21,7 +21,10 @@ a `HOST_VISIBLE|HOST_COHERENT` buffer when available and falls back to a
 device-local buffer plus a host-visible staging buffer with `vkCmdCopyBuffer`.
 `--nop` selects the empty kernel in `compute_nop.comp` (no descriptors) and
 verifies the buffer comes back unchanged, which separates "compute pipelines
-cannot be created" from "this storage-buffer shader cannot be compiled".
+cannot be created" from "this storage-buffer shader cannot be compiled";
+`--layout` keeps the empty kernel but still creates the storage-buffer
+descriptor set layout, so the descriptor path and the shader compilation can be
+told apart.
 `compute_spirv.h` and `compute_nop_spirv.h` are generated in CI from the
 `.comp` sources by the `spirv` job (`glslangValidator -V --target-env
 vulkan1.0` then `xxd -i`); regenerate them locally with those commands, they

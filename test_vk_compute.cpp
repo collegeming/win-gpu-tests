@@ -269,21 +269,26 @@ int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     const char *dll = "C:\\panvk\\dev_vulkan_virtio.dll";
-    bool nop_mode = false;
+    bool nop_shader = false;
+    bool use_layout = true;
     for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "--nop") || !std::strcmp(argv[i], "--shader=nop"))
-            nop_mode = true;
-        else if (argv[i][0] != '-' && argv[i][0] != '\0')
+        if (!std::strcmp(argv[i], "--nop") || !std::strcmp(argv[i], "--shader=nop")) {
+            nop_shader = true;
+            use_layout = false;
+        } else if (!std::strcmp(argv[i], "--layout")) {
+            nop_shader = true;
+        } else if (argv[i][0] != '-' && argv[i][0] != '\0') {
             dll = argv[i];
+        }
     }
-    // --nop runs an empty kernel with no descriptors, to separate "compute
-    // pipelines cannot be created at all" from "this storage-buffer shader
-    // cannot be compiled".
-    const unsigned char *spirv_blob = nop_mode ? compute_nop_spirv : compute_spirv;
-    const unsigned int spirv_bytes = nop_mode ? compute_nop_spirv_len : compute_spirv_len;
+    // --nop    : empty kernel, no descriptor set layout at all
+    // --layout : empty kernel but the full storage-buffer set layout
+    // default  : the storage-buffer kernel from compute.comp
+    const unsigned char *spirv_blob = nop_shader ? compute_nop_spirv : compute_spirv;
+    const unsigned int spirv_bytes = nop_shader ? compute_nop_spirv_len : compute_spirv_len;
 
     std::printf("probe=vk_compute\n");
-    std::printf("mode=%s\n", nop_mode ? "nop" : "ssbo");
+    std::printf("mode=%s\n", nop_shader ? (use_layout ? "layout" : "nop") : "ssbo");
     std::printf("icd_path=%s\n", dll);
     {
         unsigned magic = 0;
@@ -630,7 +635,7 @@ int main(int argc, char **argv) {
         }
         api.UnmapMemory(dev, upload_mem);
 
-        if (!nop_mode) {
+        if (use_layout) {
             VkDescriptorSetLayoutBinding binding{};
             binding.binding = 0;
             binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -650,15 +655,15 @@ int main(int argc, char **argv) {
 
         VkPipelineLayoutCreateInfo plci{};
         plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plci.setLayoutCount = nop_mode ? 0u : 1u;
-        plci.pSetLayouts = nop_mode ? nullptr : &set_layout;
+        plci.setLayoutCount = use_layout ? 1u : 0u;
+        plci.pSetLayouts = use_layout ? &set_layout : nullptr;
         if (!ok("vkCreatePipelineLayout",
                 api.CreatePipelineLayout(dev, &plci, nullptr, &pipeline_layout))) {
             fail_reason = "vkCreatePipelineLayout";
             break;
         }
 
-        if (!nop_mode) {
+        if (use_layout) {
             VkDescriptorPoolSize pool_size{};
             pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             pool_size.descriptorCount = 1;
@@ -793,7 +798,7 @@ int main(int argc, char **argv) {
         }
 
         api.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        if (!nop_mode)
+        if (use_layout)
             api.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
                                       &set, 0, nullptr);
 
@@ -873,7 +878,7 @@ int main(int argc, char **argv) {
             }
         }
         const uint32_t *out = static_cast<const uint32_t *>(rmap);
-        const uint32_t delta = nop_mode ? 0u : 1u;
+        const uint32_t delta = nop_shader ? 0u : 1u;
         for (uint32_t i = 0; i < kElements; i++) {
             const uint32_t expected = i + delta;
             if (out[i] != expected) {
@@ -942,7 +947,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     std::printf("verified %u elements in %s mode, expected value per element = i%s\n",
-                (unsigned)kElements, nop_mode ? "nop" : "ssbo", nop_mode ? "" : "+1");
+                (unsigned)kElements, nop_shader ? (use_layout ? "layout" : "nop") : "ssbo", nop_shader ? "" : "+1");
     std::printf("RESULT: PASS\n");
     return 0;
 }
