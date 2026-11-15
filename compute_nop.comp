@@ -1,0 +1,8 @@
+#version 450
+// Empty compute kernel: same launch geometry, no descriptor access.
+// Used to tell "compute pipelines are broken" apart from "this shader's
+// storage buffer access is broken" on the Windows ARM64 panvk build.
+layout(local_size_x = 64) in;
+
+void main() {
+}

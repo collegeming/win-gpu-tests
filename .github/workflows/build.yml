@@ -8,6 +8,7 @@ on:
       - 'test_vk_features.cpp'
       - 'test_vk_compute.cpp'
       - 'compute.comp'
+      - 'compute_nop.comp'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -26,14 +27,19 @@ jobs:
           set -euo pipefail
           glslangValidator --version
           glslangValidator -V --target-env vulkan1.0 compute.comp -o compute.spv
+          glslangValidator -V --target-env vulkan1.0 compute_nop.comp -o compute_nop.spv
           xxd -i -n compute_spirv compute.spv > compute_spirv.h
-          ls -l compute.spv compute_spirv.h
+          xxd -i -n compute_nop_spirv compute_nop.spv > compute_nop_spirv.h
+          ls -l compute.spv compute_nop.spv compute_spirv.h compute_nop_spirv.h
           head -2 compute_spirv.h
           tail -1 compute_spirv.h
+          tail -1 compute_nop_spirv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
-          path: compute_spirv.h
+          path: |
+            compute_spirv.h
+            compute_nop_spirv.h
           if-no-files-found: error
   build:
     needs: spirv

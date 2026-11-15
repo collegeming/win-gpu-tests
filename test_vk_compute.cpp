@@ -23,6 +23,7 @@
 #define VK_NO_PROTOTYPES
 #include "third_party/vulkan/include/vulkan/vulkan_core.h"
 #include "compute_spirv.h"
+#include "compute_nop_spirv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -267,19 +268,32 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
 int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    const char *dll = (argc > 1) ? argv[1] : "C:\\panvk\\dev_vulkan_virtio.dll";
+    const char *dll = "C:\\panvk\\dev_vulkan_virtio.dll";
+    bool nop_mode = false;
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--nop") || !std::strcmp(argv[i], "--shader=nop"))
+            nop_mode = true;
+        else if (argv[i][0] != '-' && argv[i][0] != '\0')
+            dll = argv[i];
+    }
+    // --nop runs an empty kernel with no descriptors, to separate "compute
+    // pipelines cannot be created at all" from "this storage-buffer shader
+    // cannot be compiled".
+    const unsigned char *spirv_blob = nop_mode ? compute_nop_spirv : compute_spirv;
+    const unsigned int spirv_bytes = nop_mode ? compute_nop_spirv_len : compute_spirv_len;
 
     std::printf("probe=vk_compute\n");
+    std::printf("mode=%s\n", nop_mode ? "nop" : "ssbo");
     std::printf("icd_path=%s\n", dll);
     {
         unsigned magic = 0;
-        if (compute_spirv_len >= 4) {
-            magic = (unsigned)compute_spirv[0] | ((unsigned)compute_spirv[1] << 8) |
-                    ((unsigned)compute_spirv[2] << 16) | ((unsigned)compute_spirv[3] << 24);
+        if (spirv_bytes >= 4) {
+            magic = (unsigned)spirv_blob[0] | ((unsigned)spirv_blob[1] << 8) |
+                    ((unsigned)spirv_blob[2] << 16) | ((unsigned)spirv_blob[3] << 24);
         }
-        std::printf("spirv_bytes=%u spirv_magic=0x%08x\n", (unsigned)compute_spirv_len, magic);
+        std::printf("spirv_bytes=%u spirv_magic=0x%08x\n", spirv_bytes, magic);
     }
-    if (compute_spirv_len == 0 || (compute_spirv_len % 4) != 0) {
+    if (spirv_bytes == 0 || (spirv_bytes % 4) != 0) {
         std::printf("ERROR: embedded SPIR-V blob is empty or not word aligned\n");
         std::printf("RESULT: FAIL\n");
         return 1;
@@ -616,78 +630,84 @@ int main(int argc, char **argv) {
         }
         api.UnmapMemory(dev, upload_mem);
 
-        VkDescriptorSetLayoutBinding binding{};
-        binding.binding = 0;
-        binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        binding.descriptorCount = 1;
-        binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        if (!nop_mode) {
+            VkDescriptorSetLayoutBinding binding{};
+            binding.binding = 0;
+            binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            binding.descriptorCount = 1;
+            binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-        VkDescriptorSetLayoutCreateInfo dslci{};
-        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dslci.bindingCount = 1;
-        dslci.pBindings = &binding;
-        if (!ok("vkCreateDescriptorSetLayout",
-                api.CreateDescriptorSetLayout(dev, &dslci, nullptr, &set_layout))) {
-            fail_reason = "vkCreateDescriptorSetLayout";
-            break;
+            VkDescriptorSetLayoutCreateInfo dslci{};
+            dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            dslci.bindingCount = 1;
+            dslci.pBindings = &binding;
+            if (!ok("vkCreateDescriptorSetLayout",
+                    api.CreateDescriptorSetLayout(dev, &dslci, nullptr, &set_layout))) {
+                fail_reason = "vkCreateDescriptorSetLayout";
+                break;
+            }
         }
 
         VkPipelineLayoutCreateInfo plci{};
         plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plci.setLayoutCount = 1;
-        plci.pSetLayouts = &set_layout;
+        plci.setLayoutCount = nop_mode ? 0u : 1u;
+        plci.pSetLayouts = nop_mode ? nullptr : &set_layout;
         if (!ok("vkCreatePipelineLayout",
                 api.CreatePipelineLayout(dev, &plci, nullptr, &pipeline_layout))) {
             fail_reason = "vkCreatePipelineLayout";
             break;
         }
 
-        VkDescriptorPoolSize pool_size{};
-        pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_size.descriptorCount = 1;
+        if (!nop_mode) {
+            VkDescriptorPoolSize pool_size{};
+            pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            pool_size.descriptorCount = 1;
 
-        VkDescriptorPoolCreateInfo dpci{};
-        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets = 1;
-        dpci.poolSizeCount = 1;
-        dpci.pPoolSizes = &pool_size;
-        if (!ok("vkCreateDescriptorPool",
-                api.CreateDescriptorPool(dev, &dpci, nullptr, &pool))) {
-            fail_reason = "vkCreateDescriptorPool";
-            break;
+            VkDescriptorPoolCreateInfo dpci{};
+            dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            dpci.maxSets = 1;
+            dpci.poolSizeCount = 1;
+            dpci.pPoolSizes = &pool_size;
+            if (!ok("vkCreateDescriptorPool",
+                    api.CreateDescriptorPool(dev, &dpci, nullptr, &pool))) {
+                fail_reason = "vkCreateDescriptorPool";
+                break;
+            }
+
+            VkDescriptorSetAllocateInfo dsai{};
+            dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            dsai.descriptorPool = pool;
+            dsai.descriptorSetCount = 1;
+            dsai.pSetLayouts = &set_layout;
+            if (!ok("vkAllocateDescriptorSets", api.AllocateDescriptorSets(dev, &dsai, &set))) {
+                fail_reason = "vkAllocateDescriptorSets";
+                break;
+            }
+
+            VkDescriptorBufferInfo dbi{};
+            dbi.buffer = storage_buf;
+            dbi.offset = 0;
+            dbi.range = VK_WHOLE_SIZE;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = set;
+            write.dstBinding = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &dbi;
+            api.UpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+            std::printf("descriptor_set updated buffer=%p\n", (void *)storage_buf);
+        } else {
+            std::printf("descriptor_set skipped (nop shader has no bindings)\n");
         }
-
-        VkDescriptorSetAllocateInfo dsai{};
-        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        dsai.descriptorPool = pool;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts = &set_layout;
-        if (!ok("vkAllocateDescriptorSets", api.AllocateDescriptorSets(dev, &dsai, &set))) {
-            fail_reason = "vkAllocateDescriptorSets";
-            break;
-        }
-
-        VkDescriptorBufferInfo dbi{};
-        dbi.buffer = storage_buf;
-        dbi.offset = 0;
-        dbi.range = VK_WHOLE_SIZE;
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = set;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &dbi;
-        api.UpdateDescriptorSets(dev, 1, &write, 0, nullptr);
-        std::printf("descriptor_set updated buffer=%p\n", (void *)storage_buf);
 
         // SPIR-V must be 4-byte aligned: copy the byte array into a uint32_t vector.
-        std::vector<uint32_t> spirv(compute_spirv_len / 4);
-        std::memcpy(spirv.data(), compute_spirv, compute_spirv_len);
+        std::vector<uint32_t> spirv(spirv_bytes / 4);
+        std::memcpy(spirv.data(), spirv_blob, spirv_bytes);
 
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        smci.codeSize = compute_spirv_len;
+        smci.codeSize = spirv_bytes;
         smci.pCode = spirv.data();
         if (!ok("vkCreateShaderModule", api.CreateShaderModule(dev, &smci, nullptr, &shader))) {
             fail_reason = "vkCreateShaderModule";
@@ -773,8 +793,9 @@ int main(int argc, char **argv) {
         }
 
         api.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        api.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &set,
-                                  0, nullptr);
+        if (!nop_mode)
+            api.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
+                                      &set, 0, nullptr);
 
         const uint32_t workgroups = (kElements + 63) / 64;
         std::printf("dispatch workgroups=(%u,1,1) local_size=64 invocations=%u elements=%u\n",
@@ -852,8 +873,9 @@ int main(int argc, char **argv) {
             }
         }
         const uint32_t *out = static_cast<const uint32_t *>(rmap);
+        const uint32_t delta = nop_mode ? 0u : 1u;
         for (uint32_t i = 0; i < kElements; i++) {
-            const uint32_t expected = i + 1u;
+            const uint32_t expected = i + delta;
             if (out[i] != expected) {
                 if (mismatches == 0) {
                     first_bad = i;
@@ -919,7 +941,8 @@ int main(int argc, char **argv) {
         std::printf("RESULT: FAIL\n");
         return 1;
     }
-    std::printf("verified %u elements, all values incremented by one\n", (unsigned)kElements);
+    std::printf("verified %u elements in %s mode, expected value per element = i%s\n",
+                (unsigned)kElements, nop_mode ? "nop" : "ssbo", nop_mode ? "" : "+1");
     std::printf("RESULT: PASS\n");
     return 0;
 }

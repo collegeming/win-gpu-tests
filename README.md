@@ -19,8 +19,12 @@ in `compute.comp` (`v[i] += 1`) over four workgroups of 64 invocations, submits
 with a fence, waits, maps the memory back and verifies every element.  It uses
 a `HOST_VISIBLE|HOST_COHERENT` buffer when available and falls back to a
 device-local buffer plus a host-visible staging buffer with `vkCmdCopyBuffer`.
-`compute_spirv.h` is generated in CI from `compute.comp` by the `spirv` job
-(`glslangValidator -V --target-env vulkan1.0` then `xxd -i`); regenerate it
-locally with those two commands, it is not checked in.
+`--nop` selects the empty kernel in `compute_nop.comp` (no descriptors) and
+verifies the buffer comes back unchanged, which separates "compute pipelines
+cannot be created" from "this storage-buffer shader cannot be compiled".
+`compute_spirv.h` and `compute_nop_spirv.h` are generated in CI from the
+`.comp` sources by the `spirv` job (`glslangValidator -V --target-env
+vulkan1.0` then `xxd -i`); regenerate them locally with those commands, they
+are not checked in.
 
 Build-only; no device credentials.
