@@ -31,7 +31,7 @@ int main() {
     if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi)) &&
         SUCCEEDED(dxgi->GetAdapter(&adapter)) &&
         SUCCEEDED(adapter->GetDesc(&desc))) {
-        std::wprintf(L"adapter: %s vendor=0x%04x device=0x%04x\n",
+        wprintf(L"adapter: %s vendor=0x%04x device=0x%04x\n",
                      desc.Description, desc.VendorId, desc.DeviceId);
     }
 
