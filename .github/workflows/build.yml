@@ -3,7 +3,11 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['test_d3d11.cpp', '.github/workflows/build.yml']
+    paths:
+      - 'test_d3d11.cpp'
+      - 'test_vk_features.cpp'
+      - 'third_party/**'
+      - '.github/workflows/build.yml'
 permissions:
   contents: read
 jobs:
@@ -14,16 +18,29 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
-      - name: Build
+      - name: Build D3D11 smoke test
         shell: cmd
         run: |
           cl /nologo /EHsc /O2 /std:c++17 test_d3d11.cpp /Fe:test_d3d11_arm64.exe d3d11.lib dxgi.lib
           if errorlevel 1 exit /b 1
           powershell -NoProfile -Command "$h=Get-FileHash .\test_d3d11_arm64.exe -Algorithm SHA256; $h.Hash | Tee-Object SHA256SUMS.txt; $b=[IO.File]::ReadAllBytes((Resolve-Path .\test_d3d11_arm64.exe)); $e=[BitConverter]::ToInt32($b,0x3c); 'machine=0x{0:x4}' -f [BitConverter]::ToUInt16($b,$e+4)"
+      - name: Build Vulkan feature probe
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /std:c++17 /I third_party\vulkan\include test_vk_features.cpp /Fe:vk_features_arm64.exe
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -Command "$h=Get-FileHash .\vk_features_arm64.exe -Algorithm SHA256; $h.Hash | Tee-Object SHA256SUMS-vk.txt; $b=[IO.File]::ReadAllBytes((Resolve-Path .\vk_features_arm64.exe)); $e=[BitConverter]::ToInt32($b,0x3c); 'machine=0x{0:x4}' -f [BitConverter]::ToUInt16($b,$e+4)"
       - uses: actions/upload-artifact@v4
         with:
           name: test-d3d11-arm64
           path: |
             test_d3d11_arm64.exe
             SHA256SUMS.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-vk-features-arm64
+          path: |
+            vk_features_arm64.exe
+            SHA256SUMS-vk.txt
           if-no-files-found: error
