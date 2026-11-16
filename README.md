@@ -30,4 +30,20 @@ told apart.
 vulkan1.0` then `xxd -i`); regenerate them locally with those commands, they
 are not checked in.
 
+`test_d3d11_shared_probe.cpp` is a two-process D3D11 shared-texture probe.  The
+producer creates a 256x256 `B8G8R8A8_UNORM` (or `--format rgba8`) texture with
+`D3D11_RESOURCE_MISC_SHARED`, clears known colours, exports a share handle via
+`IDXGIResource::GetSharedHandle`, writes the handle and frame description into
+named shared memory, and waits on named events.  The consumer opens the same
+handle with `OpenSharedResource`, copies each frame to a staging texture and
+validates the pixel.  `--loop` (or `--frames N`) clears a different colour per
+frame, so a stale first-frame read is visible as `MISMATCH`.  `--nthandle`
+switches to `IDXGIResource1::CreateSharedHandle` plus a duplicated NT handle and
+`OpenSharedResource1`.  Each process prints `RESULT: PASS/FAIL`.
+
+```bat
+d3d11_shared_probe_arm64.exe --producer --name demo --loop
+d3d11_shared_probe_arm64.exe --consumer --name demo
+```
+
 Build-only; no device credentials.
