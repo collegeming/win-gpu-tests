@@ -310,6 +310,8 @@ void run(App& a,HINSTANCE instance) {
     a.start=GetTickCount64();
     check(SetTimer(a.window,1,a.o.duration*1000,nullptr)!=0,"SetTimer");
     ShowWindow(a.window,SW_SHOWNOACTIVATE); // do not steal focus from existing user windows
+    check(SetWindowPos(a.window,HWND_TOP,0,0,0,0,SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE)!=0,"SetWindowPos(owned HWND_TOP,noactivate)");
+    log("owned_window_raised=HWND_TOP once noactivate non_TOPMOST; later_occlusion_possible,external_capture_must_confirm_visibility\n");
     check(InvalidateRect(a.window,nullptr,FALSE)!=0,"InvalidateRect");
     MSG msg{};
     for(;;) { int n=GetMessageW(&msg,nullptr,0,0); check(n!=-1,"GetMessageW"); if(!n) break; DispatchMessageW(&msg); }
