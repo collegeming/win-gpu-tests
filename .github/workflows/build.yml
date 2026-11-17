@@ -158,7 +158,7 @@ jobs:
       - name: Build independent GDI and hardware DirectWrite patterns
         shell: cmd
         run: |
-          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 test_display_pattern.cpp /Fe:display_pattern_arm64.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib d2d1.lib dwrite.lib dxgi.lib
+          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 test_display_pattern.cpp /Fe:display_pattern_arm64.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib d2d1.lib dwrite.lib dxgi.lib dwmapi.lib
           if errorlevel 1 exit /b 1
       - name: Self-test and package display patterns (no hardware draw)
         shell: pwsh
@@ -177,6 +177,7 @@ jobs:
           }
           Get-Content "$out\pattern.txt"
           if (-not (Select-String -Path "$out\pattern.txt" -Pattern 'SELF_TEST=PASS' -SimpleMatch -Quiet)) { throw 'Missing self-test PASS' }
+          if (-not (Select-String -Path "$out\pattern.txt" -Pattern 'OBSERVATION_SELF_TEST=PASS' -SimpleMatch -Quiet)) { throw 'Missing observation gate self-test PASS' }
           $before = (Get-FileHash "$out\pattern.txt").Hash
           $p = Start-Process $exe -ArgumentList @('--self-test','--out',"`"$out`"") -PassThru
           if (-not $p.WaitForExit(5000)) { $p.Kill(); throw 'Overwrite test timeout' }
@@ -214,14 +215,37 @@ jobs:
           at most 30000ms, and on timeout terminate ONLY that recorded owned process and mark FAIL.
           Do not kill by executable name or close unrelated windows. Task Scheduler may additionally
           set ExecutionTimeLimit PT30S, but retain process identity and verify it actually stopped.
-          No user-window closing, display/driver changes, menu activation or screenshot/readback.
+          For one bounded foreground observation, use the existing external 30s hard supervisor:
+          display_pattern_arm64.exe --mode gdi --out C:\path\NEW_GDI_DIR --duration 20 --foreground --capture-exe C:\path\display_state_probe_arm64.exe
+          The capture path must be absolute and preverified SHA256:
+          85577ab4c5006f11b8a5fa4417bf8741d98047fc539806fd4693cdd4d6106c52
+          No automatic tool discovery/replacement. Capture is invoked once with --capture --out
+          NEW_GDI_DIR\capture, without --uia; capture source/parameters are unchanged.
+          Start both 20s soft and external 30s hard budgets at process launch, not FIRST_PAINT.
+          External supervision must cover the recorded owned capture child too if the parent hangs.
+          --foreground requests SetForegroundWindow once on our own HWND. OS denial => exit2
+          observation_unavailable; no AttachThreadInput, focus-policy bypass, clicks or TOPMOST.
+          After FIRST_PAINT, READY=metadata_eligible requires identity/foreground/visible/not-iconic/
+          uncloaked/unchanged geometry and no known upper intersecting rectangle. READY expires
+          after 5s or the soft deadline, whichever is first; no activation/capture retries.
+          Pre/post capture snapshots and 50ms checks fail closed; foreground events latch changes.
+          Event delivery/sampling is bounded evidence, NOT proof of no change at every instant.
+          Z-order scan <=64 windows, <=16 intersection records; incomplete/unknown => unavailable.
+          Conservative rectangles can reject transparent/irregular overlays. No titles/content read.
+          Logs contain HWND/PID, own creation FILETIME, UTC FILETIME/ticks, state and geometry only.
+          OBSERVATION=CAPTURE_COMPLETED means capture exit0 and state gates, NOT visible pixels.
+          Independently inspect markers/patches/text and host screenshot; API states are not pixels.
+          GDI and dwrite are separate serial runs, never auto-chain modes after a failure.
+          No user-window closing, display/driver changes, menu activation or in-process readback.
           Launch one mode, take evidence with the separate known-good capture tool, let it exit,
-          then launch the other mode into another new directory. The window does not steal focus.
+          then launch the other mode into another new directory. Default mode does not steal focus;
+          --foreground explicitly opts into one normal self-window activation and requires --capture-exe.
           Borderless non-topmost WS_POPUP, fixed 960x560 PHYSICAL window/client pixels, PMv2
           verified, centered entirely within physical rcWork; no DPI-scaled caption/frame inflation.
           It occludes underlying content only inside its own rectangle, not the taskbar/work-area
-          exterior; after showing it raises ONLY its own HWND once via HWND_TOP + SWP_NOACTIVATE,
-          without moving/resizing it. No HWND_TOPMOST, SetForegroundWindow or user-window changes.
+          exterior; default mode raises ONLY its own HWND once via HWND_TOP + SWP_NOACTIVATE,
+          without moving/resizing it or SetForegroundWindow. --foreground instead requests normal
+          activation once as described above. Neither mode uses HWND_TOPMOST or user-window changes.
           This is not permanent topmost: other/topmost windows may still occlude it; external
           screenshots must confirm actual visibility, not infer drawing failure from an absent pattern.
           Timer/external owned-PID timeout closes it; no caption close button or visible title.
