@@ -72,7 +72,7 @@ jobs:
           New-Item -ItemType Directory r8-package | Out-Null
           & .\vk_r8_swizzle_arm64.exe --self-test | Tee-Object r8-package\self-test.txt
           if ($LASTEXITCODE -ne 0) { throw 'R8 CPU reference self-test failed' }
-          if (-not (Select-String r8-package\self-test.txt -SimpleMatch 'CPU_REFERENCE_SELF_TEST=PASS' -Quiet)) { throw 'Missing CPU PASS' }
+          if (-not (Select-String -Path r8-package\self-test.txt -Pattern 'CPU_REFERENCE_SELF_TEST=PASS' -SimpleMatch -Quiet)) { throw 'Missing CPU PASS' }
           $bytes = [IO.File]::ReadAllBytes((Resolve-Path vk_r8_swizzle_arm64.exe))
           $pe = [BitConverter]::ToInt32($bytes,0x3c)
           if ([BitConverter]::ToUInt16($bytes,$pe+4) -ne 0xaa64) { throw 'Expected ARM64' }
