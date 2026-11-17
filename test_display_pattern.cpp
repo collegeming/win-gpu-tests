@@ -139,7 +139,7 @@ void metadata(const App& a) {
     log("text English rect=24,244,936,302 white_RGB=255,255,255 expected_UTF8=%s\n",utf8(english).c_str());
     log("text Chinese rect=24,324,936,382 yellow_RGB=255,255,0 expected_UTF8=%s\n",utf8(chinese).c_str());
     log("text BlackOnWhite rect=24,424,936,496 expected_background_RGB=255,255,255 expected_text_RGB=0,0,0 expected_UTF8=%s\n",utf8(chinese).c_str());
-    log("title_expected=Display pattern - %s - physical 960x560; title is OS non-client rendering, not this test API\n",utf8(a.o.mode).c_str());
+    log("window_title_metadata=Display pattern - %s - physical 960x560; WS_POPUP borderless, no visible title; reference layout unscaled\n",utf8(a.o.mode).c_str());
     log("No capture, GPU readback, screenshot sync, automatic WARP/software fallback or display changes. External capture only.\n");
     log("duration_is_SOFT_WM_TIMER; acceptance_runner_requires_30s_HARD_cutoff_of_recorded_owned_PID_for_default20; hard_timeout=FAIL\n");
 }
@@ -273,7 +273,9 @@ void run(App& a,HINSTANCE instance) {
     a.dpi=GetDpiForSystem(); check(a.dpi!=0,"GetDpiForSystem");
     WNDCLASSW wc{}; wc.lpfnWndProc=window_proc; wc.hInstance=instance; wc.lpszClassName=L"IndependentDisplayPattern";
     check(RegisterClassW(&wc)!=0,"RegisterClassW");
-    const DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX;
+    const DWORD style=WS_POPUP; // no DPI-scaled caption/frame; fixed physical pattern stays unchanged
+    log("rcWork_physical=%ld,%ld,%ld,%ld window_style=WS_POPUP non_topmost noactivate; own_rect_occludes_underlying_content\n",
+        info.rcWork.left,info.rcWork.top,info.rcWork.right,info.rcWork.bottom);
     RECT outer{0,0,W,H}; check(AdjustWindowRectExForDpi(&outer,style,FALSE,0,a.dpi)!=0,"AdjustWindowRectExForDpi");
     const int width=outer.right-outer.left,height=outer.bottom-outer.top;
     check(width<=info.rcWork.right-info.rcWork.left && height<=info.rcWork.bottom-info.rcWork.top,"960x560 client must fit work area",ERROR_NOT_SUPPORTED);
@@ -295,6 +297,14 @@ void run(App& a,HINSTANCE instance) {
     POINT origin{0,0}; check(ClientToScreen(a.window,&origin)!=0,"ClientToScreen");
     log("DPI window=%u system=%u PMv2 verified client_physical=%ldx%ld origin_screen=%ld,%ld\n",actual_dpi,a.dpi,client.right,client.bottom,origin.x,origin.y);
     check(client.right==W&&client.bottom==H,"physical client dimensions",ERROR_INVALID_DATA);
+    RECT window_rect{}; check(GetWindowRect(a.window,&window_rect)!=0,"GetWindowRect(owned)");
+    log("window_physical=%ld,%ld,%ld,%ld client_physical_screen=%ld,%ld,%ld,%ld unscaled=1\n",
+        window_rect.left,window_rect.top,window_rect.right,window_rect.bottom,origin.x,origin.y,origin.x+W,origin.y+H);
+    check(window_rect.left>=info.rcWork.left&&window_rect.top>=info.rcWork.top&&
+          window_rect.right<=info.rcWork.right&&window_rect.bottom<=info.rcWork.bottom,
+          "owned window must stay inside physical rcWork",ERROR_INVALID_DATA);
+    check(window_rect.right-window_rect.left==W&&window_rect.bottom-window_rect.top==H&&
+          origin.x==window_rect.left&&origin.y==window_rect.top,"borderless window/client equality",ERROR_INVALID_DATA);
     if(a.o.mode==L"dwrite") setup_d2d(a);
     else log("adapter_type=GDI screen DC; no D3D adapter created/claimed\n");
     a.start=GetTickCount64();
@@ -307,6 +317,11 @@ void run(App& a,HINSTANCE instance) {
     log("window_exit=%d painted=%d elapsed_ms=%llu\n",a.result,a.painted?1:0,GetTickCount64()-a.start);
 }
 void self_test() {
+    RECT popup{0,0,W,H};
+    check(AdjustWindowRectExForDpi(&popup,WS_POPUP,FALSE,0,192)!=0,"self-test popup at DPI192");
+    check(popup.left==0&&popup.top==0&&popup.right==W&&popup.bottom==H,
+          "self-test popup has zero nonclient inflation at DPI192",ERROR_INVALID_DATA);
+    log("SELF_TEST popup DPI192 outer=960x560 client=960x560 (geometry only,no visible window)\n");
     wchar_t app[]=L"probe",mode[]=L"--mode",gdi[]=L"gdi",out[]=L"--out",dir[]=L"x",duration[]=L"--duration",bad[]=L"31",good[]=L"30";
     wchar_t* valid[]={app,mode,gdi,out,dir,duration,good}; Options o;
     check(parse(7,valid,o)&&o.duration==30,"self-test parse valid",ERROR_INVALID_DATA);

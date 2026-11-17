@@ -217,8 +217,13 @@ jobs:
           No user-window closing, display/driver changes, menu activation or screenshot/readback.
           Launch one mode, take evidence with the separate known-good capture tool, let it exit,
           then launch the other mode into another new directory. The window does not steal focus.
-          Fixed 960x560 PHYSICAL client pixels, PMv2 verified. Small work area => explicit failure,
-          not silent scaling. pattern.txt records physical client origin/size, DPI/session/desktop,
+          Borderless non-topmost WS_POPUP, fixed 960x560 PHYSICAL window/client pixels, PMv2
+          verified, centered entirely within physical rcWork; no DPI-scaled caption/frame inflation.
+          It occludes underlying content only inside its own rectangle, not the taskbar/work-area
+          exterior; it does not move/minimize other windows or guarantee visibility above other UI.
+          Timer/external owned-PID timeout closes it; no caption close button or visible title.
+          Small work area => explicit failure, not silent scaling. pattern.txt records physical
+          rcWork/window/client bounds and checks containment/equality, DPI/session/desktop,
           API/HRESULT/Win32 failures, font base-face/glyph selection, CPU RGB/BGRA reference and
           every patch/text/mark location and expected string independently of rendered labels.
           GDI: FillRect + TextOutW. DirectWrite is used ONLY for installed base-font selection;
@@ -227,7 +232,7 @@ jobs:
           equal 1 physical client pixel. No DEFAULT/SOFTWARE/WARP or retry on device loss.
           DXGI adapter inventory is informational: actual internal D2D adapter binding is NOT
           proven. Font fallback is NOT traced; glyph absence alone does not prove font root cause.
-          Window title is OS non-client rendering, not either client test API.
+          Window title exists only as metadata; the borderless window does not render a title.
           Colors are CPU-defined UNORM8 RGB, opaque; compare patch interiors, not text antialiasing.
           Exit0 means requested APIs returned success, not visual/hardware correctness. Exit2 means
           failure; preserve pattern.txt. Timer is a normal Win32 message timer, not preemption of a
