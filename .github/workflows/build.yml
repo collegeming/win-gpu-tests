@@ -176,7 +176,7 @@ jobs:
             throw "Pattern self-test exit=$($p.ExitCode)"
           }
           Get-Content "$out\pattern.txt"
-          if (-not (Select-String "$out\pattern.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing self-test PASS' }
+          if (-not (Select-String -Path "$out\pattern.txt" -Pattern 'SELF_TEST=PASS' -SimpleMatch -Quiet)) { throw 'Missing self-test PASS' }
           $before = (Get-FileHash "$out\pattern.txt").Hash
           $p = Start-Process $exe -ArgumentList @('--self-test','--out',"`"$out`"") -PassThru
           if (-not $p.WaitForExit(5000)) { $p.Kill(); throw 'Overwrite test timeout' }
