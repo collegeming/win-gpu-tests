@@ -33,6 +33,9 @@ jobs:
           glslangValidator -V --target-env vulkan1.0 compute_nop.comp -o compute_nop.spv
           xxd -i -n compute_spirv compute.spv > compute_spirv.h
           xxd -i -n compute_nop_spirv compute_nop.spv > compute_nop_spirv.h
+          glslangValidator -V --target-env vulkan1.0 r8_swizzle.comp -o r8_swizzle.spv
+          spirv-val --target-env vulkan1.0 r8_swizzle.spv
+          xxd -i -n r8_swizzle_spirv r8_swizzle.spv > r8_swizzle_spirv.h
           ls -l compute.spv compute_nop.spv compute_spirv.h compute_nop_spirv.h
           head -2 compute_spirv.h
           tail -1 compute_spirv.h
@@ -43,6 +46,8 @@ jobs:
           path: |
             compute_spirv.h
             compute_nop_spirv.h
+            r8_swizzle_spirv.h
+            r8_swizzle.spv
           if-no-files-found: error
   build:
     needs: spirv
@@ -55,6 +60,51 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
+      - name: Build offscreen R8 view-swizzle probe
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /W4 /std:c++17 test_vk_r8_swizzle.cpp /Fe:vk_r8_swizzle_arm64.exe
+          if errorlevel 1 exit /b 1
+      - name: CPU reference self-test and package R8 probe (no Vulkan calls)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory r8-package | Out-Null
+          & .\vk_r8_swizzle_arm64.exe --self-test | Tee-Object r8-package\self-test.txt
+          if ($LASTEXITCODE -ne 0) { throw 'R8 CPU reference self-test failed' }
+          if (-not (Select-String r8-package\self-test.txt -SimpleMatch 'CPU_REFERENCE_SELF_TEST=PASS' -Quiet)) { throw 'Missing CPU PASS' }
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path vk_r8_swizzle_arm64.exe))
+          $pe = [BitConverter]::ToInt32($bytes,0x3c)
+          if ([BitConverter]::ToUInt16($bytes,$pe+4) -ne 0xaa64) { throw 'Expected ARM64' }
+          Copy-Item vk_r8_swizzle_arm64.exe, test_vk_r8_swizzle.cpp, test_vk_compute.cpp, r8_swizzle.comp, r8_swizzle.spv, r8_swizzle_spirv.h, compute_spirv.h, compute_nop_spirv.h r8-package
+          Copy-Item .github\workflows\build.yml r8-package\build-workflow.yml
+          @"
+          source_commit=$env:GITHUB_SHA
+          source_branch=$env:GITHUB_REF_NAME
+          run=https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          run_attempt=$env:GITHUB_RUN_ATTEMPT
+          build_utc=$([DateTime]::UtcNow.ToString('o'))
+          runner=$env:RUNNER_OS/$env:RUNNER_ARCH
+          compiler=MSVC cl /EHsc /O2 /W4 /std:c++17
+          shader=glslang Vulkan1.0 + spirv-val
+          cpu_reference_self_test=PASS
+          hardware_sampling=NOT_TESTED
+          tolerance=1e-5 absolute; finite values required
+          usage=vk_r8_swizzle_arm64.exe --icd ABSOLUTE_ICD_DLL_PATH
+          timeout=owner must impose external 30s deadline on owned PID, fence budget 10s
+          console=redirect stdout/stderr; no GUI/window/activation calls
+          scope=legacy combined image sampler descriptors, same R8 image and queue
+          interpretation=PASS excludes only this minimal scenario; FAIL does not establish text root cause
+          "@ | Set-Content r8-package\BUILDINFO.txt -Encoding utf8
+          Get-ChildItem r8-package -File | Sort-Object Name | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name
+          } | Set-Content r8-package\SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r8-view-swizzle-arm64
+          path: r8-package/
+          if-no-files-found: error
+          retention-days: 30
       - name: Build D3D11 smoke test
         shell: cmd
         run: |
