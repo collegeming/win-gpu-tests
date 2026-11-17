@@ -6,6 +6,7 @@ on:
     paths:
       - 'test_d3d11.cpp'
       - 'test_d3d11_shared_probe.cpp'
+      - 'display_state_probe.cpp'
       - 'test_vk_features.cpp'
       - 'test_vk_compute.cpp'
       - 'compute.comp'
@@ -65,6 +66,94 @@ jobs:
           cl /nologo /EHsc /O2 /std:c++17 test_d3d11_shared_probe.cpp /Fe:d3d11_shared_probe_arm64.exe d3d11.lib dxgi.lib
           if errorlevel 1 exit /b 1
           powershell -NoProfile -Command "$h=Get-FileHash .\d3d11_shared_probe_arm64.exe -Algorithm SHA256; $h.Hash | Tee-Object SHA256SUMS-shared.txt; $b=[IO.File]::ReadAllBytes((Resolve-Path .\d3d11_shared_probe_arm64.exe)); $e=[BitConverter]::ToInt32($b,0x3c); 'machine=0x{0:x4}' -f [BitConverter]::ToUInt16($b,$e+4)"
+      - name: Build read-only display capture probe (GUI ARM64)
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 display_state_probe.cpp /Fe:display_state_probe_arm64.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib ole32.lib oleaut32.lib windowscodecs.lib shell32.lib uiautomationcore.lib
+          if errorlevel 1 exit /b 1
+      - name: Self-test and package display capture probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path .\display_state_probe_arm64.exe).Path
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 24 + 68)
+          if ($machine -ne 0xaa64 -or $subsystem -ne 2) { throw 'Expected ARM64 Windows GUI PE' }
+          $out = Join-Path $env:RUNNER_TEMP ('display-self-test-' + [guid]::NewGuid())
+          $p = Start-Process -FilePath $exe -ArgumentList @('--self-test', '--out', "`"$out`"") -PassThru
+          if (-not $p.WaitForExit(15000)) { $p.Kill(); throw 'Self-test process exceeded 15 seconds' }
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path "$out\capture.txt") { Get-Content "$out\capture.txt" }
+            throw "Self-test exit=$($p.ExitCode)"
+          }
+          Get-Content "$out\capture.txt"
+          if (-not (Select-String -Path "$out\capture.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing PASS' }
+          # Existing output directory must be refused without changing its files.
+          $before = (Get-FileHash "$out\capture.txt").Hash
+          $p = Start-Process -FilePath $exe -ArgumentList @('--self-test', '--out', "`"$out`"") -PassThru
+          if (-not $p.WaitForExit(5000)) { $p.Kill(); throw 'Existing-directory test timed out' }
+          if ($p.ExitCode -ne 2 -or (Get-FileHash "$out\capture.txt").Hash -ne $before) { throw 'Output overwrite protection failed' }
+          $p = Start-Process -FilePath $exe -ArgumentList '--unknown' -PassThru
+          if (-not $p.WaitForExit(5000)) { $p.Kill(); throw 'Argument test timed out' }
+          if ($p.ExitCode -ne 2) { throw 'Bad arguments must exit 2' }
+          New-Item -ItemType Directory display-capture-package | Out-Null
+          Copy-Item $exe, display_state_probe.cpp display-capture-package
+          Copy-Item .github\workflows\build.yml display-capture-package\build-workflow.yml
+          Copy-Item $out display-capture-package\self-test -Recurse
+          @"
+          source_commit=$env:GITHUB_SHA
+          source_branch=$env:GITHUB_REF_NAME
+          run=https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          run_attempt=$env:GITHUB_RUN_ATTEMPT
+          build_utc=$([DateTime]::UtcNow.ToString('o'))
+          runner=$env:RUNNER_OS/$env:RUNNER_ARCH
+          machine=0x$($machine.ToString('x4'))
+          subsystem=$subsystem (Windows GUI)
+          compiler=MSVC cl /EHsc /O2 /W4 /std:c++17
+          self_test=PASS (arguments, output protection, PNG 3x2 dimensions/reference pixels, owned UIA-child hard timeout)
+          hardware_capture=NOT_TESTED
+          hardware_UIA=NOT_TESTED
+          "@ | Set-Content display-capture-package\build-info.txt -Encoding utf8
+          @'
+          display_state_probe_arm64.exe --capture --out C:\path\NEW_CAPTURE_DIR
+          display_state_probe_arm64.exe --capture --out C:\path\NEW_CAPTURE_DIR --uia
+          display_state_probe_arm64.exe --self-test --out C:\path\NEW_SELF_TEST_DIR
+
+          GUI subsystem: no console or visible probe windows. Use Start-Process -Wait -PassThru
+          when waiting for completion. --out is required; its parent must exist and the output
+          directory must NOT exist. Nothing is overwritten. Invalid arguments / setup failure
+          exit 2; if the output directory cannot be created there is no log to write.
+          Exit 0 means requested API/encoding/metadata operations succeeded, NOT display correctness.
+          Exit 2 means failure/partial/unavailable/timeout; preserve capture.txt and uia.txt.
+          screen.png is saved and dimensions checked before UIA starts; it survives UIA failure.
+          Session 0 is rejected; the thread desktop must match the current input desktop.
+          No desktop switching is performed. Permission failures are logged without fallback.
+          capture.txt: session, verified PMv2 DPI, physical virtual-screen rect, DC caps,
+          BitBlt timing, PNG encode/verify timing, exact Win32/HRESULT failures.
+          UIA is opt-in. It only reads visible existing StartMenuExperienceHost/SystemSettings
+          windows, never opens/activates menus/settings, requests no Value/Text patterns, redacts
+          password/edit Names, and emits at most 32 Name/ControlType/Bounds records, 160 UTF-16
+          units per Name. uia.txt may contain user-specific names; treat PNG/logs as private.
+          UIA runs in an owned child job: 3000 ms deadline then termination and <=1000 ms wait.
+          Missing targets/session/permissions and UIA timeouts are failures, not a guessed PASS.
+          PMv2 setup/verification failure aborts, with no silent DPI fallback.
+          GDI BitBlt is synchronous screen readback, cursor not explicitly composited. A saved
+          PNG cannot rule out corruption in this readback path or prove hardware/DWM correctness.
+          Self-test uses only synthetic pixels/WIC plus a deliberately hung owned child; it does
+          not capture a screen or prove UIA/GPU/device support. Device acceptance is separate.
+          '@ | Set-Content display-capture-package\usage.txt -Encoding utf8
+          Get-ChildItem display-capture-package -File -Recurse | Sort-Object FullName | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, ([IO.Path]::GetRelativePath((Resolve-Path display-capture-package).Path, $_.FullName))
+          } | Set-Content display-capture-package\SHA256SUMS.txt -Encoding ascii
+          Get-Content display-capture-package\SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: display-state-capture-arm64
+          path: display-capture-package/
+          if-no-files-found: error
+          retention-days: 30
       - name: Build Vulkan feature probe
         shell: cmd
         run: |
