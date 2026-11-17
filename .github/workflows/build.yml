@@ -7,6 +7,7 @@ on:
       - 'test_d3d11.cpp'
       - 'test_d3d11_shared_probe.cpp'
       - 'display_state_probe.cpp'
+      - 'test_display_pattern.cpp'
       - 'test_vk_features.cpp'
       - 'test_vk_compute.cpp'
       - 'compute.comp'
@@ -152,6 +153,96 @@ jobs:
         with:
           name: display-state-capture-arm64
           path: display-capture-package/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Build independent GDI and hardware DirectWrite patterns
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 test_display_pattern.cpp /Fe:display_pattern_arm64.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib d2d1.lib dwrite.lib dxgi.lib
+          if errorlevel 1 exit /b 1
+      - name: Self-test and package display patterns (no hardware draw)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path .\display_pattern_arm64.exe).Path
+          $b = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          if ([BitConverter]::ToUInt16($b,$pe+4) -ne 0xaa64 -or [BitConverter]::ToUInt16($b,$pe+24+68) -ne 2) { throw 'Expected ARM64 GUI' }
+          $out = Join-Path $env:RUNNER_TEMP ('pattern-self-test-' + [guid]::NewGuid())
+          $p = Start-Process $exe -ArgumentList @('--self-test','--out',"`"$out`"") -PassThru
+          if (-not $p.WaitForExit(10000)) { $p.Kill(); throw 'Pattern self-test timeout' }
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path "$out\pattern.txt") { Get-Content "$out\pattern.txt" }
+            throw "Pattern self-test exit=$($p.ExitCode)"
+          }
+          Get-Content "$out\pattern.txt"
+          if (-not (Select-String "$out\pattern.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing self-test PASS' }
+          $before = (Get-FileHash "$out\pattern.txt").Hash
+          $p = Start-Process $exe -ArgumentList @('--self-test','--out',"`"$out`"") -PassThru
+          if (-not $p.WaitForExit(5000)) { $p.Kill(); throw 'Overwrite test timeout' }
+          if ($p.ExitCode -ne 2 -or (Get-FileHash "$out\pattern.txt").Hash -ne $before) { throw 'Output protection failed' }
+          $p = Start-Process $exe -ArgumentList '--mode gdi --duration 31 --out unused-invalid-pattern' -PassThru
+          if (-not $p.WaitForExit(5000)) { $p.Kill(); throw 'Invalid args test timeout' }
+          if ($p.ExitCode -ne 2 -or (Test-Path unused-invalid-pattern)) { throw 'Invalid duration not refused before window/directory' }
+          New-Item -ItemType Directory display-pattern-package | Out-Null
+          Copy-Item $exe, test_display_pattern.cpp display-pattern-package
+          Copy-Item .github\workflows\build.yml display-pattern-package\build-workflow.yml
+          Copy-Item $out display-pattern-package\self-test -Recurse
+          @"
+          source_commit=$env:GITHUB_SHA
+          source_branch=$env:GITHUB_REF_NAME
+          run=https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          run_attempt=$env:GITHUB_RUN_ATTEMPT
+          build_utc=$([DateTime]::UtcNow.ToString('o'))
+          runner=$env:RUNNER_OS/$env:RUNNER_ARCH
+          machine=0xaa64 subsystem=2 GUI
+          self_test=PASS parameters+CPU_reference+region_bounds+output_protection
+          hardware_GDI=NOT_TESTED
+          hardware_D2D_DWrite=NOT_TESTED
+          font_selection=NOT_TESTED (runtime log records selected base face, fallback not traced)
+          "@ | Set-Content display-pattern-package\build-info.txt -Encoding utf8
+          @'
+          display_pattern_arm64.exe --mode gdi --out C:\path\NEW_GDI_DIR --duration 20
+          display_pattern_arm64.exe --mode dwrite --out C:\path\NEW_DWRITE_DIR --duration 20
+          display_pattern_arm64.exe --self-test --out C:\path\NEW_SELFTEST_DIR
+
+          GUI ARM64, one independent mode/window per invocation. No console. --out is required,
+          its parent must exist, and its directory MUST NOT exist. Nothing is overwritten.
+          --duration 1..30 seconds (default20): SOFT message-timer duration, closes only owned window.
+          Acceptance runner MUST impose a separate 30s HARD cutoff for default20: record the new
+          process PID/creation time (or retain Start-Process -PassThru process handle), WaitForExit
+          at most 30000ms, and on timeout terminate ONLY that recorded owned process and mark FAIL.
+          Do not kill by executable name or close unrelated windows. Task Scheduler may additionally
+          set ExecutionTimeLimit PT30S, but retain process identity and verify it actually stopped.
+          No user-window closing, display/driver changes, menu activation or screenshot/readback.
+          Launch one mode, take evidence with the separate known-good capture tool, let it exit,
+          then launch the other mode into another new directory. The window does not steal focus.
+          Fixed 960x560 PHYSICAL client pixels, PMv2 verified. Small work area => explicit failure,
+          not silent scaling. pattern.txt records physical client origin/size, DPI/session/desktop,
+          API/HRESULT/Win32 failures, font base-face/glyph selection, CPU RGB/BGRA reference and
+          every patch/text/mark location and expected string independently of rendered labels.
+          GDI: FillRect + TextOutW. DirectWrite is used ONLY for installed base-font selection;
+          it does not draw in GDI mode. GetTextFaceW reports actual GDI-mapped base font.
+          dwrite: D2D HARDWARE HwndRenderTarget, DirectWrite DrawText, target DPI96 makes 1 DIP
+          equal 1 physical client pixel. No DEFAULT/SOFTWARE/WARP or retry on device loss.
+          DXGI adapter inventory is informational: actual internal D2D adapter binding is NOT
+          proven. Font fallback is NOT traced; glyph absence alone does not prove font root cause.
+          Window title is OS non-client rendering, not either client test API.
+          Colors are CPU-defined UNORM8 RGB, opaque; compare patch interiors, not text antialiasing.
+          Exit0 means requested APIs returned success, not visual/hardware correctness. Exit2 means
+          failure; preserve pattern.txt. Timer is a normal Win32 message timer, not preemption of a
+          hung driver/API. Use independent external supervision if the graphics stack can hang.
+          Self-test uses no window, no drawing, no font/GPU selection and proves no hardware support.
+          D3D11 texture sampling is not implemented here; existing shared-texture probe remains separate.
+          '@ | Set-Content display-pattern-package\usage.txt -Encoding utf8
+          Get-ChildItem display-pattern-package -File -Recurse | Sort-Object FullName | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, ([IO.Path]::GetRelativePath((Resolve-Path display-pattern-package).Path, $_.FullName))
+          } | Set-Content display-pattern-package\SHA256SUMS.txt -Encoding ascii
+          Get-Content display-pattern-package\SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: display-pattern-arm64
+          path: display-pattern-package/
           if-no-files-found: error
           retention-days: 30
       - name: Build Vulkan feature probe
