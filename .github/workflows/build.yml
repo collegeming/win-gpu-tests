@@ -7,6 +7,7 @@ on:
       - 'test_d3d11.cpp'
       - 'test_vk_features.cpp'
       - 'test_vk_compute.cpp'
+      - 'text_glyph_probe.cpp'
       - 'compute.comp'
       - 'compute_nop.comp'
       - 'third_party/**'
@@ -92,3 +93,84 @@ jobs:
             vk_compute_arm64.exe
             SHA256SUMS-compute.txt
           if-no-files-found: error
+      - name: Build offscreen text glyph probe (D3D11+D2D/DirectWrite, GDI)
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 text_glyph_probe.cpp /Fe:text_glyph_probe_arm64.exe d3d11.lib dxgi.lib d2d1.lib dwrite.lib gdi32.lib user32.lib ole32.lib version.lib
+          if errorlevel 1 exit /b 1
+      - name: Self-test, runner evidence snapshot and package text glyph probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path .\text_glyph_probe_arm64.exe).Path
+          $b = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          if ($machine -ne 0xaa64) { throw 'Expected ARM64 PE' }
+          $dir = Join-Path $env:RUNNER_TEMP ('text-glyph-' + [guid]::NewGuid())
+          New-Item -ItemType Directory $dir | Out-Null
+          & $exe --self-test --log "$dir\self-test.txt"
+          $selfTestExit = $LASTEXITCODE
+          if (-not (Test-Path "$dir\self-test.txt")) { throw 'self-test wrote no log' }
+          Get-Content "$dir\self-test.txt"
+          if ($selfTestExit -ne 0) { throw "CPU self-test exit=$selfTestExit" }
+          if (-not (Select-String -Path "$dir\self-test.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing SELF_TEST=PASS' }
+          # Runner evidence only. The hosted runner has no target GPU, so these
+          # exits are recorded, never gated; device acceptance is separate.
+          & $exe --log "$dir\runner-hardware.txt" | Out-Null
+          $hwExit = $LASTEXITCODE
+          & $exe --driver warp --log "$dir\runner-warp.txt" | Out-Null
+          $warpExit = $LASTEXITCODE
+          New-Item -ItemType Directory text-glyph-package | Out-Null
+          Copy-Item $exe, text_glyph_probe.cpp text-glyph-package
+          Copy-Item .github\workflows\build.yml text-glyph-package\build-workflow.yml
+          Copy-Item "$dir\self-test.txt", "$dir\runner-hardware.txt", "$dir\runner-warp.txt" text-glyph-package
+          @"
+          source_commit=$env:GITHUB_SHA
+          source_branch=$env:GITHUB_REF_NAME
+          run=https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          run_attempt=$env:GITHUB_RUN_ATTEMPT
+          build_utc=$([DateTime]::UtcNow.ToString('o'))
+          runner=$env:RUNNER_OS/$env:RUNNER_ARCH
+          machine=0x$($machine.ToString('x4')) subsystem=console
+          compiler=MSVC cl /EHsc /O2 /W4 /std:c++17
+          self_test=PASS (CPU analyzer + PASS/FAIL gate, 5 synthetic cases, no device/font)
+          runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
+          runner_warp_exit=$warpExit (hosted runner evidence, not gated)
+          hardware_device=NOT_TESTED
+          "@ | Set-Content text-glyph-package\build-info.txt -Encoding utf8
+          @'
+          text_glyph_probe_arm64.exe
+          text_glyph_probe_arm64.exe --driver warp
+          text_glyph_probe_arm64.exe --self-test
+          text_glyph_probe_arm64.exe --log C:\path\probe.txt
+
+          Console ARM64. Creates no window, requests no focus/activation, reads no screen.
+          Paths run in order d3d11_d2d then gdi; each prints its stages with HRESULT and
+          Win32 codes and one RESULT line. Exit 0 only if both PASS; exit 2 on any failure.
+          Offscreen surface is 512x128 BGRA8; text "TEST 123"; font "Segoe UI" 48 px;
+          analysis rect 8,8,504,120; dark = BT.601 integer luma < 128; bbox half-open.
+          PASS = dark_pixel_count > 50, dark bbox >= 40x8 inside the rect, dark pixels not
+          dominating the rect, unique_color_count >= 2. Antialiasing normally yields many
+          distinct values; unique_color_count == 1 with ink present means no AA blending.
+          d3d11_d2d uses a D3D11 RENDER_TARGET texture, a D2D DXGI-surface render target with
+          alpha_ignore/DPI 96, DirectWrite DrawTextLayout, a STAGING copy and Map(READ).
+          Map(READ) is the GPU completion point; there is no separate fence query.
+          gdi uses CreateDIBSection (32bpp top-down), FillRect white, TextOutW black, GdiFlush.
+          --driver warp is a control run; it proves the code path, NOT GPU/driver support.
+          --debug-layer fails if the D3D11 SDK debug layer is not installed.
+          Font fallback is NOT traced; a PASS does not prove the requested face was used.
+          A PASS means "ink exists in this offscreen readback". It does not prove on-screen
+          presentation, DWM composition, scanout, or that a visible window would show text.
+          Logs contain adapter name/ids, session id, WOW64 state, d3d11.dll version only.
+          '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8
+          Get-ChildItem text-glyph-package -File -Recurse | Sort-Object FullName | ForEach-Object {
+            '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, ([IO.Path]::GetRelativePath((Resolve-Path text-glyph-package).Path, $_.FullName))
+          } | Set-Content text-glyph-package\SHA256SUMS.txt -Encoding ascii
+          Get-Content text-glyph-package\SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: text-glyph-probe-arm64
+          path: text-glyph-package/
+          if-no-files-found: error
+          retention-days: 30
