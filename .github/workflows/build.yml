@@ -139,9 +139,9 @@ jobs:
           if (-not (Select-String -Path "$dir\self-test.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing SELF_TEST=PASS' }
           # Runner evidence only. The hosted runner has no target GPU, so these
           # exits are recorded, never gated; device acceptance is separate.
-          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --log "$dir\runner-hardware.txt" | Out-Null
+          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --mode typed-buffer-srv --log "$dir\runner-hardware.txt" | Out-Null
           $hwExit = $LASTEXITCODE
-          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --log "$dir\runner-warp.txt" | Out-Null
+          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --mode typed-buffer-srv --log "$dir\runner-warp.txt" | Out-Null
           $warpExit = $LASTEXITCODE
           # Surface the evidence verdicts in the job log so a non-zero evidence
           # exit is diagnosable without the artifact; the full logs are packaged.
@@ -168,12 +168,13 @@ jobs:
           runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
           runner_warp_exit=$warpExit (hosted runner evidence, not gated)
           hardware_device=NOT_TESTED
-          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline,a8-upload,rt-to-srv,d2d-aa-modes,text-paths,clip-contract,mask-uint,dualsrc-blend,uint-rt-extreme (additive; full == no --mode)
+          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline,a8-upload,rt-to-srv,d2d-aa-modes,text-paths,clip-contract,mask-uint,dualsrc-blend,uint-rt-extreme,typed-buffer-srv (additive; full == no --mode)
           v2_result=NOT_TESTED (mode items judge expected ink/colour per region; device run decides)
           v3_result=NOT_TESTED (a8-contract judges A8_UNORM values; drawline separates AA paths)
           v4_result=NOT_TESTED (a8-upload judges UpdateSubresource upload and SRV->PS value; rt-to-srv judges RT->SRV; d2d-aa-modes and text-paths judge per-item ink; device run decides)
           v5_result=NOT_TESTED (clip-contract judges clip/discard keep-vs-drop; mask-uint judges R32_UINT write/Load/countbits/array index; dualsrc-blend judges SRC1 blend factors; device run decides)
           v7_result=NOT_TESTED (uint-rt-extreme judges bit-exact PS integer writes of float-hostile bit patterns plus an R32_FLOAT NaN-bit readback control; WARP must be exact; device run decides)
+          v8_result=NOT_TESTED (typed-buffer-srv judges typed/structured/raw texel-buffer SRV fetches, a Texture2D<uint> control and a Buffer<float> control, with per-case SRV desc and staged initial-data checks; WARP must be exact; device run decides)
           "@ | Set-Content text-glyph-package\build-info.txt -Encoding utf8
           @'
           text_glyph_probe_arm64.exe
@@ -192,6 +193,7 @@ jobs:
           text_glyph_probe_arm64.exe --mode mask-uint
           text_glyph_probe_arm64.exe --mode dualsrc-blend
           text_glyph_probe_arm64.exe --mode uint-rt-extreme
+          text_glyph_probe_arm64.exe --mode typed-buffer-srv
           text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --log C:\path\probe.txt
 
           Console ARM64. Creates no window, requests no focus/activation, reads no screen.
@@ -390,6 +392,20 @@ jobs:
             through asfloat from a constant buffer into R32_FLOAT and compares the raw bytes,
             so the readback path itself is shown not to convert. Each item prints expected,
             actual_min, actual_max (uint), mismatches and all_zero; WARP must be bit exact.
+          typed-buffer-srv isolates the typed texel-buffer SRV path the failing D2D shader
+            uses (image<u32> dim=Buffer). Five cases, each with its own 64-word buffer or
+            64x1 texture, SRV, draw and 64x64 R32_FLOAT readback: Buffer<uint>.Load,
+            StructuredBuffer<uint>, ByteAddressBuffer.Load(idx*4), a Texture2D<uint>.Load
+            control and a Buffer<float> control. The words are 0x00010001, 0xDEADBEEF,
+            0x7FC00001, 0x12345678 plus 1..64; pixel column x reads element x through
+            SV_Position.x and the uint cases store asfloat(v), so the raw readback bits must
+            equal v. Every item prints the SRV desc (format/viewdim/first/last) and the
+            staged initial-data check, then expected, actual_min, actual_max, mismatches,
+            bad_columns, all_zero, plus denormal_expected/denormal_bad and nan_expected/
+            nan_bad because asfloat turns 0x00010001 and 1..64 into denormals and the two
+            NaN patterns can be canonicalised independently of the buffer view. WARP must be
+            bit exact; a failing Texture2D<uint> control makes the run inconclusive rather
+            than evidence against the buffer path.
           Modes never alter the full-mode numbers; a mode failure only changes the exit code
           and SUMMARY_MODES.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8
