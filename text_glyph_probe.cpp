@@ -2020,7 +2020,1331 @@ int run_drawline(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v4 diagnostic modes. Additive: the v1/v2/v3 modes and their output lines are
+// unchanged.
+//
+// Device state when these were added: a 64x64 D2D FillRectangle and a 1x1
+// bitmap brush filled correctly, while a 1px D2D rectangle stroke and
+// DrawTextLayout produced a single-colour readback with no ink; GDI text on the
+// same device passed, the same exe passed through WARP, and the A8 contract
+// (Clear, PS with and without blending, typed UAV store then SRV sample)
+// passed 5/5. So A8 store, A8 blend and A8 sample work, and the open questions
+// are the upload path, the render-target-to-SRV path, and which D2D primitive
+// families need the coverage rasterizer.
+//
+//   --mode a8-upload    UpdateSubresource of {0,64,128,255} into a 4x4
+//                       R8_UNORM (and A8_UNORM when the UMD accepts it)
+//                       texture: raw bytes read back, then the same texture
+//                       sampled through the default SRV and through a
+//                       (ZERO,ZERO,ZERO,R) mapped SRV into a BGRA target.
+//                       Answers "does an 8-bit upload land" separately from the
+//                       typed UAV store that already worked.
+//   --mode rt-to-srv    one R8_UNORM texture used as render target and then as
+//                       SRV in the same frame: PS 0.5 -> 128 in the R8 target
+//                       -> sampled -> 128 in the BGRA target. That is the shape
+//                       of a D2D coverage / glyph mask.
+//   --mode d2d-aa-modes six D2D primitives, each on its own target and readback:
+//                       AA and aliased 1px stroke, AA triangle fill, AA ellipse
+//                       fill, and a 1px half-pixel line AA and aliased. A
+//                       primitive that needs partial coverage is compared with
+//                       the same primitive that does not.
+//   --mode text-paths   six glyph paths, each on its own target and readback:
+//                       solid brush, bitmap brush, aliased text, a direct
+//                       DrawGlyphRun, and a GRAYSCALE draw into an
+//                       ALPHA_MODE_IGNORE and an ALPHA_MODE_PREMULTIPLIED
+//                       target.
+//
+// Items keep the v2 rule set: judged by presence of the expected pixels, with an
+// expected and an actual number on every line. A mode failure only changes the
+// exit code and SUMMARY_MODES.
+
+constexpr int kUploadSize = 4;
+constexpr int kRtSize = 8;
+constexpr int kTexelTolerance = 2;
+
+const char* fmt_name(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
+        case DXGI_FORMAT_A8_UNORM: return "A8_UNORM";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+        default: return "other";
+    }
+}
+
+int int_diff(int a, int b) { return a > b ? a - b : b - a; }
+
+struct SmallRead {
+    bool ok = false;
+    HRESULT hr_map = E_FAIL;
+    int pitch = 0;
+    std::vector<uint8_t> bytes;
+};
+
+bool small_texture(const char* path, ID3D11Device* device, DXGI_FORMAT fmt, int size,
+                   UINT bind, ComPtr<ID3D11Texture2D>& tex,
+                   ComPtr<ID3D11Texture2D>& staging) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = static_cast<UINT>(size);
+    desc.Height = static_cast<UINT>(size);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = fmt;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = bind;
+    const HRESULT hr = device->CreateTexture2D(&desc, nullptr, &tex);
+    out("MODE=%s stage=create_texture fmt=%s size=%dx%d bind=0x%x hr=0x%08lx\n", path,
+        fmt_name(fmt), size, size, bind, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    out("MODE=%s stage=texture_desc fmt=%s size=%dx%d mip=1 array=1 sample=1 usage=DEFAULT"
+        " bind=0x%x\n", path, fmt_name(fmt), size, size, bind);
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    const HRESULT hr_staging = device->CreateTexture2D(&staging_desc, nullptr, &staging);
+    out("MODE=%s stage=create_staging fmt=%s hr=0x%08lx\n", path, fmt_name(fmt),
+        static_cast<unsigned long>(hr_staging));
+    return SUCCEEDED(hr_staging);
+}
+
+// Copy to staging, Flush, Map(READ) and keep the bytes. Map(READ) is the GPU
+// completion point, exactly as in target_map; there is no separate fence.
+SmallRead small_read(const char* path, ID3D11DeviceContext* context, ID3D11Texture2D* tex,
+                     ID3D11Texture2D* staging, int size, int bytes_per_pixel) {
+    SmallRead r;
+    context->CopyResource(staging, tex);
+    context->Flush();
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    r.hr_map = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+    out("MODE=%s stage=map_read size=%dx%d bpp=%d row_pitch=%u hr=0x%08lx\n", path, size,
+        size, bytes_per_pixel, mapped.RowPitch, static_cast<unsigned long>(r.hr_map));
+    if (FAILED(r.hr_map)) return r;
+    r.pitch = static_cast<int>(mapped.RowPitch);
+    r.bytes.assign(static_cast<size_t>(r.pitch) * static_cast<size_t>(size), 0);
+    memcpy(r.bytes.data(), mapped.pData, r.bytes.size());
+    context->Unmap(staging, 0);
+    r.ok = true;
+    return r;
+}
+
+// Draw state for one fullscreen triangle into a square target of `size` pixels.
+// Culling off, no depth, blending off: the cases must fail on the value path and
+// on nothing else.
+bool small_pipeline(const char* path, Gpu& g, int size, ID3D11VertexShader* vs) {
+    D3D11_RASTERIZER_DESC raster_desc{};
+    raster_desc.FillMode = D3D11_FILL_SOLID;
+    raster_desc.CullMode = D3D11_CULL_NONE;
+    raster_desc.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> raster;
+    HRESULT hr = g.device->CreateRasterizerState(&raster_desc, &raster);
+    out("MODE=%s stage=create_rasterizer_state cull=none hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+
+    D3D11_BLEND_DESC blend_desc{};
+    blend_desc.RenderTarget[0].BlendEnable = FALSE;
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D11BlendState> blend;
+    const HRESULT hr_blend = g.device->CreateBlendState(&blend_desc, &blend);
+    out("MODE=%s stage=create_blend_state name=off hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_blend));
+    if (FAILED(hr_blend)) return false;
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<FLOAT>(size);
+    viewport.Height = static_cast<FLOAT>(size);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    g.context->RSSetViewports(1, &viewport);
+    g.context->RSSetState(raster.Get());
+    g.context->OMSetBlendState(blend.Get(), blend_factor, 0xffffffff);
+    g.context->IASetInputLayout(nullptr);
+    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.context->VSSetShader(vs, nullptr, 0);
+    return true;
+}
+
+void format_bgra_list(char* buf, size_t cap, const Rgba* v, int count) {
+    size_t used = 0;
+    buf[0] = 0;
+    for (int i = 0; i < count; ++i) {
+        if (used + 24 >= cap) break;
+        const int n = _snprintf_s(buf + used, cap - used, _TRUNCATE,
+                                  i ? "|%d,%d,%d,%d" : "%d,%d,%d,%d", v[i].b, v[i].g, v[i].r,
+                                  v[i].a);
+        if (n <= 0) break;
+        used += static_cast<size_t>(n);
+    }
+}
+
+// Per-texel compare with the expected and the actual vector on one line, plus
+// one TEXEL line per mismatching texel so a single bad texel is locatable.
+const char* print_texel_item(const char* mode, const char* item, const char* extra,
+                             const Rgba* want, const Rgba* got, int count, int tolerance) {
+    int bad = 0;
+    for (int i = 0; i < count; ++i) {
+        if (int_diff(want[i].b, got[i].b) > tolerance ||
+            int_diff(want[i].g, got[i].g) > tolerance ||
+            int_diff(want[i].r, got[i].r) > tolerance ||
+            int_diff(want[i].a, got[i].a) > tolerance)
+            ++bad;
+    }
+    char want_text[512] = "none";
+    char got_text[512] = "none";
+    format_bgra_list(want_text, sizeof(want_text), want, count);
+    format_bgra_list(got_text, sizeof(got_text), got, count);
+    const char* reason = bad ? "value_mismatch" : nullptr;
+    out("MODE=%s ITEM=%s%s RESULT=%s texels=%d mismatches=%d tolerance=%d expected_bgra=%s"
+        " actual_bgra=%s reason=%s\n", mode, item, extra, reason ? "FAIL" : "PASS", count,
+        bad, tolerance, want_text, got_text, reason ? reason : "ok");
+    for (int i = 0; i < count; ++i) {
+        if (int_diff(want[i].b, got[i].b) <= tolerance &&
+            int_diff(want[i].g, got[i].g) <= tolerance &&
+            int_diff(want[i].r, got[i].r) <= tolerance &&
+            int_diff(want[i].a, got[i].a) <= tolerance)
+            continue;
+        out("MODE=%s TEXEL item=%s index=%d expected_bgra=%d,%d,%d,%d"
+            " actual_bgra=%d,%d,%d,%d\n", mode, item, i, want[i].b, want[i].g, want[i].r,
+            want[i].a, got[i].b, got[i].g, got[i].r, got[i].a);
+    }
+    if (reason) ++g_failures;
+    return reason;
+}
+
+// Whole-surface colour compare: expected one BGRA value for every texel, actual
+// reported as the per-channel min/max so a uniform wrong value is visible.
+const char* print_plane_item(const char* mode, const char* item, const char* extra,
+                             const SmallRead& r, int size, Rgba want, int tolerance) {
+    int bad = 0;
+    int lo[4] = {255, 255, 255, 255};
+    int hi[4] = {0, 0, 0, 0};
+    for (int y = 0; y < size; ++y) {
+        const uint8_t* row = r.bytes.data() + static_cast<size_t>(y) * r.pitch;
+        for (int x = 0; x < size; ++x) {
+            const int c[4] = {row[x * 4 + 0], row[x * 4 + 1], row[x * 4 + 2], row[x * 4 + 3]};
+            for (int k = 0; k < 4; ++k) {
+                if (c[k] < lo[k]) lo[k] = c[k];
+                if (c[k] > hi[k]) hi[k] = c[k];
+            }
+            if (int_diff(c[0], want.b) > tolerance || int_diff(c[1], want.g) > tolerance ||
+                int_diff(c[2], want.r) > tolerance || int_diff(c[3], want.a) > tolerance)
+                ++bad;
+        }
+    }
+    const char* reason = bad ? "value_mismatch" : nullptr;
+    out("MODE=%s ITEM=%s%s RESULT=%s texels=%d mismatches=%d tolerance=%d"
+        " expected_bgra=%d,%d,%d,%d actual_min_bgra=%d,%d,%d,%d actual_max_bgra=%d,%d,%d,%d"
+        " reason=%s\n", mode, item, extra, reason ? "FAIL" : "PASS", size * size, bad,
+        tolerance, want.b, want.g, want.r, want.a, lo[0], lo[1], lo[2], lo[3], hi[0], hi[1],
+        hi[2], hi[3], reason ? reason : "ok");
+    if (reason) ++g_failures;
+    return reason;
+}
+
+// Single-channel plane compare for an R8/A8 texture read back directly.
+const char* print_scalar_item(const char* mode, const char* item, const char* extra,
+                              const SmallRead& r, int size, unsigned want, int tolerance) {
+    unsigned lo = 255;
+    unsigned hi = 0;
+    int bad = 0;
+    for (int y = 0; y < size; ++y) {
+        const uint8_t* row = r.bytes.data() + static_cast<size_t>(y) * r.pitch;
+        for (int x = 0; x < size; ++x) {
+            const unsigned v = row[x];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            if (int_diff(static_cast<int>(v), static_cast<int>(want)) > tolerance) ++bad;
+        }
+    }
+    const char* reason = bad ? "value_mismatch" : nullptr;
+    out("MODE=%s ITEM=%s%s RESULT=%s texels=%d mismatches=%d expected=%u tolerance=%d"
+        " actual_min=%u actual_max=%u reason=%s\n", mode, item, extra,
+        reason ? "FAIL" : "PASS", size * size, bad, want, tolerance, lo, hi,
+        reason ? reason : "ok");
+    if (reason) ++g_failures;
+    return reason;
+}
+
+// The identity view of an R8_UNORM texture hands the shader (v,0,0,1) and the
+// identity view of an A8_UNORM texture hands it (0,0,0,v), so the meaningful
+// channel differs per format; two shaders keep the expected value honest
+// instead of a max(r,a) that would read the constant alpha of the R8 view.
+const char* kUploadPsReplicateR =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    float4 s = src.Load(int3(int2(pos.xy), 0));\n"
+    "    float v = s.r;\n"
+    "    return float4(v, v, v, 1.0);\n"
+    "}\n";
+
+const char* kUploadPsReplicateA =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    float4 s = src.Load(int3(int2(pos.xy), 0));\n"
+    "    float v = s.a;\n"
+    "    return float4(v, v, v, 1.0);\n"
+    "}\n";
+
+// Writes the sampled float4 unchanged, so the readback is exactly what the SRV
+// handed the shader. Under a (ZERO,ZERO,ZERO,R) mapping that is (0,0,0,v); a
+// driver that ignores the mapping shows (v,0,0,1) instead.
+const char* kUploadPsRaw =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    return src.Load(int3(int2(pos.xy), 0));\n"
+    "}\n";
+
+// Mode 5: does UpdateSubresource into an 8-bit texture land, and does the value
+// reach a shader through the default and a remapped SRV?
+int run_a8_upload(bool warp, bool debug_layer) {
+    const char* path = "a8-upload";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_replicate_r_blob, ps_replicate_a_blob, ps_raw_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "upload_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "upload_ps_replicate_r", kUploadPsReplicateR, "ps_5_0",
+                        "ps_4_0", ps_replicate_r_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "upload_ps_replicate_a", kUploadPsReplicateA, "ps_5_0",
+                        "ps_4_0", ps_replicate_a_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "upload_ps_raw", kUploadPsRaw, "ps_5_0", "ps_4_0",
+                        ps_raw_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps_replicate_r;
+    ComPtr<ID3D11PixelShader> ps_replicate_a;
+    ComPtr<ID3D11PixelShader> ps_raw;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_replicate_r_blob->GetBufferPointer(),
+                                         ps_replicate_r_blob->GetBufferSize(), nullptr,
+                                         &ps_replicate_r);
+        out("MODE=%s stage=create_ps_replicate_r hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_replicate_a_blob->GetBufferPointer(),
+                                         ps_replicate_a_blob->GetBufferSize(), nullptr,
+                                         &ps_replicate_a);
+        out("MODE=%s stage=create_ps_replicate_a hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_raw_blob->GetBufferPointer(),
+                                        ps_raw_blob->GetBufferSize(), nullptr, &ps_raw);
+        out("MODE=%s stage=create_ps_raw hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    if (!small_pipeline(path, g, kUploadSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    // (ZERO,ZERO,ZERO,R): output.x/.y/.z forced to 0, output.w takes the memory
+    // component 0. Three bits per component, component 0 in the low bits. The
+    // D3D11_SHADER_COMPONENT_MAPPING values are spelled out so this file does not
+    // depend on which header the SDK puts the enum in: FROM_MEMORY_COMPONENT_0
+    // is 0, FORCE_VALUE_0 is 3.
+    const UINT map_from_memory_0 = 0u;
+    const UINT map_force_value_0 = 3u;
+    const UINT swizzle_zzzr = map_force_value_0 | (map_force_value_0 << 3) |
+                              (map_force_value_0 << 6) | (map_from_memory_0 << 9);
+
+    const unsigned values[kUploadSize] = {0, 64, 128, 255};
+    struct FmtCase {
+        DXGI_FORMAT fmt;
+        const char* name;
+    };
+    const FmtCase formats[] = {
+        {DXGI_FORMAT_R8_UNORM, "R8_UNORM"},
+        {DXGI_FORMAT_A8_UNORM, "A8_UNORM"},
+    };
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int failed = 0;
+    int skipped = 0;
+    int items = 0;
+
+    for (const FmtCase& f : formats) {
+        UINT support = 0;
+        const HRESULT hr_support = g.device->CheckFormatSupport(f.fmt, &support);
+        out("MODE=%s stage=format_support fmt=%s hr=0x%08lx texture2d=%s shader_sample=%s"
+            " shader_load=%s\n", path, f.name, static_cast<unsigned long>(hr_support),
+            (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) ? "yes" : "no",
+            (support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) ? "yes" : "no",
+            (support & D3D11_FORMAT_SUPPORT_SHADER_LOAD) ? "yes" : "no");
+
+        ComPtr<ID3D11Texture2D> src, src_staging;
+        if (!small_texture(path, g.device.Get(), f.fmt, kUploadSize,
+                           D3D11_BIND_SHADER_RESOURCE, src, src_staging)) {
+            // An 8-bit format the UMD refuses is recorded as unsupported, not as
+            // a crash and not as a value failure: the A8 question is then
+            // answered by the R8 case alone.
+            out("MODE=%s ITEM=%s_upload_raw RESULT=SKIP reason=format_unsupported\n", path,
+                f.name);
+            ++skipped;
+            continue;
+        }
+
+        uint8_t data[kUploadSize * kUploadSize];
+        for (int y = 0; y < kUploadSize; ++y)
+            for (int x = 0; x < kUploadSize; ++x)
+                data[y * kUploadSize + x] = static_cast<uint8_t>(values[x]);
+        g.context->UpdateSubresource(src.Get(), 0, nullptr, data,
+                                     static_cast<UINT>(kUploadSize),
+                                     static_cast<UINT>(kUploadSize * kUploadSize));
+        g.context->Flush();
+        const HRESULT hr_upload = g.device->GetDeviceRemovedReason();
+        out("MODE=%s stage=update_subresource fmt=%s size=%dx%d values=0,64,128,255"
+            " src_row_pitch=%d hr_draw=0x%08lx\n", path, f.name, kUploadSize, kUploadSize,
+            kUploadSize, static_cast<unsigned long>(hr_upload));
+
+        // 1) the uploaded bytes, read back from the texture itself.
+        Rgba want_raw[kUploadSize * kUploadSize];
+        Rgba got_raw[kUploadSize * kUploadSize];
+        for (int y = 0; y < kUploadSize; ++y)
+            for (int x = 0; x < kUploadSize; ++x) {
+                const int v = static_cast<int>(values[x]);
+                want_raw[y * kUploadSize + x] = Rgba{v, v, v, 255};
+                got_raw[y * kUploadSize + x] = Rgba{0, 0, 0, 0};
+            }
+        const SmallRead raw =
+            small_read(path, g.context.Get(), src.Get(), src_staging.Get(), kUploadSize, 1);
+        char item[64];
+        char extra[192];
+        if (!raw.ok) {
+            ++failed;
+            ++g_failures;
+            _snprintf_s(item, sizeof(item), _TRUNCATE, "%s_upload_raw", f.name);
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+        } else {
+            for (int y = 0; y < kUploadSize; ++y)
+                for (int x = 0; x < kUploadSize; ++x) {
+                    const int v =
+                        static_cast<int>(raw.bytes[static_cast<size_t>(y) * raw.pitch + x]);
+                    got_raw[y * kUploadSize + x] = Rgba{v, v, v, 255};
+                }
+            _snprintf_s(item, sizeof(item), _TRUNCATE, "%s_upload_raw", f.name);
+            _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                        " fmt=%s path=UpdateSubresource_then_copy channel=stored_byte_as_bgr"
+                        " hr_draw=0x%08lx", f.name, static_cast<unsigned long>(hr_upload));
+            ++items;
+            if (print_texel_item(path, item, extra, want_raw, got_raw,
+                                 kUploadSize * kUploadSize, 0))
+                ++failed;
+        }
+
+        ComPtr<ID3D11ShaderResourceView> srv;
+        const HRESULT hr_srv = g.device->CreateShaderResourceView(src.Get(), nullptr, &srv);
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = f.fmt;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MostDetailedMip = 0;
+        sd.Texture2D.MipLevels = 1;
+        sd.Shader4ComponentMapping = swizzle_zzzr;
+        ComPtr<ID3D11ShaderResourceView> srv_swz;
+        const HRESULT hr_srv_swz =
+            g.device->CreateShaderResourceView(src.Get(), &sd, &srv_swz);
+        out("MODE=%s stage=create_srv fmt=%s identity_hr=0x%08lx zzzr_hr=0x%08lx"
+            " zzzr_mapping=%u\n", path, f.name, static_cast<unsigned long>(hr_srv),
+            static_cast<unsigned long>(hr_srv_swz), swizzle_zzzr);
+        if (FAILED(hr_srv) || FAILED(hr_srv_swz)) {
+            // An SRV the UMD refuses is "this format cannot be sampled", not a
+            // value failure: the R8 case carries the answer.
+            out("MODE=%s ITEM=%s_identity_replicate RESULT=SKIP reason=srv_create_failed\n",
+                path, f.name);
+            out("MODE=%s ITEM=%s_map_zzzr_raw RESULT=SKIP reason=srv_create_failed\n", path,
+                f.name);
+            skipped += 2;
+            continue;
+        }
+
+        // 2) and 3): sample the same texture twice, once through each SRV.
+        struct SampleCase {
+            const char* suffix;
+            ID3D11ShaderResourceView* view;
+            ID3D11PixelShader* ps;
+            bool raw_output;
+            int alpha;
+            const char* note;
+        };
+        const SampleCase cases[] = {
+            {"identity_replicate", srv.Get(),
+             (f.fmt == DXGI_FORMAT_A8_UNORM) ? ps_replicate_a.Get() : ps_replicate_r.Get(),
+             false, 255, "ps=stored_channel_replicated_to_rgb_alpha_255"},
+            {"map_zzzr_raw", srv_swz.Get(), ps_raw.Get(), true, 0,
+             "ps=sampled_float4_unchanged_mapping_forces_xyz_zero"},
+        };
+        for (const SampleCase& c : cases) {
+            ComPtr<ID3D11Texture2D> dst, dst_staging;
+            if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kUploadSize,
+                               D3D11_BIND_RENDER_TARGET, dst, dst_staging)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=%s_%s RESULT=FAIL reason=dst_texture_create_failed\n",
+                    path, f.name, c.suffix);
+                continue;
+            }
+            ComPtr<ID3D11RenderTargetView> rtv;
+            const HRESULT hr_rtv =
+                g.device->CreateRenderTargetView(dst.Get(), nullptr, &rtv);
+            out("MODE=%s stage=create_dst_rtv fmt=%s item=%s hr=0x%08lx\n", path, f.name,
+                c.suffix, static_cast<unsigned long>(hr_rtv));
+            if (FAILED(hr_rtv)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=%s_%s RESULT=FAIL reason=rtv_create_failed\n", path,
+                    f.name, c.suffix);
+                continue;
+            }
+            g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+            g.context->ClearRenderTargetView(rtv.Get(), clear);
+            g.context->PSSetShader(c.ps, nullptr, 0);
+            g.context->PSSetShaderResources(0, 1, &c.view);
+            g.context->Draw(3, 0);
+            ID3D11ShaderResourceView* no_srvs[1] = {nullptr};
+            g.context->PSSetShaderResources(0, 1, no_srvs);
+            g.context->Flush();
+            const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+            g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+            const SmallRead back = small_read(path, g.context.Get(), dst.Get(),
+                                             dst_staging.Get(), kUploadSize, 4);
+            _snprintf_s(item, sizeof(item), _TRUNCATE, "%s_%s", f.name, c.suffix);
+            if (!back.ok) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+                continue;
+            }
+            Rgba want[kUploadSize * kUploadSize];
+            Rgba got[kUploadSize * kUploadSize];
+            for (int y = 0; y < kUploadSize; ++y)
+                for (int x = 0; x < kUploadSize; ++x) {
+                    const int v = static_cast<int>(values[x]);
+                    want[y * kUploadSize + x] =
+                        c.raw_output ? Rgba{0, 0, 0, v} : Rgba{v, v, v, c.alpha};
+                    const uint8_t* p =
+                        back.bytes.data() + static_cast<size_t>(y) * back.pitch + x * 4;
+                    got[y * kUploadSize + x] =
+                        Rgba{static_cast<int>(p[0]), static_cast<int>(p[1]),
+                             static_cast<int>(p[2]), static_cast<int>(p[3])};
+                }
+            _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                        " fmt=%s note=%s hr_draw=0x%08lx", f.name, c.note,
+                        static_cast<unsigned long>(hr_draw));
+            ++items;
+            if (print_texel_item(path, item, extra, want, got, kUploadSize * kUploadSize,
+                                 kTexelTolerance))
+                ++failed;
+        }
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d skipped=%d formats=R8_UNORM,A8_UNORM"
+        " size=%dx%d tolerance=%d\n", path, items, failed, skipped, kUploadSize, kUploadSize,
+        kTexelTolerance);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
+// Mode 6: render target and SRV over the same R8_UNORM resource in one frame.
+const char* kRtPsConst =
+    "float4 main() : SV_Target {\n"
+    "    return float4(0.5, 0.5, 0.5, 0.5);\n"
+    "}\n";
+
+const char* kRtPsSample =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    float4 s = src.Load(int3(int2(pos.xy), 0));\n"
+    "    return float4(s.r, s.r, s.r, 1.0);\n"
+    "}\n";
+
+int run_rt_to_srv(bool warp, bool debug_layer) {
+    const char* path = "rt-to-srv";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_const_blob, ps_sample_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "rt_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "rt_ps_const", kRtPsConst, "ps_5_0", "ps_4_0",
+                        ps_const_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "rt_ps_sample", kRtPsSample, "ps_5_0", "ps_4_0",
+                        ps_sample_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps_const;
+    ComPtr<ID3D11PixelShader> ps_sample;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_const_blob->GetBufferPointer(),
+                                         ps_const_blob->GetBufferSize(), nullptr, &ps_const);
+        out("MODE=%s stage=create_ps_const hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_sample_blob->GetBufferPointer(),
+                                         ps_sample_blob->GetBufferSize(), nullptr,
+                                         &ps_sample);
+        out("MODE=%s stage=create_ps_sample hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    if (!small_pipeline(path, g, kRtSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    int failed = 0;
+    // One resource, both bindings: this is how a D2D coverage mask is produced
+    // and consumed.
+    ComPtr<ID3D11Texture2D> src, src_staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_R8_UNORM, kRtSize,
+                       D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, src,
+                       src_staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=r8_texture_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    const HRESULT hr_rtv = g.device->CreateRenderTargetView(src.Get(), nullptr, &rtv);
+    out("MODE=%s stage=create_r8_rtv bind=render_target|shader_resource hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_rtv));
+    ComPtr<ID3D11ShaderResourceView> srv;
+    const HRESULT hr_srv = g.device->CreateShaderResourceView(src.Get(), nullptr, &srv);
+    out("MODE=%s stage=create_r8_srv hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_srv));
+    if (FAILED(hr_rtv) || FAILED(hr_srv)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=r8_view_create_failed\n", path);
+        return 2;
+    }
+
+    // 1) PS 0.5 into the R8 render target.
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    g.context->ClearRenderTargetView(rtv.Get(), clear);
+    g.context->PSSetShader(ps_const.Get(), nullptr, 0);
+    g.context->Draw(3, 0);
+    g.context->Flush();
+    const HRESULT hr_rt_draw = g.device->GetDeviceRemovedReason();
+    g.context->OMSetRenderTargets(0, nullptr, nullptr);
+    out("MODE=%s stage=draw_rt ps=const_0.5 target=R8_UNORM size=%dx%d hr_draw=0x%08lx\n",
+        path, kRtSize, kRtSize, static_cast<unsigned long>(hr_rt_draw));
+
+    const SmallRead rt =
+        small_read(path, g.context.Get(), src.Get(), src_staging.Get(), kRtSize, 1);
+    char extra[192];
+    if (!rt.ok) {
+        ++failed;
+        ++g_failures;
+        out("MODE=%s ITEM=rt_r8_fill_0p5 RESULT=FAIL reason=map_read_failed\n", path);
+    } else {
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " path=RT_write_then_copy ps=const_0.5 store=rn hr_draw=0x%08lx",
+                    static_cast<unsigned long>(hr_rt_draw));
+        if (print_scalar_item(path, "rt_r8_fill_0p5", extra, rt, kRtSize, 128,
+                              kTexelTolerance))
+            ++failed;
+    }
+
+    // 2) the same resource as SRV, sampled into a BGRA target.
+    ComPtr<ID3D11Texture2D> dst, dst_staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kRtSize,
+                       D3D11_BIND_RENDER_TARGET, dst, dst_staging)) {
+        ++failed;
+        ++g_failures;
+        out("MODE=%s ITEM=rt_then_srv RESULT=FAIL reason=dst_texture_create_failed\n", path);
+    } else {
+        ComPtr<ID3D11RenderTargetView> dst_rtv;
+        const HRESULT hr_dst_rtv =
+            g.device->CreateRenderTargetView(dst.Get(), nullptr, &dst_rtv);
+        out("MODE=%s stage=create_dst_rtv hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr_dst_rtv));
+        if (FAILED(hr_dst_rtv)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=rt_then_srv RESULT=FAIL reason=rtv_create_failed\n", path);
+        } else {
+            g.context->OMSetRenderTargets(1, dst_rtv.GetAddressOf(), nullptr);
+            g.context->ClearRenderTargetView(dst_rtv.Get(), clear);
+            g.context->PSSetShader(ps_sample.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* views[1] = {srv.Get()};
+            g.context->PSSetShaderResources(0, 1, views);
+            g.context->Draw(3, 0);
+            ID3D11ShaderResourceView* no_srvs[1] = {nullptr};
+            g.context->PSSetShaderResources(0, 1, no_srvs);
+            g.context->Flush();
+            const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+            g.context->OMSetRenderTargets(0, nullptr, nullptr);
+            const SmallRead back = small_read(path, g.context.Get(), dst.Get(),
+                                             dst_staging.Get(), kRtSize, 4);
+            if (!back.ok) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=rt_then_srv RESULT=FAIL reason=map_read_failed\n", path);
+            } else {
+                _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                            " path=RT_then_SRV_same_resource ps=load_r_replicate_alpha_255"
+                            " sample_point=pixel_xy hr_draw=0x%08lx",
+                            static_cast<unsigned long>(hr_draw));
+                if (print_plane_item(path, "rt_then_srv", extra, back, kRtSize,
+                                     Rgba{128, 128, 128, 255}, kTexelTolerance))
+                    ++failed;
+            }
+        }
+    }
+
+    out("MODE=%s SUMMARY items=2 failed=%d resource=R8_UNORM size=%dx%d tolerance=%d"
+        " bind=render_target|shader_resource\n", path, failed, kRtSize, kRtSize,
+        kTexelTolerance);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
+// Mode 7: which D2D primitive families survive. Same 512x128 BGRA target and
+// same black solid brush as d2d-primitives, one fresh target per item.
+enum AaDrawKind { kAaRectStroke, kAaTriangleFill, kAaEllipseFill, kAaLine };
+enum AaJudge { kJudgeInk, kJudgeLine, kJudgeCoverage };
+
+struct AaItem {
+    AaDrawKind draw;
+    D2D1_ANTIALIAS_MODE aa;
+    AaJudge judge;
+    RECT region;
+    float line_y;
+    float line_width;
+    const char* name;
+    const char* expected;
+};
+
+int run_d2d_aa_modes(bool warp, bool debug_layer) {
+    const char* path = "d2d-aa-modes";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID2D1PathGeometry> triangle;
+    HRESULT hr = g.d2d->CreatePathGeometry(&triangle);
+    out("MODE=%s stage=create_path_geometry hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        ComPtr<ID2D1GeometrySink> sink;
+        hr = triangle->Open(&sink);
+        if (SUCCEEDED(hr)) {
+            sink->BeginFigure(D2D1::Point2F(40.0f, 20.0f), D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(D2D1::Point2F(120.0f, 20.0f));
+            sink->AddLine(D2D1::Point2F(80.0f, 100.0f));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            hr = sink->Close();
+        }
+        out("MODE=%s stage=triangle_geometry points=40,20_120,20_80,100 hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=path_geometry_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    const AaItem items[] = {
+        {kAaRectStroke, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, kJudgeInk, RECT{76, 4, 148, 76},
+         0.0f, 0.0f, "rect_stroke_aa",
+         "dark_gt_50_bbox_ge_8x4_outline_63x63_1px_aa_on"},
+        {kAaRectStroke, D2D1_ANTIALIAS_MODE_ALIASED, kJudgeInk, RECT{76, 4, 148, 76}, 0.0f,
+         0.0f, "rect_stroke_aliased",
+         "dark_gt_50_bbox_ge_8x4_outline_63x63_1px_aa_off"},
+        {kAaTriangleFill, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, kJudgeInk, RECT{36, 16, 124, 104},
+         0.0f, 0.0f, "triangle_fill_aa", "dark_gt_50_bbox_ge_8x4_filled_triangle_aa_on"},
+        {kAaEllipseFill, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, kJudgeInk, RECT{36, 20, 124, 108},
+         0.0f, 0.0f, "ellipse_fill_aa", "dark_gt_50_bbox_ge_8x4_filled_ellipse_aa_on"},
+        {kAaLine, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, kJudgeCoverage, RECT{0, 84, 512, 118},
+         100.5f, 1.0f, "line_d2d_aa",
+         "nonwhite_gt_50_bbox_width_ge_100_half_pixel_aa_on"},
+        {kAaLine, D2D1_ANTIALIAS_MODE_ALIASED, kJudgeLine, RECT{0, 84, 512, 118}, 100.5f,
+         1.0f, "line_d2d_aliased",
+         "dark_gt_50_bbox_width_ge_100_half_pixel_aa_off"},
+    };
+
+    int failed = 0;
+    unsigned long long dark_by_item[ARRAYSIZE(items)] = {0, 0, 0, 0, 0, 0};
+    size_t index = 0;
+    for (const AaItem& item : items) {
+        const size_t this_index = index++;
+        Target t;
+        if (!target_create(path, g, warp, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path,
+                item.name);
+            continue;
+        }
+        t.rt->SetAntialiasMode(item.aa);
+        const D2D1_ANTIALIAS_MODE effective = t.rt->GetAntialiasMode();
+        ComPtr<ID2D1SolidColorBrush> black;
+        hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s stage=d2d_solid_brush hr=0x%08lx RESULT=FAIL\n", path,
+                item.name, static_cast<unsigned long>(hr));
+            continue;
+        }
+        t.rt->BeginDraw();
+        t.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
+        switch (item.draw) {
+            case kAaRectStroke:
+                t.rt->DrawRectangle(D2D1::RectF(80.5f, 8.5f, 143.5f, 71.5f), black.Get(),
+                                    1.0f);
+                break;
+            case kAaTriangleFill:
+                t.rt->FillGeometry(triangle.Get(), black.Get());
+                break;
+            case kAaEllipseFill:
+                t.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(80.0f, 64.0f), 40.0f, 40.0f),
+                                  black.Get());
+                break;
+            case kAaLine:
+                t.rt->DrawLine(D2D1::Point2F(8.0f, item.line_y),
+                               D2D1::Point2F(240.0f, item.line_y), black.Get(),
+                               item.line_width);
+                break;
+        }
+        hr = t.rt->EndDraw();
+        char extra[256];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " region=%d,%d,%d,%d requested_aa=%d effective_aa=%d end_draw_hr=0x%08lx"
+                    " expected=%s", static_cast<int>(item.region.left),
+                    static_cast<int>(item.region.top), static_cast<int>(item.region.right),
+                    static_cast<int>(item.region.bottom), static_cast<int>(item.aa),
+                    static_cast<int>(effective), static_cast<unsigned long>(hr),
+                    item.expected);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=end_draw_failed\n", path, item.name,
+                extra);
+            continue;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (!target_map(path, g, t, mapped)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=map_read_failed\n", path, item.name,
+                extra);
+            continue;
+        }
+        const PixelStats s = analyze(static_cast<const uint8_t*>(mapped.pData),
+                                     static_cast<int>(mapped.RowPitch), kWidth, kHeight,
+                                     item.region);
+        g.context->Unmap(t.staging.Get(), 0);
+        dark_by_item[this_index] = s.dark;
+        const char* reason = nullptr;
+        switch (item.judge) {
+            case kJudgeInk: reason = ink_reason(s); break;
+            case kJudgeLine: reason = line_reason(s); break;
+            case kJudgeCoverage: reason = coverage_reason(s); break;
+        }
+        if (print_ink_item_with(path, item.name, extra, s, reason)) ++failed;
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d targets=%d"
+        " dark_by_item=%llu,%llu,%llu,%llu,%llu,%llu\n", path,
+        static_cast<int>(ARRAYSIZE(items)), failed, static_cast<int>(ARRAYSIZE(items)),
+        dark_by_item[0], dark_by_item[1], dark_by_item[2], dark_by_item[3],
+        dark_by_item[4], dark_by_item[5]);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
+// target_create with an explicit D2D alpha mode. A separate function on purpose:
+// the v2/v3 modes keep calling target_create and their output lines are not
+// touched by the alpha-mode cases.
+bool target_create_alpha(const char* path, const Gpu& g, bool warp, D2D1_ALPHA_MODE alpha,
+                         const char* alpha_name, Target& t) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = kWidth;
+    desc.Height = kHeight;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    HRESULT hr = g.device->CreateTexture2D(&desc, nullptr, &t.tex);
+    out("MODE=%s stage=create_texture size=%dx%d format=BGRA8 bind=RENDER_TARGET"
+        " alpha_mode=%s hr=0x%08lx\n", path, kWidth, kHeight, alpha_name,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    hr = t.tex.As(&t.surface);
+    if (FAILED(hr)) {
+        out("MODE=%s stage=query_dxgi_surface alpha_mode=%s hr=0x%08lx\n", path, alpha_name,
+            static_cast<unsigned long>(hr));
+        return false;
+    }
+    const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        warp ? D2D1_RENDER_TARGET_TYPE_DEFAULT : D2D1_RENDER_TARGET_TYPE_HARDWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, alpha), 96.0f, 96.0f);
+    hr = g.d2d->CreateDxgiSurfaceRenderTarget(t.surface.Get(), &props, &t.rt);
+    out("MODE=%s stage=d2d_surface_rt target_type=%s alpha_mode=%s hr=0x%08lx\n", path,
+        warp ? "default" : "hardware", alpha_name, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    t.rt->SetDpi(96.0f, 96.0f);
+
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = g.device->CreateTexture2D(&staging_desc, nullptr, &t.staging);
+    if (FAILED(hr)) {
+        out("MODE=%s stage=create_staging alpha_mode=%s hr=0x%08lx\n", path, alpha_name,
+            static_cast<unsigned long>(hr));
+        return false;
+    }
+    return true;
+}
+
+// Mode 8: which glyph path survives.
+struct GlyphSource {
+    ComPtr<IDWriteFontFace> face;
+    UINT16 glyphs[kTextLen] = {0, 0, 0, 0, 0, 0, 0, 0};
+    FLOAT advances[kTextLen] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    UINT32 design_units = 0;
+    FLOAT ascent_px = 0.0f;
+    FLOAT advance_sum = 0.0f;
+    bool ok = false;
+};
+
+GlyphSource glyph_source(const char* path, const Gpu& g) {
+    GlyphSource s;
+    ComPtr<IDWriteFontCollection> fonts;
+    HRESULT hr = g.dwrite->GetSystemFontCollection(&fonts, FALSE);
+    out("MODE=%s stage=get_system_fonts hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return s;
+    UINT32 index = 0;
+    BOOL exists = FALSE;
+    hr = fonts->FindFamilyName(kFontFamily, &index, &exists);
+    out("MODE=%s stage=find_family family=\"Segoe UI\" hr=0x%08lx index=%u exists=%s\n", path,
+        static_cast<unsigned long>(hr), index, exists ? "yes" : "no");
+    if (FAILED(hr) || !exists) return s;
+    ComPtr<IDWriteFontFamily> family;
+    hr = fonts->GetFontFamily(index, &family);
+    out("MODE=%s stage=get_font_family hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return s;
+    ComPtr<IDWriteFont> font;
+    hr = family->GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                      DWRITE_FONT_STYLE_NORMAL, &font);
+    out("MODE=%s stage=get_first_matching_font hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return s;
+    hr = font->CreateFontFace(&s.face);
+    out("MODE=%s stage=create_font_face hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return s;
+    DWRITE_FONT_METRICS metrics{};
+    s.face->GetMetrics(&metrics);
+    s.design_units = metrics.designUnitsPerEm;
+    UINT32 codepoints[kTextLen];
+    for (UINT32 i = 0; i < kTextLen; ++i) codepoints[i] = static_cast<UINT32>(kText[i]);
+    hr = s.face->GetGlyphIndices(codepoints, kTextLen, s.glyphs);
+    out("MODE=%s stage=get_glyph_indices count=%u hr=0x%08lx\n", path, kTextLen,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return s;
+    DWRITE_GLYPH_METRICS glyph_metrics[kTextLen]{};
+    hr = s.face->GetDesignGlyphMetrics(s.glyphs, kTextLen, glyph_metrics, FALSE);
+    out("MODE=%s stage=get_design_glyph_metrics count=%u hr=0x%08lx design_units=%u\n", path,
+        kTextLen, static_cast<unsigned long>(hr), s.design_units);
+    if (FAILED(hr)) return s;
+    const FLOAT scale =
+        (s.design_units > 0) ? kFontSize / static_cast<FLOAT>(s.design_units) : 0.0f;
+    for (UINT32 i = 0; i < kTextLen; ++i) {
+        s.advances[i] = static_cast<FLOAT>(glyph_metrics[i].advanceWidth) * scale;
+        s.advance_sum += s.advances[i];
+    }
+    s.ascent_px = static_cast<FLOAT>(metrics.ascent) * scale;
+    out("MODE=%s stage=glyph_run_ready glyphs=%u,%u,%u,%u,%u,%u,%u,%u advance_sum=%.2f"
+        " ascent_px=%.2f baseline_y=%.2f\n",
+        path, s.glyphs[0], s.glyphs[1], s.glyphs[2], s.glyphs[3], s.glyphs[4], s.glyphs[5],
+        s.glyphs[6], s.glyphs[7], static_cast<double>(s.advance_sum),
+        static_cast<double>(s.ascent_px),
+        static_cast<double>(static_cast<FLOAT>(kTextTop) + s.ascent_px));
+    s.ok = true;
+    return s;
+}
+
+int finish_text_item(const char* path, const char* item, const char* extra, Gpu& g,
+                     Target& t) {
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (!target_map(path, g, t, mapped)) {
+        ++g_failures;
+        out("MODE=%s ITEM=%s%s RESULT=FAIL reason=map_read_failed\n", path, item, extra);
+        return 1;
+    }
+    const PixelStats s = analyze(static_cast<const uint8_t*>(mapped.pData),
+                                 static_cast<int>(mapped.RowPitch), kWidth, kHeight,
+                                 text_rect());
+    g.context->Unmap(t.staging.Get(), 0);
+    return print_ink_item(path, item, extra, s) ? 1 : 0;
+}
+
+int run_text_paths(bool warp, bool debug_layer) {
+    const char* path = "text-paths";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    int failed = 0;
+    ComPtr<IDWriteTextLayout> layout;
+    HRESULT hr = g.dwrite->CreateTextLayout(kText, kTextLen, g.format.Get(), 496.0f, 112.0f,
+                                            &layout);
+    out("MODE=%s stage=dwrite_create_layout hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=text_layout_failed\n", path);
+        return 2;
+    }
+    const D2D1_COLOR_F white = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+
+    // a) DrawTextLayout with a solid black brush: the path the device already
+    //    reported as inkless, kept as the control.
+    {
+        Target t;
+        if (!target_create(path, g, warp, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=solid_brush RESULT=FAIL reason=target_create_failed\n", path);
+        } else {
+            ComPtr<ID2D1SolidColorBrush> black;
+            hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+            out("MODE=%s stage=d2d_solid_brush item=solid_brush hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr));
+            if (FAILED(hr)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=solid_brush RESULT=FAIL reason=solid_brush_failed\n",
+                    path);
+            } else {
+                t.rt->BeginDraw();
+                t.rt->Clear(white);
+                t.rt->DrawTextLayout(D2D1::Point2F(8.0f, 8.0f), layout.Get(), black.Get(),
+                                     D2D1_DRAW_TEXT_OPTIONS_NONE);
+                hr = t.rt->EndDraw();
+                char extra[256];
+                _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                            " region=%d,%d,%d,%d alpha_mode=ignore brush=solid_black"
+                            " effective_text_aa=%d end_draw_hr=0x%08lx"
+                            " expected=dark_gt_50_bbox_ge_8x4_glyph_ink",
+                            kTextLeft, kTextTop, kTextRight, kTextBottom,
+                            static_cast<int>(t.rt->GetTextAntialiasMode()),
+                            static_cast<unsigned long>(hr));
+                if (FAILED(hr)) {
+                    ++failed;
+                    ++g_failures;
+                    out("MODE=%s ITEM=solid_brush%s RESULT=FAIL reason=end_draw_failed\n",
+                        path, extra);
+                } else {
+                    failed += finish_text_item(path, "solid_brush", extra, g, t);
+                }
+            }
+        }
+    }
+
+    // b) same layout, 1x1 black bitmap brush (clamp/nearest): separates "this
+    //    brush type" from "glyph coverage".
+    {
+        Target t;
+        if (!target_create(path, g, warp, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=bitmap_brush RESULT=FAIL reason=target_create_failed\n", path);
+        } else {
+            const uint8_t black_px[4] = {0, 0, 0, 255};
+            const D2D1_BITMAP_PROPERTIES bitmap_props =
+                D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                         D2D1_ALPHA_MODE_IGNORE),
+                                       96.0f, 96.0f);
+            ComPtr<ID2D1Bitmap> black_bitmap;
+            hr = t.rt->CreateBitmap(D2D1::SizeU(1, 1), black_px, 4, bitmap_props,
+                                    &black_bitmap);
+            out("MODE=%s stage=create_bitmap item=bitmap_brush size=1x1 color=black"
+                " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+            ComPtr<ID2D1BitmapBrush> brush;
+            HRESULT hr_brush = E_FAIL;
+            if (SUCCEEDED(hr)) {
+                const D2D1_BITMAP_BRUSH_PROPERTIES brush_props = D2D1::BitmapBrushProperties(
+                    D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                hr_brush = t.rt->CreateBitmapBrush(black_bitmap.Get(), brush_props, &brush);
+                out("MODE=%s stage=create_bitmap_brush item=bitmap_brush extend=clamp"
+                    " hr=0x%08lx\n", path, static_cast<unsigned long>(hr_brush));
+            }
+            if (FAILED(hr) || FAILED(hr_brush)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=bitmap_brush RESULT=FAIL"
+                    " reason=bitmap_brush_setup_failed\n", path);
+            } else {
+                t.rt->BeginDraw();
+                t.rt->Clear(white);
+                t.rt->DrawTextLayout(D2D1::Point2F(8.0f, 8.0f), layout.Get(), brush.Get(),
+                                     D2D1_DRAW_TEXT_OPTIONS_NONE);
+                hr = t.rt->EndDraw();
+                char extra[256];
+                _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                            " region=%d,%d,%d,%d alpha_mode=ignore"
+                            " brush=bitmap_1x1_black_clamp effective_text_aa=%d"
+                            " end_draw_hr=0x%08lx expected=dark_gt_50_bbox_ge_8x4_glyph_ink",
+                            kTextLeft, kTextTop, kTextRight, kTextBottom,
+                            static_cast<int>(t.rt->GetTextAntialiasMode()),
+                            static_cast<unsigned long>(hr));
+                if (FAILED(hr)) {
+                    ++failed;
+                    ++g_failures;
+                    out("MODE=%s ITEM=bitmap_brush%s RESULT=FAIL reason=end_draw_failed\n",
+                        path, extra);
+                } else {
+                    failed += finish_text_item(path, "bitmap_brush", extra, g, t);
+                }
+            }
+        }
+    }
+
+    // c) antialiasing off, both the geometry and the text mode set.
+    {
+        Target t;
+        if (!target_create(path, g, warp, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=text_aliased RESULT=FAIL reason=target_create_failed\n", path);
+        } else {
+            t.rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            t.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_ALIASED);
+            const int effective_aa = static_cast<int>(t.rt->GetAntialiasMode());
+            const int effective_text_aa = static_cast<int>(t.rt->GetTextAntialiasMode());
+            ComPtr<ID2D1SolidColorBrush> black;
+            hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+            if (FAILED(hr)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=text_aliased stage=d2d_solid_brush hr=0x%08lx RESULT=FAIL\n",
+                    path, static_cast<unsigned long>(hr));
+            } else {
+                t.rt->BeginDraw();
+                t.rt->Clear(white);
+                t.rt->DrawTextLayout(D2D1::Point2F(8.0f, 8.0f), layout.Get(), black.Get(),
+                                     D2D1_DRAW_TEXT_OPTIONS_NONE);
+                hr = t.rt->EndDraw();
+                char extra[256];
+                _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                            " region=%d,%d,%d,%d alpha_mode=ignore brush=solid_black"
+                            " effective_aa=%d effective_text_aa=%d end_draw_hr=0x%08lx"
+                            " expected=dark_gt_50_bbox_ge_8x4_glyph_ink_no_coverage",
+                            kTextLeft, kTextTop, kTextRight, kTextBottom, effective_aa,
+                            effective_text_aa, static_cast<unsigned long>(hr));
+                if (FAILED(hr)) {
+                    ++failed;
+                    ++g_failures;
+                    out("MODE=%s ITEM=text_aliased%s RESULT=FAIL reason=end_draw_failed\n",
+                        path, extra);
+                } else {
+                    failed += finish_text_item(path, "text_aliased", extra, g, t);
+                }
+            }
+        }
+    }
+
+    // d) DrawGlyphRun directly: no text layout, no glyph-run cache, explicit
+    //    glyph indices and advances from the font face.
+    {
+        const GlyphSource gs = glyph_source(path, g);
+        if (!gs.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=glyph_run RESULT=FAIL reason=font_face_or_metrics_failed\n",
+                path);
+        } else {
+            Target t;
+            if (!target_create(path, g, warp, t)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=glyph_run RESULT=FAIL reason=target_create_failed\n", path);
+            } else {
+                ComPtr<ID2D1SolidColorBrush> black;
+                hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f),
+                                                &black);
+                if (FAILED(hr)) {
+                    ++failed;
+                    ++g_failures;
+                    out("MODE=%s ITEM=glyph_run stage=d2d_solid_brush hr=0x%08lx"
+                        " RESULT=FAIL\n", path, static_cast<unsigned long>(hr));
+                } else {
+                    DWRITE_GLYPH_RUN run{};
+                    run.fontFace = gs.face.Get();
+                    run.fontEmSize = kFontSize;
+                    run.glyphCount = kTextLen;
+                    run.glyphIndices = gs.glyphs;
+                    run.glyphAdvances = gs.advances;
+                    run.glyphOffsets = nullptr;
+                    run.isSideways = FALSE;
+                    run.bidiLevel = 0;
+                    t.rt->BeginDraw();
+                    t.rt->Clear(white);
+                    // DrawGlyphRun takes a BASELINE origin, not a layout top-left,
+                    // so shift down by the font ascent or the glyph bodies would
+                    // be drawn above the surface.
+                    const FLOAT baseline_y =
+                        static_cast<FLOAT>(kTextTop) + gs.ascent_px;
+                    // DrawGlyphRun returns void; EndDraw is the error signal.
+                    t.rt->DrawGlyphRun(D2D1::Point2F(static_cast<FLOAT>(kTextLeft), baseline_y),
+                                       &run, black.Get(), DWRITE_MEASURING_MODE_NATURAL);
+                    hr = t.rt->EndDraw();
+                    char extra[256];
+                    _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                                " region=%d,%d,%d,%d alpha_mode=ignore brush=solid_black"
+                                " glyphs=%u advance_sum=%.2f baseline_y=%.2f"
+                                " effective_text_aa=%d end_draw_hr=0x%08lx"
+                                " expected=dark_gt_50_bbox_ge_8x4_glyph_ink_direct_run",
+                                kTextLeft, kTextTop, kTextRight, kTextBottom, kTextLen,
+                                static_cast<double>(gs.advance_sum),
+                                static_cast<double>(baseline_y),
+                                static_cast<int>(t.rt->GetTextAntialiasMode()),
+                                static_cast<unsigned long>(hr));
+                    if (FAILED(hr)) {
+                        ++failed;
+                        ++g_failures;
+                        out("MODE=%s ITEM=glyph_run%s RESULT=FAIL reason=end_draw_failed\n",
+                            path, extra);
+                    } else {
+                        failed += finish_text_item(path, "glyph_run", extra, g, t);
+                    }
+                }
+            }
+        }
+    }
+
+    // e) the same GRAYSCALE text draw into an ALPHA_MODE_IGNORE and an
+    //    ALPHA_MODE_PREMULTIPLIED target: the alpha mode is the only difference.
+    struct AlphaCase {
+        D2D1_ALPHA_MODE mode;
+        const char* name;
+        const char* item;
+    };
+    const AlphaCase alpha_cases[] = {
+        {D2D1_ALPHA_MODE_IGNORE, "ignore", "target_alpha_ignore"},
+        {D2D1_ALPHA_MODE_PREMULTIPLIED, "premultiplied", "target_alpha_premultiplied"},
+    };
+    for (const AlphaCase& c : alpha_cases) {
+        Target t;
+        if (!target_create_alpha(path, g, warp, c.mode, c.name, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed alpha_mode=%s\n",
+                path, c.item, c.name);
+            continue;
+        }
+        t.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        const int effective_text_aa = static_cast<int>(t.rt->GetTextAntialiasMode());
+        ComPtr<ID2D1SolidColorBrush> black;
+        hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s stage=d2d_solid_brush hr=0x%08lx RESULT=FAIL\n", path,
+                c.item, static_cast<unsigned long>(hr));
+            continue;
+        }
+        t.rt->BeginDraw();
+        t.rt->Clear(white);
+        t.rt->DrawTextLayout(D2D1::Point2F(8.0f, 8.0f), layout.Get(), black.Get(),
+                             D2D1_DRAW_TEXT_OPTIONS_NONE);
+        hr = t.rt->EndDraw();
+        char extra[256];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " region=%d,%d,%d,%d alpha_mode=%s brush=solid_black"
+                    " effective_text_aa=%d end_draw_hr=0x%08lx"
+                    " expected=dark_gt_50_bbox_ge_8x4_glyph_ink_grayscale",
+                    kTextLeft, kTextTop, kTextRight, kTextBottom, c.name, effective_text_aa,
+                    static_cast<unsigned long>(hr));
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=end_draw_failed\n", path, c.item,
+                extra);
+            continue;
+        }
+        failed += finish_text_item(path, c.item, extra, g, t);
+    }
+
+    out("MODE=%s SUMMARY items=6 failed=%d targets=6 separate_readbacks=yes"
+        " text=\"TEST 123\" font=\"Segoe UI\" size_px=48\n", path, failed);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
+    if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
+    if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
+    if (mode == "d2d-aa-modes") return run_d2d_aa_modes(warp, debug_layer);
+    if (mode == "text-paths") return run_text_paths(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -2047,6 +3371,18 @@ void usage() {
         "                    half-pixel row antialiased vs aliased, each on its own\n"
         "                    target; the half-pixel AA item is judged on non-white\n"
         "                    pixels, not on dark pixels\n"
+        "  --mode a8-upload  UpdateSubresource {0,64,128,255} into 4x4 R8_UNORM and\n"
+        "                    A8_UNORM, read the bytes back, then sample the same\n"
+        "                    texture through the default SRV and a (ZERO,ZERO,ZERO,R)\n"
+        "                    mapped SRV into BGRA; unsupported format is SKIP\n"
+        "  --mode rt-to-srv  one R8_UNORM as render target and SRV in one frame:\n"
+        "                    PS 0.5 -> 128 in R8 -> sampled -> 128,128,128 in BGRA\n"
+        "  --mode d2d-aa-modes  six D2D primitives, each on its own target: AA and\n"
+        "                    aliased 1px stroke, AA triangle, AA ellipse, AA and\n"
+        "                    aliased 1px half-pixel line\n"
+        "  --mode text-paths  six glyph paths, each on its own target: solid and\n"
+        "                    bitmap brush, aliased text, direct DrawGlyphRun, and a\n"
+        "                    GRAYSCALE draw into ALPHA_MODE_IGNORE and PREMULTIPLIED\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -2089,6 +3425,14 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("a8-contract");
             } else if (value == L"drawline") {
                 modes.push_back("drawline");
+            } else if (value == L"a8-upload") {
+                modes.push_back("a8-upload");
+            } else if (value == L"rt-to-srv") {
+                modes.push_back("rt-to-srv");
+            } else if (value == L"d2d-aa-modes") {
+                modes.push_back("d2d-aa-modes");
+            } else if (value == L"text-paths") {
+                modes.push_back("text-paths");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
