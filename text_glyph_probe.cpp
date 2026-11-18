@@ -7087,13 +7087,14 @@ int run_int_attribs(bool warp, bool debug_layer) {
             dst[0] = back.bytes[o + 0];
             dst[1] = back.bytes[o + 1];
             dst[2] = back.bytes[o + 2];
+            dst[3] = back.bytes[o + 3];
         };
-        int s0[3], s64[3], s192[3], s255[3];
+        int s0[4], s64[4], s192[4], s255[4];
         sample(0, s0); sample(64, s64); sample(192, s192); sample(255, s255);
-        out("MODE=%s ITEM=%s SAMPLES x0=%d,%d,%d x64=%d,%d,%d x128=%d,%d,%d"
-            " x192=%d,%d,%d x255=%d,%d,%d\n", path, item, s0[0], s0[1], s0[2], s64[0],
-            s64[1], s64[2], got[0], got[1], got[2], s192[0], s192[1], s192[2], s255[0],
-            s255[1], s255[2]);
+        out("MODE=%s ITEM=%s SAMPLES x0=%d,%d,%d,%d x64=%d,%d,%d,%d x128=%d,%d,%d,%d"
+            " x192=%d,%d,%d,%d x255=%d,%d,%d,%d\n", path, item, s0[0], s0[1], s0[2], s0[3],
+            s64[0], s64[1], s64[2], s64[3], got[0], got[1], got[2], got[3], s192[0],
+            s192[1], s192[2], s192[3], s255[0], s255[1], s255[2], s255[3]);
         bool ok = true;
         for (int i = 0; i < 4; ++i) {
             if (abs(got[i] - expected[i]) > 1) ok = false;
@@ -7106,6 +7107,25 @@ int run_int_attribs(bool warp, bool debug_layer) {
             ++g_failures;
         }
         (void)pair;
+    };
+    auto dump_grid = [&](const char* item) {
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
+                                          kIntSize, 4);
+        if (!back.ok) return;
+        out("MODE=%s ITEM=%s GRID_BEGIN\n", path, item);
+        for (int gy = 0; gy < 16; ++gy) {
+            char line[17];
+            const int y = 8 + gy * 16;
+            for (int gx = 0; gx < 16; ++gx) {
+                const int x = 8 + gx * 16;
+                const size_t o = static_cast<size_t>(y) * back.pitch +
+                                 static_cast<size_t>(x) * 4;
+                line[gx] = "0123456789abcdef"[static_cast<int>(back.bytes[o + 2]) >> 4];
+            }
+            line[16] = 0;
+            out("MODE=%s ITEM=%s GRID y=%d %s\n", path, item, y, line);
+        }
+        out("MODE=%s ITEM=%s GRID_END\n", path, item);
     };
 
     auto draw_quad = [&](Pair& pair, ComPtr<ID3D11InputLayout>& layout,
@@ -7234,6 +7254,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
                 const int expected[4] = {0, 0, 128, 255};
                 check_center("pos_const_varying", p, expected);
+                dump_grid("pos_const_varying");
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=pos_const_varying RESULT=FAIL reason=setup_failed\n", path);
@@ -7270,6 +7291,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
             draw_quad(float4_pair, layout, vb.Get(), sizeof(V), nullptr, 0, false);
             const int expected[4] = {7, 42, 99, 255};
             check_center("float4_control", float4_pair, expected);
+            dump_grid("float4_control");
         } else {
             ++failed; ++g_failures;
             out("MODE=%s ITEM=float4_control RESULT=FAIL reason=setup_failed\n", path);
