@@ -7160,6 +7160,64 @@ const char* kIntPsShiftCheck =
     "struct PSIn { float4 pos : SV_Position; float2 t : TEXY; float4 u : PADY; };\n"
     "float4 main(PSIn i) : SV_Target { return i.u; }\n";
 
+// v23: narrow the trigger. text_shape_nopad keeps the exact real-D2D glyph
+// interface (SV_Position, vec2, four packed flat scalars, no unused pad);
+// pack_after_vec2_fail would then be independent of the unused input.
+const char* kIntVsTextNoPad =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut {\n"
+    "    float4 pos : SV_POSITION;\n"
+    "    float2 t : TEXY;\n"
+    "    float a : G8; float b : G9; float c : G10; float d : G11;\n"
+    "};\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.t = float2(0.25, 0.75);\n"
+    "    o.a = 0.25; o.b = 0.5; o.c = 0.75; o.d = 1.0;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsTextNoPad =
+    "struct PSIn {\n"
+    "    float4 pos : SV_Position;\n"
+    "    noperspective float2 t : TEXY;\n"
+    "    nointerpolation float a : G8;\n"
+    "    nointerpolation float b : G9;\n"
+    "    nointerpolation float c : G10;\n"
+    "    nointerpolation float d : G11;\n"
+    "};\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(i.t.y + i.a - 0.5, i.t.x + i.b - 0.5, i.c, i.d);\n"
+    "}\n";
+
+// Reverse order: the packed scalars precede the vec2.
+const char* kIntVsPackFirst =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut {\n"
+    "    float4 pos : SV_POSITION;\n"
+    "    float a : G8; float b : G9; float c : G10; float d : G11;\n"
+    "    float2 t : TEXY;\n"
+    "};\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.a = 0.25; o.b = 0.5; o.c = 0.75; o.d = 1.0;\n"
+    "    o.t = float2(0.25, 0.75);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsPackFirst =
+    "struct PSIn {\n"
+    "    float4 pos : SV_Position;\n"
+    "    nointerpolation float a : G8;\n"
+    "    nointerpolation float b : G9;\n"
+    "    nointerpolation float c : G10;\n"
+    "    nointerpolation float d : G11;\n"
+    "    noperspective float2 t : TEXY;\n"
+    "};\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(i.t.y + i.a - 0.5, i.t.x + i.b - 0.5, i.c, i.d);\n"
+    "}\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -8116,6 +8174,64 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=shift_check RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case Y3: the real D2D glyph interface — no unused pad.
+    {
+        Pair p;
+        if (!build_pair("text_nopad", kIntVsTextNoPad, kIntPsTextNoPad, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=text_nopad RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {191, 64, 128, 255};
+                check_center("text_nopad", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=text_nopad RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case Y4: same varyings, scalars first.
+    {
+        Pair p;
+        if (!build_pair("pack_first", kIntVsPackFirst, kIntPsPackFirst, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=pack_first RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {191, 64, 128, 255};
+                check_center("pack_first", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=pack_first RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
