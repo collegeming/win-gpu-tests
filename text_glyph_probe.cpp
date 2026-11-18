@@ -6976,9 +6976,36 @@ const char* kIntVsDerived =
 
 constexpr int kIntSize = 256;
 
+void write_bmp(const char* item, const SmallRead& r, int size) {
+    char file[260];
+    _snprintf_s(file, sizeof(file), _TRUNCATE, "C:\\Users\\USER\\ia_%s.bmp", item);
+    FILE* f = nullptr;
+    if (fopen_s(&f, file, "wb") != 0 || !f) return;
+    const int row = size * 4;
+    const unsigned int data_size = static_cast<unsigned int>(row * size);
+    BITMAPFILEHEADER fh{};
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = static_cast<DWORD>(sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER));
+    fh.bfSize = fh.bfOffBits + data_size;
+    BITMAPINFOHEADER ih{};
+    ih.biSize = sizeof(ih);
+    ih.biWidth = size;
+    ih.biHeight = size;
+    ih.biPlanes = 1;
+    ih.biBitCount = 32;
+    ih.biCompression = BI_RGB;
+    ih.biSizeImage = data_size;
+    fwrite(&fh, sizeof(fh), 1, f);
+    fwrite(&ih, sizeof(ih), 1, f);
+    for (int y = size - 1; y >= 0; --y)
+        fwrite(r.bytes.data() + static_cast<size_t>(y) * r.pitch,
+               static_cast<size_t>(row), 1, f);
+    fclose(f);
+    out("MODE=%s stage=write_bmp item=%s file=%s\n", "int-attribs", item, file);
+}
+
 void reflect_signatures(const char* path, const char* name, ID3DBlob* vs_blob,
-                        ID3DBlob* ps_blob) {
-    ID3DBlob* blobs[2] = {vs_blob, ps_blob};
+                        ID3DBlob* ps_blob) {    ID3DBlob* blobs[2] = {vs_blob, ps_blob};
     const char* which[2] = {"vs", "ps"};
     for (int b = 0; b < 2; ++b) {
         ComPtr<ID3D11ShaderReflection> refl;
@@ -7130,6 +7157,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
             " x192=%d,%d,%d,%d x255=%d,%d,%d,%d\n", path, item, s0[0], s0[1], s0[2], s0[3],
             s64[0], s64[1], s64[2], s64[3], got[0], got[1], got[2], got[3], s192[0],
             s192[1], s192[2], s192[3], s255[0], s255[1], s255[2], s255[3]);
+        write_bmp(item, back, kIntSize);
         bool ok = true;
         for (int i = 0; i < 4; ++i) {
             if (abs(got[i] - expected[i]) > 1) ok = false;
