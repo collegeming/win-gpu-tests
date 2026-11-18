@@ -121,6 +121,14 @@ jobs:
           $hwExit = $LASTEXITCODE
           & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --log "$dir\runner-warp.txt" | Out-Null
           $warpExit = $LASTEXITCODE
+          # Surface the evidence verdicts in the job log so a non-zero evidence
+          # exit is diagnosable without the artifact; the full logs are packaged.
+          Write-Host "evidence_exits hardware=$hwExit warp=$warpExit"
+          foreach ($f in @('runner-hardware.txt', 'runner-warp.txt')) {
+            Write-Host "--- $f failures and summaries ---"
+            Select-String -Path "$dir\$f" -Pattern 'RESULT=FAIL', 'RESULT=SKIP', 'SUMMARY' |
+              ForEach-Object { $_.Line }
+          }
           New-Item -ItemType Directory text-glyph-package | Out-Null
           Copy-Item $exe, text_glyph_probe.cpp text-glyph-package
           Copy-Item .github\workflows\build.yml text-glyph-package\build-workflow.yml
@@ -351,6 +359,10 @@ jobs:
             '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, ([IO.Path]::GetRelativePath((Resolve-Path text-glyph-package).Path, $_.FullName))
           } | Set-Content text-glyph-package\SHA256SUMS.txt -Encoding ascii
           Get-Content text-glyph-package\SHA256SUMS.txt
+          # The GPU-less runner evidence above is recorded, never gated: without
+          # this the pwsh wrapper would promote the last native evidence exit code
+          # into the step result. Self-test failures still throw before this line.
+          exit 0
       - uses: actions/upload-artifact@v4
         with:
           name: text-glyph-probe-arm64
