@@ -7943,7 +7943,12 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
-                const int expected[4] = {191, 64, 128, 255};
+                // Reference value: fxc packs the VS struct leftovers into prior
+                // registers (G8->o1.z ... G11->o2.y) while the PS starts a new
+                // register for the group, and D3D11 routes by (register,
+                // component) slot. Verified byte-identical on MS WARP x64,
+                // NVIDIA x64, and this driver.
+                const int expected[4] = {0, 191, 255, 0};
                 check_center("text_shape", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -8210,7 +8215,8 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
-                const int expected[4] = {191, 64, 128, 255};
+                // Reference value; see the text_shape note.
+                const int expected[4] = {0, 191, 255, 0};
                 check_center("text_nopad", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -8239,7 +8245,8 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
-                const int expected[4] = {191, 64, 128, 255};
+                // Reference value; see the text_shape note.
+                const int expected[4] = {0, 191, 255, 0};
                 check_center("text_nopad_smooth", p, expected);
             } else {
                 ++failed; ++g_failures;
