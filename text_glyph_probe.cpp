@@ -6993,6 +6993,32 @@ const char* kIntPsColorVarying =
 
 const char* kIntPsRed = "float4 main() : SV_Target { return float4(1.0, 0.0, 0.0, 1.0); }\n";
 
+// Cases that mirror the real D2D glyph shader interface: the pixel shader
+// takes SV_Position (which occupies input register 0) plus a user varying at
+// register 1, so the DXBC registers agree across the two stages.
+const char* kIntPsGlyphSvpos =
+    "struct PSIn { float4 pos : SV_Position; float4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
+const char* kIntPsNopGlyphSvpos =
+    "struct PSIn { float4 pos : SV_Position; noperspective float4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
+const char* kIntVsG16 =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; nointerpolation uint g : G16; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.g = 0x00010001u;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsG16Svpos =
+    "struct PSIn { float4 pos : SV_Position; nointerpolation uint g : G16; };\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(float(i.g & 255u) / 255.0, float((i.g >> 8) & 255u) / 255.0, 0.0, 1.0);\n"
+    "}\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7455,6 +7481,95 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=red_control RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case G: SV_Position plus GLYPH in the PS, so both stages put the user
+    // varying at register 1 (the D2D glyph shader shape).
+    {
+        Pair p;
+        if (!build_pair("glyph_svpos", kIntVsConstVarying, kIntPsGlyphSvpos, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=glyph_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("glyph_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=glyph_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case H: same shape but the varying is noperspective.
+    {
+        Pair p;
+        if (!build_pair("glyph_nop_svpos", kIntVsConstVarying, kIntPsNopGlyphSvpos, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=glyph_nop_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("glyph_nop_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=glyph_nop_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case I: SV_Position plus a flat uint varying, the second D2D interface
+    // shape; checks flat integer delivery rather than interpolation.
+    {
+        Pair p;
+        if (!build_pair("g16_svpos", kIntVsG16, kIntPsG16Svpos, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=g16_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 1, 255};
+                check_center("g16_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=g16_svpos RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
