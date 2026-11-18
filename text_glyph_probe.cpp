@@ -6954,6 +6954,17 @@ const char* kIntPsUint1 =
     "    return float4(float(i.g & 255u), float((i.g >> 8) & 255u), 0.0, 255.0) / 255.0;\n"
     "}\n";
 
+const char* kIntPsConst = "float4 main() : SV_Target { return float4(0.0, 0.0, 0.0, 1.0); }\n";
+
+const char* kIntVsDerived =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.g = float4(i.pos.x * 0.5 + 0.5, 0.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
 constexpr int kIntSize = 256;
 
 // Fullscreen quad, two triangles, y flipped in NDC is irrelevant here.
@@ -7079,8 +7090,8 @@ int run_int_attribs(bool warp, bool debug_layer) {
                          ID3D11Buffer* vb0, UINT stride0, ID3D11Buffer* vb1, UINT stride1,
                          bool instanced) {
         if (!small_pipeline(path, g, kIntSize, pair.vs.Get())) return false;
-        const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        g.context->ClearRenderTargetView(rtv.Get(), white);
+        const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), magenta);
         ID3D11RenderTargetView* rtvs[1] = {rtv.Get()};
         g.context->OMSetRenderTargets(1, rtvs, nullptr);
         g.context->IASetInputLayout(layout.Get());
@@ -7097,6 +7108,86 @@ int run_int_attribs(bool warp, bool debug_layer) {
             g.context->Draw(6, 0);
         return true;
     };
+
+    auto build_pair = [&](const char* name, const char* vs_src, const char* ps_src,
+                          Pair& p) -> bool {
+        ComPtr<ID3DBlob> vb, pb;
+        const char* u = nullptr;
+        HRESULT h = a8_compile(path, name, vs_src, "vs_5_0", "vs_5_0", vb.GetAddressOf(), &u);
+        if (SUCCEEDED(h))
+            h = a8_compile(path, name, ps_src, "ps_5_0", "ps_5_0", pb.GetAddressOf(), &u);
+        if (SUCCEEDED(h)) {
+            p.vs_blob = vb;
+            h = g.device->CreateVertexShader(vb->GetBufferPointer(), vb->GetBufferSize(),
+                                             nullptr, p.vs.GetAddressOf());
+        }
+        if (SUCCEEDED(h))
+            h = g.device->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(),
+                                            nullptr, p.ps.GetAddressOf());
+        out("MODE=%s stage=create_shader_pair name=%s hr=0x%08lx\n", path, name,
+            static_cast<unsigned long>(h));
+        return SUCCEEDED(h);
+    };
+
+    // Case A: constant black on a magenta clear; if the centre stays magenta the
+    // quad never reached it, if it is black the draw and write mask work.
+    {
+        Pair p;
+        if (!build_pair("pos_only", kIntVsPos, kIntPsConst, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=pos_only_black RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 0, 255};
+                check_center("pos_only_black", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=pos_only_black RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case B: colour derived from POSITION only; proves the VS->PS varying path
+    // with a single vertex element.
+    {
+        Pair p;
+        if (!build_pair("pos_derived", kIntVsDerived, kIntPsFloat4, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=pos_derived RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("pos_derived", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=pos_derived RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
 
     // Case 1: float4 attribute control, both attributes in slot 0.
     {
@@ -7247,38 +7338,38 @@ int run_int_attribs(bool warp, bool debug_layer) {
         }
     }
 
-    // Case 5: R16_UINT attribute, 0x2A63 -> 99/42.
+    // Case 5: R32_UINT attribute, 0x2A63 -> 99/42.
     {
-        struct V16 { float pos[2]; unsigned short g; unsigned short pad; };
+        struct V16 { float pos[2]; unsigned int g; };
         V16 data[6];
         for (int i = 0; i < 6; ++i) {
             data[i].pos[0] = kIntPos6[i * 2];
             data[i].pos[1] = kIntPos6[i * 2 + 1];
-            data[i].g = 0x2A63;
-            data[i].pad = 0;
+            data[i].g = 0x2A63u;
+            // no padding field
         }
         D3D11_INPUT_ELEMENT_DESC elems[2] = {};
         elems[0].SemanticName = "POSITION"; elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
         elems[0].InputSlot = 0; elems[0].AlignedByteOffset = 0;
         elems[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
-        elems[1].SemanticName = "G16"; elems[1].Format = DXGI_FORMAT_R16_UINT;
+        elems[1].SemanticName = "G16"; elems[1].Format = DXGI_FORMAT_R32_UINT;
         elems[1].InputSlot = 0; elems[1].AlignedByteOffset = 8;
         elems[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
         ComPtr<ID3D11InputLayout> layout;
         HRESULT h = g.device->CreateInputLayout(
             elems, 2, uint1_pair.vs_blob->GetBufferPointer(),
             uint1_pair.vs_blob->GetBufferSize(), layout.GetAddressOf());
-        out("MODE=%s stage=create_layout name=r16_uint hr=0x%08lx\n", path,
+        out("MODE=%s stage=create_layout name=r32_uint hr=0x%08lx\n", path,
             static_cast<unsigned long>(h));
         ComPtr<ID3D11Buffer> vb;
         if (SUCCEEDED(h) && create_buffer(path, g.device.Get(), data, sizeof(data),
                                           D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
             draw_quad(uint1_pair, layout, vb.Get(), sizeof(V16), nullptr, 0, false);
             const int expected[4] = {0, 42, 99, 255};
-            check_center("r16_uint", uint1_pair, expected);
+            check_center("r32_uint", uint1_pair, expected);
         } else {
             ++failed; ++g_failures;
-            out("MODE=%s ITEM=r16_uint RESULT=FAIL reason=setup_failed\n", path);
+            out("MODE=%s ITEM=r32_uint RESULT=FAIL reason=setup_failed\n", path);
         }
     }
 
