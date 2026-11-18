@@ -6983,7 +6983,7 @@ void reflect_signatures(const char* path, const char* name, ID3DBlob* vs_blob,
     for (int b = 0; b < 2; ++b) {
         ComPtr<ID3D11ShaderReflection> refl;
         HRESULT hr = D3DReflect(blobs[b]->GetBufferPointer(), blobs[b]->GetBufferSize(),
-                                IID_ID3D11ShaderReflection,
+                                __uuidof(ID3D11ShaderReflection),
                                 reinterpret_cast<void**>(refl.GetAddressOf()));
         if (FAILED(hr)) {
             out("MODE=%s stage=reflect name=%s who=%s hr=0x%08lx\n", path, name, which[b],
