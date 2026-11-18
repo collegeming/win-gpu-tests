@@ -4367,6 +4367,7 @@ int run_vb_paths(bool warp, bool debug_layer) {
     auto read_item = [&](const char* item, bool want_left, bool want_right, auto&& draw) {
         const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         g.context->ClearRenderTargetView(rtv.Get(), white);
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
         draw();
         g.context->Flush();
         const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
@@ -4711,6 +4712,42 @@ int run_mask_write_srv(bool warp, bool debug_layer) {
 
     write_mask(rtv_b.Get());
     srv_readback(srv_b.Get(), "with_uav_ps_write_srv");
+
+    // A fresh texture that is never cleared: if the PS write survives here but
+    // not after a ClearRenderTargetView, the clear is being submitted after the
+    // draw (deferred-clear ordering) rather than the integer write being lost.
+    ComPtr<ID3D11Texture2D> mask_c, stage_c;
+    if (small_texture(path, g.device.Get(), DXGI_FORMAT_R32_UINT, kMaskSize,
+                      D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, mask_c,
+                      stage_c)) {
+        ComPtr<ID3D11RenderTargetView> rtv_c;
+        ComPtr<ID3D11ShaderResourceView> srv_c;
+        const HRESULT hr_rc = g.device->CreateRenderTargetView(mask_c.Get(), nullptr,
+                                                               rtv_c.GetAddressOf());
+        const HRESULT hr_sc = g.device->CreateShaderResourceView(mask_c.Get(), nullptr,
+                                                                 srv_c.GetAddressOf());
+        out("MODE=%s stage=create_views no_clear rtv=0x%08lx srv=0x%08lx\n", path,
+            static_cast<unsigned long>(hr_rc), static_cast<unsigned long>(hr_sc));
+        if (SUCCEEDED(hr_rc) && SUCCEEDED(hr_sc)) {
+            g.context->OMSetRenderTargets(1, rtv_c.GetAddressOf(), nullptr);
+            g.context->PSSetShader(ps_write.Get(), nullptr, 0);
+            g.context->Draw(3, 0);
+            ID3D11RenderTargetView* no_rtv = nullptr;
+            g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+            g.context->Flush();
+            srv_readback(srv_c.Get(), "no_clear_ps_write_srv");
+        } else {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=no_clear_ps_write_srv RESULT=FAIL"
+                " reason=view_create_failed\n", path);
+        }
+    } else {
+        ++failed;
+        ++g_failures;
+        out("MODE=%s ITEM=no_clear_ps_write_srv RESULT=FAIL"
+            " reason=texture_create_failed\n", path);
+    }
 
     clear_bits(rtv_b.Get(), 65537u);
     srv_readback(srv_b.Get(), "with_uav_clear_srv");
