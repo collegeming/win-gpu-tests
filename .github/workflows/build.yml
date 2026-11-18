@@ -230,13 +230,26 @@ jobs:
             source entirely, which is the path a DirectWrite mask blend would take; 64 vs
             128 vs 255 tells you which blend equations and which component applied.
             uav_store_then_srv separates the A8 store side from the A8 sample side.
-          drawline re-draws a 2px horizontal line at y=100, x=8..240, once with
-            D2D1_ANTIALIAS_MODE_ANTIALIASED and once with ALIASED, each on its own target and
-            readback, and judges region 0,84,512,118. A 1px hairline measured ~100% white
-            while a 64x64 solid fill measured correct in the v2 device run, so the suspicion
-            is the AA/coverage rasterizer rather than the whole D2D pipeline. This item needs
-            dark > 50 and a dark bbox at least 100 px wide, because a long thin line is
-            expected to be sparse in a tall analysis rect.
+          drawline draws four 232px-long lines, each on its own target and readback, all
+            inside region 0,84,512,118:
+              line_2px_integer_aa    y=100.0 width 2 antialiased  fully covered control
+              line_1px_integer_aa    y=100.0 width 1 antialiased  fully covered control
+              line_1px_half_aa       y=100.5 width 1 antialiased  partial coverage only
+              line_1px_half_aliased  y=100.5 width 1 aliased      same geometry, AA off
+            The two integer lines are the control: they are fully covered, so they must be
+            dark exactly like the v2 solid fill. The half-pixel pair is the measurement: a
+            line straddling two rows can only paint through the coverage path, and its
+            aliased twin shows what the same geometry does with AA switched off.
+            The AA half-pixel item is judged on NON-WHITE pixels, not on dark pixels: a
+            50%-covered black-on-white pixel is mid-grey (luma about 127) and the luma < 128
+            rule would classify it unpredictably. Any coverage at all, partial or full,
+            passes it; its point is that ink exists. The other three items need dark > 50 with
+            a dark bbox at least 100 px wide.
+            A COVERAGE line then reports nonwhite counts for all four items and
+            aa_path=paints_ink only if the antialiased half-pixel line produced non-white
+            pixels. aa_path=paints_nothing with dark integer lines is the signature of a
+            broken coverage rasterizer: geometry that needs no partial coverage works,
+            geometry that does produces nothing.
           Modes never alter the full-mode numbers; a mode failure only changes the exit code
           and SUMMARY_MODES.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8

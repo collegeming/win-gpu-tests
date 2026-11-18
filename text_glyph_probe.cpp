@@ -1008,6 +1008,19 @@ const char* line_reason(const PixelStats& s) {
     return nullptr;
 }
 
+// A half-pixel line can only produce ink through the coverage path, and a
+// 50%-covered black-on-white pixel is mid-grey (luma about 127), which the
+// luma < 128 rule classifies unpredictably. So a sub-pixel line is judged on
+// non-white pixels: any coverage at all, partial or full, proves the AA
+// rasterizer produced something. Absence of non-white pixels is the finding.
+const char* coverage_reason(const PixelStats& s) {
+    if (s.nonwhite <= kMinDarkPixels) return "no_ink_at_all";
+    if (!s.nonwhite_bbox_valid) return "nonwhite_bbox_missing";
+    const int w = s.nonwhite_right - s.nonwhite_left;
+    if (w < 100) return "nonwhite_bbox_too_narrow";
+    return nullptr;
+}
+
 const char* print_ink_item_with(const char* mode, const char* item, const char* extra,
                                 const PixelStats& s, const char* reason) {
     char bbox[64] = "none";
@@ -1920,17 +1933,30 @@ int run_drawline(bool warp, bool debug_layer) {
     }
     gpu_adapter(path, g.device.Get());
 
+    // Four items, each on its own target. The 2px and 1px integer lines are
+    // both fully covered, so they must be dark in the same way the v2 solid fill
+    // was; they are the control. The y=100.5 pair is the measurement: a
+    // half-pixel line can only paint through the coverage path, and its aliased
+    // twin shows what the same geometry looks like with AA switched off.
     struct LineCase {
         D2D1_ANTIALIAS_MODE mode;
+        float y;
+        float width;
+        bool coverage_judged;
         const char* name;
     };
     const LineCase cases[] = {
-        {D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, "line_per_primitive"},
-        {D2D1_ANTIALIAS_MODE_ALIASED, "line_aliased"},
+        {D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, 100.0f, 2.0f, false, "line_2px_integer_aa"},
+        {D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, 100.0f, 1.0f, false, "line_1px_integer_aa"},
+        {D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, 100.5f, 1.0f, true, "line_1px_half_aa"},
+        {D2D1_ANTIALIAS_MODE_ALIASED, 100.5f, 1.0f, false, "line_1px_half_aliased"},
     };
 
     int failed = 0;
+    unsigned long long nonwhite_by_item[ARRAYSIZE(cases)] = {0, 0, 0, 0};
+    size_t item_index = 0;
     for (const LineCase& c : cases) {
+        const size_t this_index = item_index++;
         Target t;
         if (!target_create(path, g, warp, t)) {
             ++failed;
@@ -1951,12 +1977,13 @@ int run_drawline(bool warp, bool debug_layer) {
         }
         t.rt->BeginDraw();
         t.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
-        t.rt->DrawLine(D2D1::Point2F(8.0f, 100.0f), D2D1::Point2F(240.0f, 100.0f), black.Get(),
-                       2.0f);
+        t.rt->DrawLine(D2D1::Point2F(8.0f, c.y), D2D1::Point2F(240.0f, c.y), black.Get(),
+                       c.width);
         hr = t.rt->EndDraw();
-        char extra[96];
+        char extra[144];
         _snprintf_s(extra, sizeof(extra), _TRUNCATE,
-                    " requested_aa=%d effective_aa=%d end_draw_hr=0x%08lx",
+                    " y=%.1f width=%.1f requested_aa=%d effective_aa=%d end_draw_hr=0x%08lx",
+                    static_cast<double>(c.y), static_cast<double>(c.width),
                     static_cast<int>(c.mode), static_cast<int>(effective),
                     static_cast<unsigned long>(hr));
         if (FAILED(hr)) {
@@ -1976,10 +2003,19 @@ int run_drawline(bool warp, bool debug_layer) {
             analyze(static_cast<const uint8_t*>(mapped.pData),
                     static_cast<int>(mapped.RowPitch), kWidth, kHeight, RECT{0, 84, 512, 118});
         g.context->Unmap(t.staging.Get(), 0);
-        if (print_line_item(path, c.name, extra, s)) ++failed;
+        nonwhite_by_item[this_index] = s.nonwhite;
+        if (c.coverage_judged
+                ? print_ink_item_with(path, c.name, extra, s, coverage_reason(s))
+                : print_line_item(path, c.name, extra, s))
+            ++failed;
     }
-    out("MODE=%s SUMMARY items=%d failed=%d line=y100 x8..240 width=2"
-        " ink_rule=dark_gt_50_and_bbox_width_ge_100\n", path,
+    out("MODE=%s COVERAGE integer_2px_nonwhite=%llu integer_1px_nonwhite=%llu"
+        " half_pixel_aa_nonwhite=%llu half_pixel_aliased_nonwhite=%llu"
+        " aa_path=%s\n", path, nonwhite_by_item[0], nonwhite_by_item[1],
+        nonwhite_by_item[2], nonwhite_by_item[3],
+        nonwhite_by_item[2] > kMinDarkPixels ? "paints_ink" : "paints_nothing");
+    out("MODE=%s SUMMARY items=%d failed=%d x=8..240 rows=y100(int) y100.5(half)"
+        " judge=dark_run_or_partial_coverage aa=per_primitive_vs_aliased\n", path,
         static_cast<int>(ARRAYSIZE(cases)), failed);
     return failed ? 2 : 0;
 }
@@ -2007,8 +2043,10 @@ void usage() {
         "                    separates texture sampling from geometry\n"
         "  --mode a8-contract  A8_UNORM value contract: clear 0/255, PS 0.5 with and\n"
         "                    without blending, typed UAV store then SRV sample\n"
-        "  --mode drawline   long 2px line, antialiased vs aliased, on separate\n"
-        "                    targets\n"
+        "  --mode drawline   four long lines: 2px and 1px fully covered, 1px on a\n"
+        "                    half-pixel row antialiased vs aliased, each on its own\n"
+        "                    target; the half-pixel AA item is judged on non-white\n"
+        "                    pixels, not on dark pixels\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
