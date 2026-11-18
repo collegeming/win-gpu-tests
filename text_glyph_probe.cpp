@@ -4911,6 +4911,165 @@ int run_uint_rt_matrix(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v6: integer target ordering
+// ---------------------------------------------------------------------------
+// If a UAV store survives but a pixel-shader write does not, the write can be
+// lost in two very different places: the graphics pipeline may be rejected on
+// this integer attachment, or a pending clear may run after the draw. Storing
+// with a compute shader first puts the image in a defined state; a PS draw
+// after that has no pending clear left to lose against. The value that comes
+// back then separates "draw dropped" from "clear ordering".
+
+const char* kOrderCsStore =
+    "RWTexture2D<uint> dst : register(u0);\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) { dst[id.xy] = 0x11111111u; }\n";
+
+int run_uint_order(bool warp, bool debug_layer) {
+    const char* path = "uint-order";
+    const int size = 64;
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob, cs_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "order_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "order_ps", kMaskPsWrite, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "order_cs", kOrderCsStore, "cs_5_0", "cs_4_0",
+                        cs_blob.GetAddressOf(), &used);
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11ComputeShader> cs;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                          vs_blob->GetBufferSize(), nullptr,
+                                          vs.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                         ps_blob->GetBufferSize(), nullptr,
+                                         ps.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateComputeShader(cs_blob->GetBufferPointer(),
+                                           cs_blob->GetBufferSize(), nullptr,
+                                           cs.GetAddressOf());
+    if (FAILED(hr) || !small_pipeline(path, g, size, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=setup_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_R32_UINT, size,
+                       D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+                           D3D11_BIND_UNORDERED_ACCESS,
+                       tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=texture_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    const HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr,
+                                                            rtv.GetAddressOf());
+    const HRESULT hr_uav = g.device->CreateUnorderedAccessView(tex.Get(), nullptr,
+                                                               uav.GetAddressOf());
+    out("MODE=%s stage=create_views rtv=0x%08lx uav=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_rtv), static_cast<unsigned long>(hr_uav));
+    if (FAILED(hr_rtv) || FAILED(hr_uav)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=view_create_failed\n", path);
+        return 2;
+    }
+
+    auto uav_store = [&]() {
+        g.context->CSSetShader(cs.Get(), nullptr, 0);
+        ID3D11UnorderedAccessView* u = uav.Get();
+        g.context->CSSetUnorderedAccessViews(0, 1, &u, nullptr);
+        const UINT groups = static_cast<UINT>(size / 16);
+        g.context->Dispatch(groups, groups, 1);
+        ID3D11UnorderedAccessView* none = nullptr;
+        g.context->CSSetUnorderedAccessViews(0, 1, &none, nullptr);
+        g.context->CSSetShader(nullptr, nullptr, 0);
+        g.context->Flush();
+    };
+    auto ps_draw = [&]() {
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        g.context->Draw(3, 0);
+        ID3D11RenderTargetView* none = nullptr;
+        g.context->OMSetRenderTargets(1, &none, nullptr);
+        g.context->Flush();
+    };
+
+    int items = 0;
+    int failed = 0;
+    auto report = [&](const char* item, const SmallRead& back) {
+        unsigned lo = 0xFFFFFFFFu, hi = 0;
+        for (int y = 0; y < size; ++y) {
+            const uint8_t* row = back.bytes.data() + static_cast<size_t>(y) * back.pitch;
+            for (int x = 0; x < size; ++x) {
+                const uint8_t* p = row + x * 4;
+                const unsigned v = static_cast<unsigned>(p[0]) |
+                                   (static_cast<unsigned>(p[1]) << 8) |
+                                   (static_cast<unsigned>(p[2]) << 16) |
+                                   (static_cast<unsigned>(p[3]) << 24);
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+        }
+        out("MODE=%s ITEM=%s actual_min=0x%08x actual_max=0x%08x\n", path, item, lo, hi);
+    };
+
+    // A: compute store first, then a pixel-shader draw into the same target.
+    uav_store();
+    ps_draw();
+    ++items;
+    {
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(),
+                                          staging.Get(), size, 4);
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=uav_then_ps RESULT=FAIL reason=map_read_failed\n", path);
+        } else {
+            report("uav_then_ps", back);
+            out("MODE=%s ITEM=uav_then_ps RESULT=INFO expected_ps=0x00010001"
+                " expected_if_dropped=0x11111111\n", path);
+        }
+    }
+
+    // B: pixel-shader draw first, then a compute store (control: the store must
+    // win, proving both paths reach the same image).
+    ps_draw();
+    uav_store();
+    ++items;
+    {
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(),
+                                          staging.Get(), size, 4);
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=ps_then_uav RESULT=FAIL reason=map_read_failed\n", path);
+        } else {
+            report("ps_then_uav", back);
+            out("MODE=%s ITEM=ps_then_uav RESULT=INFO expected=0x11111111\n", path);
+        }
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d\n", path, items, failed);
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -4922,6 +5081,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
+    if (mode == "uint-order") return run_uint_order(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -4982,6 +5142,9 @@ void usage() {
         "                    texture with and without the UAV bind (RT|SRV vs\n"
         "                    RT|SRV|UAV); separates a lost PS write from a lost\n"
         "                    integer readback and from a dual-usage effect\n"
+        "  --mode uint-order  R32_UINT: UAV store then PS draw, then PS draw then\n"
+        "                    UAV store; the winning value separates a dropped draw\n"
+        "                    from a clear that runs after the draw\n"
         "  --mode uint-rt-matrix  PS writes one known value into R32_UINT, R16_UINT,\n"
         "                    R8_UINT, RGBA32_UINT, R32_FLOAT and BGRA8 targets and\n"
         "                    the raw map bytes are compared, to separate an integer\n"
@@ -5048,6 +5211,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("mask-write-srv");
             } else if (value == L"uint-rt-matrix") {
                 modes.push_back("uint-rt-matrix");
+            } else if (value == L"uint-order") {
+                modes.push_back("uint-order");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
