@@ -7190,6 +7190,18 @@ const char* kIntPsTextNoPad =
     "    return float4(i.t.y + i.a - 0.5, i.t.x + i.b - 0.5, i.c, i.d);\n"
     "}\n";
 
+// v24: identical shape but the four scalars stay smooth — tells apart a
+// flat-only mapping bug from a generic split-row (4 rows x mask 0x1) bug.
+const char* kIntPsTextNoPadSmooth =
+    "struct PSIn {\n"
+    "    float4 pos : SV_Position;\n"
+    "    noperspective float2 t : TEXY;\n"
+    "    float a : G8; float b : G9; float c : G10; float d : G11;\n"
+    "};\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(i.t.y + i.a - 0.5, i.t.x + i.b - 0.5, i.c, i.d);\n"
+    "}\n";
+
 // Reverse order: the packed scalars precede the vec2.
 const char* kIntVsPackFirst =
     "struct VSIn { float2 pos : POSITION; };\n"
@@ -8203,6 +8215,35 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=text_nopad RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case Y3b: identical to text_nopad but the scalars stay smooth.
+    {
+        Pair p;
+        if (!build_pair("text_nopad_smooth", kIntVsTextNoPad, kIntPsTextNoPadSmooth, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=text_nopad_smooth RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {191, 64, 128, 255};
+                check_center("text_nopad_smooth", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=text_nopad_smooth RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
