@@ -4758,6 +4758,159 @@ int run_mask_write_srv(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v6: integer render-target matrix
+// ---------------------------------------------------------------------------
+// The R32_UINT mask write reads back as zero on the device while the same
+// shader passes on WARP. This mode asks whether that is specific to R32_UINT,
+// to integer targets in general, or to rasterisation into integer formats,
+// with float targets as the control. Every case writes one known value with a
+// pixel shader and compares the raw map bytes, so a conversion cannot hide a
+// missing write.
+
+const char* kUintPsR32 = "uint4 main() : SV_Target { return uint4(65537u, 0u, 0u, 0u); }\n";
+const char* kUintPsR16 = "uint4 main() : SV_Target { return uint4(4660u, 0u, 0u, 0u); }\n";
+const char* kUintPsR8 = "uint4 main() : SV_Target { return uint4(7u, 0u, 0u, 0u); }\n";
+const char* kUintPsRGBA =
+    "uint4 main() : SV_Target { return uint4(1u, 2u, 3u, 4u); }\n";
+const char* kFloatPsHalf =
+    "float4 main() : SV_Target { return float4(0.5f, 0.5f, 0.5f, 1.0f); }\n";
+const char* kFloatPsQuarter =
+    "float4 main() : SV_Target { return float4(0.25f, 0.25f, 0.25f, 1.0f); }\n";
+
+int run_uint_rt_matrix(bool warp, bool debug_layer) {
+    const char* path = "uint-rt-matrix";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "matrix_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    ComPtr<ID3D11VertexShader> vs;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                          vs_blob->GetBufferSize(), nullptr,
+                                          vs.GetAddressOf());
+    if (FAILED(hr) || !small_pipeline(path, g, 64, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=setup_failed\n", path);
+        return 2;
+    }
+
+    struct Case {
+        const char* item;
+        DXGI_FORMAT fmt;
+        int bpp;
+        const char* ps;
+        const uint8_t* want;
+        int want_len;
+    };
+    static const uint8_t want_r32[] = {0x01, 0x00, 0x01, 0x00};
+    static const uint8_t want_r16[] = {0x34, 0x12};
+    static const uint8_t want_r8[] = {0x07};
+    static const uint8_t want_rgba[] = {0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+                                        0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00};
+    static const uint8_t want_f32[] = {0x00, 0x00, 0x00, 0x3F};
+    static const uint8_t want_bgra[] = {0x40, 0x40, 0x40, 0xFF};
+    const Case cases[] = {
+        {"r32_uint_65537", DXGI_FORMAT_R32_UINT, 4, kUintPsR32, want_r32, 4},
+        {"r16_uint_4660", DXGI_FORMAT_R16_UINT, 2, kUintPsR16, want_r16, 2},
+        {"r8_uint_7", DXGI_FORMAT_R8_UINT, 1, kUintPsR8, want_r8, 1},
+        {"rgba32_uint_1_2_3_4", DXGI_FORMAT_R32G32B32A32_UINT, 16, kUintPsRGBA, want_rgba,
+         16},
+        {"r32_float_0p5", DXGI_FORMAT_R32_FLOAT, 4, kFloatPsHalf, want_f32, 4},
+        {"bgra8_unorm_0p25", DXGI_FORMAT_B8G8R8A8_UNORM, 4, kFloatPsQuarter, want_bgra, 4},
+    };
+
+    int items = 0;
+    int failed = 0;
+    for (const Case& c : cases) {
+        ComPtr<ID3DBlob> ps_blob;
+        hr = a8_compile(path, c.item, c.ps, "ps_5_0", "ps_4_0", ps_blob.GetAddressOf(), &used);
+        ComPtr<ID3D11PixelShader> ps;
+        if (SUCCEEDED(hr))
+            hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                             ps_blob->GetBufferSize(), nullptr,
+                                             ps.GetAddressOf());
+        ++items;
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=shader_create_failed\n", path, c.item);
+            continue;
+        }
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!small_texture(path, g.device.Get(), c.fmt, 64,
+                           D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, tex,
+                           staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=texture_create_failed\n", path,
+                c.item);
+            continue;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        hr = g.device->CreateRenderTargetView(tex.Get(), nullptr, rtv.GetAddressOf());
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed hr=0x%08lx\n", path,
+                c.item, static_cast<unsigned long>(hr));
+            continue;
+        }
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), zero);
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        g.context->Draw(3, 0);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        g.context->Flush();
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
+                                          64, c.bpp);
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, c.item);
+            continue;
+        }
+        int mismatches = 0;
+        unsigned first = 0;
+        for (int y = 0; y < 64; ++y) {
+            const uint8_t* row = back.bytes.data() + static_cast<size_t>(y) * back.pitch;
+            for (int x = 0; x < 64; ++x) {
+                const uint8_t* p = row + x * c.bpp;
+                if (memcmp(p, c.want, static_cast<size_t>(c.want_len)) != 0) {
+                    if (!mismatches) {
+                        first = 0;
+                        for (int i = 0; i < c.want_len && i < 4; ++i)
+                            first |= static_cast<unsigned>(p[i]) << (8 * i);
+                    }
+                    ++mismatches;
+                }
+            }
+        }
+        const bool ok = (mismatches == 0);
+        out("MODE=%s ITEM=%s RESULT=%s mismatches=%d first_actual_hex=0x%08x"
+            " want_len=%d reason=%s\n", path, c.item, ok ? "PASS" : "FAIL", mismatches,
+            first, c.want_len, ok ? "ok" : "value_mismatch");
+        if (!ok) {
+            ++failed;
+            ++g_failures;
+        }
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d size=64x64 cases=r32/r16/r8/rgba32/float/bgra\n",
+        path, items, failed);
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -4768,6 +4921,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "dualsrc-blend") return run_dualsrc_blend(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
+    if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -4828,6 +4982,10 @@ void usage() {
         "                    texture with and without the UAV bind (RT|SRV vs\n"
         "                    RT|SRV|UAV); separates a lost PS write from a lost\n"
         "                    integer readback and from a dual-usage effect\n"
+        "  --mode uint-rt-matrix  PS writes one known value into R32_UINT, R16_UINT,\n"
+        "                    R8_UINT, RGBA32_UINT, R32_FLOAT and BGRA8 targets and\n"
+        "                    the raw map bytes are compared, to separate an integer\n"
+        "                    target failure from a rasterisation or format failure\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -4888,6 +5046,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("vb-paths");
             } else if (value == L"mask-write-srv") {
                 modes.push_back("mask-write-srv");
+            } else if (value == L"uint-rt-matrix") {
+                modes.push_back("uint-rt-matrix");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
