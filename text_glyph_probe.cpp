@@ -5070,6 +5070,262 @@ int run_uint_order(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v7: extreme integer render-target values
+// ---------------------------------------------------------------------------
+// The matrix mode writes values small enough to survive a float round trip.
+// These cases use bit patterns that cannot: 0x7FC00001 is a NaN bit pattern as
+// float, 0x80000001 and 0xFFFFFFFF are not representable in a 32-bit float,
+// and 0xDEADBEEF is outside the exact integer range. A bit-exact readback
+// therefore proves the pixel-shader integer result reached the target without
+// a float->uint conversion; an all-zero readback proves the integer write was
+// dropped instead. The R32_FLOAT control writes the same 0x7FC00001 bit
+// pattern through asfloat from a constant buffer and compares the raw map
+// bytes, so the readback path itself is shown not to convert.
+
+const char* kExtremePsR32Nan =
+    "uint4 main() : SV_Target { return uint4(0x7FC00001u, 0u, 0u, 0u); }\n";
+const char* kExtremePsR32Dead =
+    "uint4 main() : SV_Target { return uint4(0xDEADBEEFu, 0u, 0u, 0u); }\n";
+const char* kExtremePsRgba =
+    "uint4 main() : SV_Target {\n"
+    "    return uint4(0x80000001u, 0xFFFFFFFFu, 0x7FFFFFFFu, 0xDEADBEEFu);\n"
+    "}\n";
+const char* kExtremePsFloatNan =
+    "cbuffer C : register(b0) { uint g_bits; };\n"
+    "float4 main() : SV_Target { return float4(asfloat(g_bits), 0.0f, 0.0f, 0.0f); }\n";
+
+void format_uints(char* buf, size_t cap, const unsigned* v, int count) {
+    size_t used = 0;
+    buf[0] = 0;
+    for (int i = 0; i < count; ++i) {
+        if (used + 16 >= cap) break;
+        const int n = _snprintf_s(buf + used, cap - used, _TRUNCATE,
+                                  i ? ",0x%08x" : "0x%08x", v[i]);
+        if (n <= 0) break;
+        used += static_cast<size_t>(n);
+    }
+}
+
+struct ExtremeScan {
+    int mismatches = 0;
+    bool all_zero = true;
+    bool ok = false;
+    unsigned lo[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    unsigned hi[4] = {0, 0, 0, 0};
+};
+
+ExtremeScan extreme_scan(const SmallRead& back, int size, int channels,
+                         const unsigned* want) {
+    ExtremeScan s;
+    for (int y = 0; y < size; ++y) {
+        const uint8_t* row = back.bytes.data() + static_cast<size_t>(y) * back.pitch;
+        for (int x = 0; x < size; ++x) {
+            const uint8_t* p = row + static_cast<size_t>(x) * channels * 4;
+            bool zero = true;
+            bool match = true;
+            for (int c = 0; c < channels; ++c) {
+                const unsigned v = static_cast<unsigned>(p[c * 4 + 0]) |
+                                   (static_cast<unsigned>(p[c * 4 + 1]) << 8) |
+                                   (static_cast<unsigned>(p[c * 4 + 2]) << 16) |
+                                   (static_cast<unsigned>(p[c * 4 + 3]) << 24);
+                if (v != 0) zero = false;
+                if (v < s.lo[c]) s.lo[c] = v;
+                if (v > s.hi[c]) s.hi[c] = v;
+                if (v != want[c]) match = false;
+            }
+            if (!zero) s.all_zero = false;
+            if (!match) ++s.mismatches;
+        }
+    }
+    s.ok = (s.mismatches == 0);
+    return s;
+}
+
+int run_uint_rt_extreme(bool warp, bool debug_layer) {
+    const char* path = "uint-rt-extreme";
+    const int size = 64;
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "extreme_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    ComPtr<ID3D11VertexShader> vs;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                          vs_blob->GetBufferSize(), nullptr,
+                                          vs.GetAddressOf());
+    if (FAILED(hr) || !small_pipeline(path, g, size, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=setup_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Buffer> bits_cb;
+    const unsigned bits[4] = {0x7FC00001u, 0u, 0u, 0u};
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.ByteWidth = static_cast<UINT>(sizeof(bits));
+    cb_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA cb_init{};
+    cb_init.pSysMem = bits;
+    const HRESULT hr_cb = g.device->CreateBuffer(&cb_desc, &cb_init,
+                                                 bits_cb.GetAddressOf());
+    out("MODE=%s stage=create_constant_buffer bytes=%zu hr=0x%08lx\n", path,
+        sizeof(bits), static_cast<unsigned long>(hr_cb));
+    if (FAILED(hr_cb)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=constant_buffer_failed\n", path);
+        return 2;
+    }
+
+    struct ExtremeCase {
+        const char* item;
+        DXGI_FORMAT fmt;
+        const char* fmt_text;
+        int channels;
+        const char* ps;
+        bool bind_bits;
+        unsigned want[4];
+    };
+    const ExtremeCase cases[] = {
+        {"r32_uint_nan_bits", DXGI_FORMAT_R32_UINT, "R32_UINT", 1, kExtremePsR32Nan,
+         false, {0x7FC00001u, 0u, 0u, 0u}},
+        {"r32_uint_deadbeef", DXGI_FORMAT_R32_UINT, "R32_UINT", 1, kExtremePsR32Dead,
+         false, {0xDEADBEEFu, 0u, 0u, 0u}},
+        {"rgba32_uint_extremes", DXGI_FORMAT_R32G32B32A32_UINT, "RGBA32_UINT", 4,
+         kExtremePsRgba, false,
+         {0x80000001u, 0xFFFFFFFFu, 0x7FFFFFFFu, 0xDEADBEEFu}},
+        {"r32_float_nan_bits", DXGI_FORMAT_R32_FLOAT, "R32_FLOAT", 1,
+         kExtremePsFloatNan, true, {0x7FC00001u, 0u, 0u, 0u}},
+    };
+
+    int items = 0;
+    int failed = 0;
+    int uint_cases = 0;
+    int uint_failed = 0;
+    int uint_zero = 0;
+    bool control_ok = false;
+    for (const ExtremeCase& c : cases) {
+        const bool control = (c.fmt == DXGI_FORMAT_R32_FLOAT);
+        ComPtr<ID3DBlob> ps_blob;
+        hr = a8_compile(path, c.item, c.ps, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used);
+        ComPtr<ID3D11PixelShader> ps;
+        if (SUCCEEDED(hr))
+            hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                             ps_blob->GetBufferSize(), nullptr,
+                                             ps.GetAddressOf());
+        ++items;
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            if (!control) {
+                ++uint_cases;
+                ++uint_failed;
+            }
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=shader_create_failed\n", path,
+                c.item);
+            continue;
+        }
+        if (!control) ++uint_cases;
+
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!small_texture(path, g.device.Get(), c.fmt, size,
+                           D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, tex,
+                           staging)) {
+            ++failed;
+            ++g_failures;
+            if (!control) ++uint_failed;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=texture_create_failed\n", path,
+                c.item);
+            continue;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        hr = g.device->CreateRenderTargetView(tex.Get(), nullptr, rtv.GetAddressOf());
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            if (!control) ++uint_failed;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed hr=0x%08lx\n", path,
+                c.item, static_cast<unsigned long>(hr));
+            continue;
+        }
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), zero);
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        if (c.bind_bits) {
+            ID3D11Buffer* cb = bits_cb.Get();
+            g.context->PSSetConstantBuffers(0, 1, &cb);
+        }
+        g.context->Draw(3, 0);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        if (c.bind_bits) {
+            ID3D11Buffer* no_cb = nullptr;
+            g.context->PSSetConstantBuffers(0, 1, &no_cb);
+        }
+        g.context->Flush();
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
+                                          size, c.channels * 4);
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            if (!control) ++uint_failed;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, c.item);
+            continue;
+        }
+        const ExtremeScan scan = extreme_scan(back, size, c.channels, c.want);
+        char want_text[160], lo_text[160], hi_text[160];
+        format_uints(want_text, sizeof(want_text), c.want, c.channels);
+        format_uints(lo_text, sizeof(lo_text), scan.lo, c.channels);
+        format_uints(hi_text, sizeof(hi_text), scan.hi, c.channels);
+        const char* reason = scan.ok ? "ok" : (scan.all_zero ? "all_zero" : "value_mismatch");
+        out("MODE=%s ITEM=%s RESULT=%s fmt=%s texels=%d mismatches=%d expected=%s"
+            " actual_min=%s actual_max=%s all_zero=%s reason=%s\n", path, c.item,
+            scan.ok ? "PASS" : "FAIL", c.fmt_text, size * size, scan.mismatches,
+            want_text, lo_text, hi_text, scan.all_zero ? "yes" : "no", reason);
+        if (!scan.ok) {
+            ++failed;
+            ++g_failures;
+            if (!control) {
+                ++uint_failed;
+                if (scan.all_zero) ++uint_zero;
+            }
+        } else if (control) {
+            control_ok = true;
+        }
+    }
+
+    const int uint_exact = uint_cases - uint_failed;
+    out("MODE=%s SUMMARY items=%d failed=%d driver=%s uint_cases=%d uint_exact=%d"
+        " uint_all_zero=%d control_float_nan_exact=%s\n", path, items, failed,
+        warp ? "warp" : "hardware", uint_cases, uint_exact, uint_zero,
+        control_ok ? "yes" : "no");
+    if (uint_cases > 0 && uint_failed == 0) {
+        out("MODE=%s VERDICT=integer_output_bit_exact driver=%s items=%d"
+            " float_to_uint_conversion=excluded\n", path, warp ? "warp" : "hardware",
+            uint_cases);
+    } else if (uint_cases > 0 && uint_zero == uint_cases) {
+        out("MODE=%s VERDICT=integer_write_dropped driver=%s all_zero_items=%d"
+            " confirmation=%s\n", path, warp ? "warp" : "hardware", uint_zero,
+            warp ? "warp_should_not_drop_so_mode_or_driver_is_broken"
+                 : "umd_drops_ps_integer_write");
+    } else {
+        out("MODE=%s VERDICT=integer_value_mismatch driver=%s exact=%d/%d all_zero=%d\n",
+            path, warp ? "warp" : "hardware", uint_exact, uint_cases, uint_zero);
+    }
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -5082,6 +5338,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
     if (mode == "uint-order") return run_uint_order(warp, debug_layer);
+    if (mode == "uint-rt-extreme") return run_uint_rt_extreme(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -5149,6 +5406,14 @@ void usage() {
         "                    R8_UINT, RGBA32_UINT, R32_FLOAT and BGRA8 targets and\n"
         "                    the raw map bytes are compared, to separate an integer\n"
         "                    target failure from a rasterisation or format failure\n"
+        "  --mode uint-rt-extreme  R32_UINT writes of 0x7FC00001 and 0xDEADBEEF and\n"
+        "                    an RGBA32_UINT write of 0x80000001/0xFFFFFFFF/\n"
+        "                    0x7FFFFFFF/0xDEADBEEF: none of those survive a float\n"
+        "                    round trip, so a bit-exact readback proves the output\n"
+        "                    really is integer; all zero confirms the write is\n"
+        "                    dropped. An R32_FLOAT control writes the 0x7FC00001\n"
+        "                    NaN bit pattern and reads the raw bytes back; WARP\n"
+        "                    must be bit exact\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -5213,6 +5478,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("uint-rt-matrix");
             } else if (value == L"uint-order") {
                 modes.push_back("uint-order");
+            } else if (value == L"uint-rt-extreme") {
+                modes.push_back("uint-rt-extreme");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
