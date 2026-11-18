@@ -756,15 +756,569 @@ int run_self_test() {
     return failures ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v2 diagnostic modes. Additive: the full-mode paths above and their verdicts
+// are unchanged.
+//
+// Motivation from the device run: on the target GPU the whole d3d11_d2d chain
+// returned hr=0 (device, texture, D2D surface RT, DWrite layout, brush,
+// EndDraw, CopyResource, Map all succeeded) but the readback held a single
+// colour with zero ink, while GDI on the same machine passed and the same exe
+// passed through WARP. That rules out setup failures and points at the draw
+// itself. These modes split "the draw" into separately measurable items:
+//
+//   --mode d2d-primitives   solid geometry fill, 1px geometry stroke and glyphs
+//                           in ONE target and ONE readback, so "every D2D draw
+//                           is lost" can be told apart from "only glyphs are
+//                           lost".
+//   --mode dwrite-offscreen one glyph draw per text antialias mode, each into
+//                           its own texture and readback (nothing is
+//                           overwritten before it is measured).
+//   --mode bitmap-brush     a 1x1 known-colour bitmap brush and a 16x16
+//                           DrawBitmap, to separate texture sampling from
+//                           geometry.
+//
+// Items are judged by presence of the expected pixels, not by the full-mode
+// text rule: a solid fill is expected to be 100% dark and single-coloured, so
+// "dark must not dominate" and "unique_color_count >= 2" cannot apply.
+
+struct Rgba {
+    int b = 0, g = 0, r = 0, a = 0;
+};
+
+struct Gpu {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<ID2D1Factory> d2d;
+    ComPtr<IDWriteFactory> dwrite;
+    ComPtr<IDWriteTextFormat> format;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_1_0_CORE;
+};
+
+struct Target {
+    ComPtr<ID3D11Texture2D> tex;
+    ComPtr<ID3D11Texture2D> staging;
+    ComPtr<IDXGISurface> surface;
+    ComPtr<ID2D1RenderTarget> rt;
+};
+
+// A 1px stroke over a 64x64 outline, or a 64x64 fill, is far smaller than the
+// text rect, so item bboxes use their own lower bound.
+constexpr int kItemMinBBoxWidth = 8;
+constexpr int kItemMinBBoxHeight = 4;
+
+void gpu_adapter(const char* path, ID3D11Device* device) {
+    ComPtr<IDXGIDevice> dxgi;
+    HRESULT hr = device->QueryInterface(IID_PPV_ARGS(dxgi.GetAddressOf()));
+    if (FAILED(hr)) {
+        out("MODE=%s adapter status=dxgi_device_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    ComPtr<IDXGIAdapter> adapter;
+    hr = dxgi->GetAdapter(&adapter);
+    if (FAILED(hr)) {
+        out("MODE=%s adapter status=get_adapter_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    DXGI_ADAPTER_DESC desc{};
+    hr = adapter->GetDesc(&desc);
+    if (FAILED(hr)) {
+        out("MODE=%s adapter status=desc_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return;
+    }
+    out("MODE=%s adapter name=\"%s\" vendor=0x%04x device=0x%04x subsystem=0x%08x"
+        " dedicated_vram_mb=%llu\n",
+        path, utf8(desc.Description).c_str(), desc.VendorId, desc.DeviceId, desc.SubSysId,
+        static_cast<unsigned long long>(desc.DedicatedVideoMemory / (1024ull * 1024ull)));
+}
+
+bool gpu_create(const char* path, bool warp, bool debug_layer, Gpu& g) {
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    if (debug_layer) flags |= D3D11_CREATE_DEVICE_DEBUG;
+    const D3D_DRIVER_TYPE driver = warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
+    const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3,  D3D_FEATURE_LEVEL_9_2,
+        D3D_FEATURE_LEVEL_9_1,
+    };
+    HRESULT hr = D3D11CreateDevice(nullptr, driver, nullptr, flags, levels,
+                                   ARRAYSIZE(levels), D3D11_SDK_VERSION, &g.device, &g.fl,
+                                   &g.context);
+    if (hr == E_INVALIDARG) {
+        hr = D3D11CreateDevice(nullptr, driver, nullptr, flags, levels + 1,
+                               ARRAYSIZE(levels) - 1, D3D11_SDK_VERSION, &g.device, &g.fl,
+                               &g.context);
+    }
+    out("MODE=%s stage=create_device driver=%s feature_level=%s hr=0x%08lx\n", path,
+        warp ? "warp" : "hardware", fl_name(g.fl), static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+
+    hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g.d2d.GetAddressOf());
+    out("MODE=%s stage=d2d_create_factory hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+
+    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                             reinterpret_cast<IUnknown**>(g.dwrite.GetAddressOf()));
+    out("MODE=%s stage=dwrite_create_factory hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+
+    hr = g.dwrite->CreateTextFormat(kFontFamily, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+                                    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                    kFontSize, L"en-US", &g.format);
+    out("MODE=%s stage=dwrite_text_format family=\"Segoe UI\" size_px=48"
+        " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+bool target_create(const char* path, const Gpu& g, bool warp, Target& t) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = kWidth;
+    desc.Height = kHeight;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    HRESULT hr = g.device->CreateTexture2D(&desc, nullptr, &t.tex);
+    out("MODE=%s stage=create_texture size=%dx%d format=BGRA8 bind=RENDER_TARGET"
+        " hr=0x%08lx\n", path, kWidth, kHeight, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+
+    hr = t.tex.As(&t.surface);
+    if (FAILED(hr)) {
+        out("MODE=%s stage=query_dxgi_surface hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return false;
+    }
+    const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        warp ? D2D1_RENDER_TARGET_TYPE_DEFAULT : D2D1_RENDER_TARGET_TYPE_HARDWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f,
+        96.0f);
+    hr = g.d2d->CreateDxgiSurfaceRenderTarget(t.surface.Get(), &props, &t.rt);
+    out("MODE=%s stage=d2d_surface_rt target_type=%s hr=0x%08lx\n", path,
+        warp ? "default" : "hardware", static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    t.rt->SetDpi(96.0f, 96.0f);
+
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = g.device->CreateTexture2D(&staging_desc, nullptr, &t.staging);
+    if (FAILED(hr)) {
+        out("MODE=%s stage=create_staging hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return false;
+    }
+    const D2D1_SIZE_U px = t.rt->GetPixelSize();
+    out("MODE=%s stage=target_ready d2d_pixel_size=%ux%u d2d_dpi=%.1fx%.1f\n", path,
+        px.width, px.height, t.rt->GetDpi().width, t.rt->GetDpi().height);
+    return true;
+}
+
+bool target_map(const char* path, Gpu& g, Target& t, D3D11_MAPPED_SUBRESOURCE& mapped) {
+    g.context->CopyResource(t.staging.Get(), t.tex.Get());
+    g.context->Flush();
+    const HRESULT hr = g.context->Map(t.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    out("MODE=%s stage=map_read row_pitch=%u hr=0x%08lx\n", path, mapped.RowPitch,
+        static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+RECT clipped(RECT r, int width, int height) {
+    if (r.left < 0) r.left = 0;
+    if (r.top < 0) r.top = 0;
+    if (r.right > width) r.right = width;
+    if (r.bottom > height) r.bottom = height;
+    return r;
+}
+
+Rgba pixel_at(const uint8_t* data, int pitch, int x, int y) {
+    const uint8_t* p = data + static_cast<size_t>(y) * static_cast<size_t>(pitch) + x * 4;
+    Rgba c;
+    c.b = p[0];
+    c.g = p[1];
+    c.r = p[2];
+    c.a = p[3];
+    return c;
+}
+
+unsigned long long count_color_match(const uint8_t* data, int pitch, RECT rect, Rgba want,
+                                     int tolerance) {
+    rect = clipped(rect, kWidth, kHeight);
+    unsigned long long n = 0;
+    for (int y = rect.top; y < rect.bottom; ++y) {
+        const uint8_t* row = data + static_cast<size_t>(y) * static_cast<size_t>(pitch);
+        for (int x = rect.left; x < rect.right; ++x) {
+            const int db = static_cast<int>(row[x * 4 + 0]) - want.b;
+            const int dg = static_cast<int>(row[x * 4 + 1]) - want.g;
+            const int dr = static_cast<int>(row[x * 4 + 2]) - want.r;
+            if (db >= -tolerance && db <= tolerance && dg >= -tolerance &&
+                dg <= tolerance && dr >= -tolerance && dr <= tolerance)
+                ++n;
+        }
+    }
+    return n;
+}
+
+const char* ink_reason(const PixelStats& s) {
+    if (s.dark <= kMinDarkPixels) return "dark_pixels_too_few";
+    if (!s.dark_bbox_valid) return "dark_bbox_missing";
+    const int w = s.dark_right - s.dark_left;
+    const int h = s.dark_bottom - s.dark_top;
+    if (w < kItemMinBBoxWidth || h < kItemMinBBoxHeight) return "dark_bbox_too_small";
+    return nullptr;
+}
+
+const char* color_reason(unsigned long long matched, long long area) {
+    if (area <= 0) return "empty_region";
+    if (matched * 10 < static_cast<unsigned long long>(area) * 9)
+        return "expected_color_not_dominant";
+    return nullptr;
+}
+
+const char* print_ink_item(const char* mode, const char* item, const char* extra,
+                           const PixelStats& s) {
+    const char* reason = ink_reason(s);
+    char bbox[64] = "none";
+    if (s.nonwhite_bbox_valid) {
+        _snprintf_s(bbox, sizeof(bbox), _TRUNCATE, "%d,%d,%d,%d", s.nonwhite_left,
+                    s.nonwhite_top, s.nonwhite_right, s.nonwhite_bottom);
+    }
+    out("MODE=%s ITEM=%s%s RESULT=%s dark_pixel_count=%llu nonwhite_pixel_count=%llu"
+        " unique_color_count=%zu bbox=%s dark_bbox_size=%dx%d reason=%s\n",
+        mode, item, extra, reason ? "FAIL" : "PASS", s.dark, s.nonwhite, s.unique_colors,
+        bbox, s.dark_bbox_valid ? s.dark_right - s.dark_left : 0,
+        s.dark_bbox_valid ? s.dark_bottom - s.dark_top : 0, reason ? reason : "ok");
+    if (reason) ++g_failures;
+    return reason;
+}
+
+const char* print_color_item(const char* mode, const char* item, Rgba want, Rgba got,
+                             unsigned long long matched, long long area,
+                             const PixelStats& s) {
+    const char* reason = color_reason(matched, area);
+    out("MODE=%s ITEM=%s expected_bgra=%d,%d,%d,%d sampled_bgra=%d,%d,%d,%d"
+        " matched=%llu region_area=%lld RESULT=%s dark_pixel_count=%llu"
+        " nonwhite_pixel_count=%llu unique_color_count=%zu reason=%s\n",
+        mode, item, want.b, want.g, want.r, want.a, got.b, got.g, got.r, got.a, matched,
+        area, reason ? "FAIL" : "PASS", s.dark, s.nonwhite, s.unique_colors,
+        reason ? reason : "ok");
+    if (reason) ++g_failures;
+    return reason;
+}
+
+// Item 1: one target, one readback, three independently judged items.
+int run_d2d_primitives(bool warp, bool debug_layer) {
+    const char* path = "d2d-primitives";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    Target t;
+    if (!target_create(path, g, warp, t)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<IDWriteTextLayout> layout;
+    HRESULT hr = g.dwrite->CreateTextLayout(kText, kTextLen, g.format.Get(),
+                                            512.0f - 160.0f, 112.0f, &layout);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s stage=dwrite_create_layout hr=0x%08lx RESULT=FAIL"
+            " reason=text_layout_failed\n", path, static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID2D1SolidColorBrush> black;
+    hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s stage=d2d_solid_brush hr=0x%08lx RESULT=FAIL"
+            " reason=solid_brush_failed\n", path, static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    t.rt->BeginDraw();
+    t.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
+    t.rt->FillRectangle(D2D1::RectF(8.0f, 8.0f, 72.0f, 72.0f), black.Get());
+    // Integer-aligned 1px stroke: path at half pixels covers exactly 1px.
+    t.rt->DrawRectangle(D2D1::RectF(80.5f, 8.5f, 143.5f, 71.5f), black.Get(), 1.0f);
+    t.rt->DrawTextLayout(D2D1::Point2F(160.0f, 8.0f), layout.Get(), black.Get(),
+                         D2D1_DRAW_TEXT_OPTIONS_NONE);
+    hr = t.rt->EndDraw();
+    out("MODE=%s stage=end_draw items=fill(8,8,64x64) stroke(80.5,8.5,63x63,1px)"
+        " text(160,8) hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=end_draw_failed\n", path);
+        return 2;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (!target_map(path, g, t, mapped)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
+        return 2;
+    }
+    const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
+    const int pitch = static_cast<int>(mapped.RowPitch);
+    const PixelStats fill = analyze(base, pitch, kWidth, kHeight, RECT{4, 4, 76, 76});
+    const PixelStats stroke = analyze(base, pitch, kWidth, kHeight, RECT{76, 4, 148, 76});
+    const PixelStats text = analyze(base, pitch, kWidth, kHeight, RECT{152, 4, 508, 124});
+    g.context->Unmap(t.staging.Get(), 0);
+
+    print_ink_item(path, "rect_fill", " region=4,4,76,76", fill);
+    print_ink_item(path, "rect_stroke", " region=76,4,148,76", stroke);
+    print_ink_item(path, "text", " region=152,4,508,124", text);
+    const bool geometry_ink = fill.dark > kMinDarkPixels || stroke.dark > kMinDarkPixels;
+    const bool glyph_ink = text.dark > kMinDarkPixels;
+    const int failed = (ink_reason(fill) ? 1 : 0) + (ink_reason(stroke) ? 1 : 0) +
+                       (ink_reason(text) ? 1 : 0);
+    out("MODE=%s SUMMARY items=3 failed=%d geometry_ink=%s glyph_ink=%s"
+        " all_draws_lost=%s\n", path, failed, geometry_ink ? "yes" : "no",
+        glyph_ink ? "yes" : "no", (!geometry_ink && !glyph_ink) ? "yes" : "no");
+    return failed ? 2 : 0;
+}
+
+// Item 2: one glyph draw per text antialias mode, each on its own texture.
+int run_dwrite_offscreen(bool warp, bool debug_layer) {
+    const char* path = "dwrite-offscreen";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<IDWriteTextLayout> layout;
+    HRESULT hr = g.dwrite->CreateTextLayout(kText, kTextLen, g.format.Get(),
+                                            496.0f, 112.0f, &layout);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s stage=dwrite_create_layout hr=0x%08lx RESULT=FAIL"
+            " reason=text_layout_failed\n", path, static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    struct AaCase {
+        D2D1_TEXT_ANTIALIAS_MODE mode;
+        const char* name;
+    };
+    const AaCase cases[] = {
+        {D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, "aa_cleartype"},
+        {D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, "aa_grayscale"},
+        {D2D1_TEXT_ANTIALIAS_MODE_ALIASED, "aa_aliased"},
+    };
+
+    int failed = 0;
+    for (const AaCase& c : cases) {
+        // A fresh texture per case: no case can be hidden by a later draw
+        // overwriting the same surface before it is read back.
+        Target t;
+        if (!target_create(path, g, warp, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path,
+                c.name);
+            continue;
+        }
+        t.rt->SetTextAntialiasMode(c.mode);
+        const D2D1_TEXT_ANTIALIAS_MODE effective = t.rt->GetTextAntialiasMode();
+        ComPtr<ID2D1SolidColorBrush> black;
+        hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s stage=d2d_solid_brush hr=0x%08lx RESULT=FAIL\n", path,
+                c.name, static_cast<unsigned long>(hr));
+            continue;
+        }
+        t.rt->BeginDraw();
+        t.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
+        t.rt->DrawTextLayout(D2D1::Point2F(8.0f, 8.0f), layout.Get(), black.Get(),
+                             D2D1_DRAW_TEXT_OPTIONS_NONE);
+        hr = t.rt->EndDraw();
+        char extra[96];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " requested_aa=%d effective_aa=%d end_draw_hr=0x%08lx",
+                    static_cast<int>(c.mode), static_cast<int>(effective),
+                    static_cast<unsigned long>(hr));
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=end_draw_failed\n", path, c.name,
+                extra);
+            continue;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (!target_map(path, g, t, mapped)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=map_read_failed\n", path, c.name,
+                extra);
+            continue;
+        }
+        const PixelStats s = analyze(static_cast<const uint8_t*>(mapped.pData),
+                                     static_cast<int>(mapped.RowPitch), kWidth, kHeight,
+                                     text_rect());
+        g.context->Unmap(t.staging.Get(), 0);
+        if (print_ink_item(path, c.name, extra, s)) ++failed;
+    }
+    out("MODE=%s SUMMARY items=3 failed=%d textures=3 separate_readbacks=yes\n", path,
+        failed);
+    return failed ? 2 : 0;
+}
+
+// Item 3: known-colour bitmaps, to separate texture sampling from geometry.
+int run_bitmap_brush(bool warp, bool debug_layer) {
+    const char* path = "bitmap-brush";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    Target t;
+    if (!target_create(path, g, warp, t)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+
+    const D2D1_BITMAP_PROPERTIES bitmap_props =
+        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                 D2D1_ALPHA_MODE_IGNORE),
+                               96.0f, 96.0f);
+    const uint8_t red_px[4] = {0, 0, 255, 255};    // BGRA: pure red
+    const uint8_t green_px[4] = {0, 255, 0, 255};  // BGRA: pure green
+    ComPtr<ID2D1Bitmap> red_bitmap;
+    HRESULT hr = t.rt->CreateBitmap(D2D1::SizeU(1, 1), red_px, 4, bitmap_props,
+                                    &red_bitmap);
+    out("MODE=%s stage=create_bitmap size=1x1 color=red hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=create_bitmap_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID2D1Bitmap> green_bitmap;
+    hr = t.rt->CreateBitmap(D2D1::SizeU(1, 1), green_px, 4, bitmap_props, &green_bitmap);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=create_green_bitmap_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID2D1BitmapBrush> brush;
+    const D2D1_BITMAP_BRUSH_PROPERTIES brush_props = D2D1::BitmapBrushProperties(
+        D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    hr = t.rt->CreateBitmapBrush(red_bitmap.Get(), brush_props, &brush);
+    out("MODE=%s stage=create_bitmap_brush extend=clamp interpolation=nearest"
+        " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=create_bitmap_brush_failed\n", path);
+        return 2;
+    }
+
+    t.rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);  // keep edges exact
+    t.rt->BeginDraw();
+    t.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
+    t.rt->FillRectangle(D2D1::RectF(8.0f, 8.0f, 72.0f, 72.0f), brush.Get());
+    t.rt->DrawBitmap(green_bitmap.Get(),
+                     D2D1::RectF(200.0f, 8.0f, 264.0f, 72.0f), 1.0f,
+                     D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    hr = t.rt->EndDraw();
+    out("MODE=%s stage=end_draw items=brush(8,8,64x64) draw_bitmap(200,8,64x64)"
+        " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=end_draw_failed\n", path);
+        return 2;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (!target_map(path, g, t, mapped)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
+        return 2;
+    }
+    const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
+    const int pitch = static_cast<int>(mapped.RowPitch);
+    // Regions are exactly the drawn rects: the colour gate is a ratio of the
+    // region, so padding would count as mismatched pixels.
+    const RECT red_rect{8, 8, 72, 72};
+    const RECT green_rect{200, 8, 264, 72};
+    Rgba want_red{0, 0, 255, 255};
+    Rgba want_green{0, 255, 0, 255};
+    const Rgba got_red = pixel_at(base, pitch, 40, 40);
+    const Rgba got_green = pixel_at(base, pitch, 232, 40);
+    const unsigned long long red_matched = count_color_match(base, pitch, red_rect,
+                                                             want_red, 2);
+    const unsigned long long green_matched = count_color_match(base, pitch, green_rect,
+                                                               want_green, 2);
+    const PixelStats red_stats = analyze(base, pitch, kWidth, kHeight, red_rect);
+    const PixelStats green_stats = analyze(base, pitch, kWidth, kHeight, green_rect);
+    g.context->Unmap(t.staging.Get(), 0);
+
+    const long long red_area = static_cast<long long>(red_rect.right - red_rect.left) *
+                               (red_rect.bottom - red_rect.top);
+    const long long green_area =
+        static_cast<long long>(green_rect.right - green_rect.left) *
+        (green_rect.bottom - green_rect.top);
+    const char* red_reason =
+        print_color_item(path, "bitmap_brush_fill", want_red, got_red, red_matched,
+                         red_area, red_stats);
+    const char* green_reason =
+        print_color_item(path, "draw_bitmap", want_green, got_green, green_matched,
+                         green_area, green_stats);
+    out("MODE=%s SUMMARY items=2 failed=%d sampling_vs_geometry=%s\n", path,
+        (red_reason || green_reason) ? 1 : 0,
+        red_reason ? "bitmap_sampling_lost" : "bitmap_sampling_ok");
+    return (red_reason || green_reason) ? 2 : 0;
+}
+
+int run_mode(const std::string& mode, bool warp, bool debug_layer) {
+    if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
+    if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
+    if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
+    out("MODE=%s RESULT=FAIL reason=unknown_mode\n", mode.c_str());
+    return 2;
+}
+
 void usage() {
     out("usage: text_glyph_probe.exe [--driver hardware|warp] [--debug-layer]"
-        " [--log PATH] [--self-test]\n"
+        " [--log PATH] [--self-test] [--mode NAME]...\n"
         "  no arguments      run d3d11_d2d (hardware) then gdi, print stats\n"
+        "  --mode full       same as no arguments (default)\n"
+        "  --mode d2d-primitives  geometry fill + 1px stroke + glyphs in one\n"
+        "                    target and one readback, judged per item\n"
+        "  --mode dwrite-offscreen  glyphs under cleartype/grayscale/aliased,\n"
+        "                    each on its own texture and readback\n"
+        "  --mode bitmap-brush  1x1 known-colour bitmap brush + DrawBitmap,\n"
+        "                    separates texture sampling from geometry\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
         "  --self-test       CPU-only analyzer/pass-gate test; no device, no font\n"
-        "exit 0 = all executed paths PASS; 2 = failure. GUI/focus/screen untouched.\n");
+        "exit 0 = all executed paths/items PASS; 2 = failure."
+        " GUI/focus/screen untouched.\n"
+        "mode items are judged by presence of the expected ink/colour, not by the\n"
+        "full-mode text rule; a solid fill is expected to be all dark and one colour.\n");
 }
 
 }  // namespace
@@ -773,7 +1327,10 @@ int wmain(int argc, wchar_t** argv) {
     bool warp = false;
     bool debug_layer = false;
     bool self_test = false;
+    bool full = false;
+    bool saw_mode = false;
     std::wstring log_path;
+    std::vector<std::string> modes;
 
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
@@ -781,6 +1338,22 @@ int wmain(int argc, wchar_t** argv) {
             self_test = true;
         } else if (arg == L"--debug-layer") {
             debug_layer = true;
+        } else if (arg == L"--mode" && i + 1 < argc) {
+            const std::wstring value = argv[++i];
+            saw_mode = true;
+            if (value == L"full") {
+                full = true;
+            } else if (value == L"d2d-primitives") {
+                modes.push_back("d2d-primitives");
+            } else if (value == L"dwrite-offscreen") {
+                modes.push_back("dwrite-offscreen");
+            } else if (value == L"bitmap-brush") {
+                modes.push_back("bitmap-brush");
+            } else {
+                out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
+                usage();
+                return 2;
+            }
         } else if (arg == L"--driver" && i + 1 < argc) {
             const std::wstring value = argv[++i];
             if (value == L"hardware") {
@@ -820,11 +1393,24 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     print_environment();
+    // No --mode at all keeps the v1 behaviour byte for byte: full paths only.
+    if (!saw_mode) full = true;
     int failed = 0;
-    if (run_d3d11_d2d(warp, debug_layer) != 0) ++failed;
-    if (run_gdi() != 0) ++failed;
-    out("SUMMARY paths=2 passed=%d failed=%d driver=%s\n", 2 - failed, failed,
-        warp ? "warp" : "hardware");
+    if (full) {
+        if (run_d3d11_d2d(warp, debug_layer) != 0) ++failed;
+        if (run_gdi() != 0) ++failed;
+        out("SUMMARY paths=2 passed=%d failed=%d driver=%s\n", 2 - failed, failed,
+            warp ? "warp" : "hardware");
+    }
+    int mode_failed = 0;
+    for (const std::string& mode : modes) {
+        if (run_mode(mode, warp, debug_layer) != 0) ++mode_failed;
+    }
+    if (!modes.empty()) {
+        out("SUMMARY_MODES modes=%zu passed=%zu failed=%d driver=%s\n", modes.size(),
+            modes.size() - static_cast<size_t>(mode_failed), mode_failed,
+            warp ? "warp" : "hardware");
+    }
     if (g_log) fclose(g_log);
-    return failed ? 2 : 0;
+    return (failed + mode_failed) ? 2 : 0;
 }

@@ -117,9 +117,9 @@ jobs:
           if (-not (Select-String -Path "$dir\self-test.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing SELF_TEST=PASS' }
           # Runner evidence only. The hosted runner has no target GPU, so these
           # exits are recorded, never gated; device acceptance is separate.
-          & $exe --log "$dir\runner-hardware.txt" | Out-Null
+          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --log "$dir\runner-hardware.txt" | Out-Null
           $hwExit = $LASTEXITCODE
-          & $exe --driver warp --log "$dir\runner-warp.txt" | Out-Null
+          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --log "$dir\runner-warp.txt" | Out-Null
           $warpExit = $LASTEXITCODE
           New-Item -ItemType Directory text-glyph-package | Out-Null
           Copy-Item $exe, text_glyph_probe.cpp text-glyph-package
@@ -138,12 +138,17 @@ jobs:
           runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
           runner_warp_exit=$warpExit (hosted runner evidence, not gated)
           hardware_device=NOT_TESTED
+          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush (additive; full == no --mode)
+          v2_result=NOT_TESTED (mode items judge expected ink/colour per region; device run decides)
           "@ | Set-Content text-glyph-package\build-info.txt -Encoding utf8
           @'
           text_glyph_probe_arm64.exe
           text_glyph_probe_arm64.exe --driver warp
           text_glyph_probe_arm64.exe --self-test
-          text_glyph_probe_arm64.exe --log C:\path\probe.txt
+          text_glyph_probe_arm64.exe --mode d2d-primitives
+          text_glyph_probe_arm64.exe --mode dwrite-offscreen
+          text_glyph_probe_arm64.exe --mode bitmap-brush
+          text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --log C:\path\probe.txt
 
           Console ARM64. Creates no window, requests no focus/activation, reads no screen.
           Paths run in order d3d11_d2d then gdi; each prints its stages with HRESULT and
@@ -163,6 +168,29 @@ jobs:
           A PASS means "ink exists in this offscreen readback". It does not prove on-screen
           presentation, DWM composition, scanout, or that a visible window would show text.
           Logs contain adapter name/ids, session id, WOW64 state, d3d11.dll version only.
+
+          v2 diagnostic modes (additive; --mode full is byte-identical to no --mode):
+          d2d-primitives draws, into ONE target and one readback: a solid black
+            FillRectangle at 8,8 64x64, a 1px black DrawRectangle at 80.5,8.5 63x63, and
+            DrawTextLayout at 160,8. Items rect_fill / rect_stroke / text are judged
+            separately, so "every D2D draw is lost" can be told apart from "only glyphs".
+            Regions 4,4,76,76 / 76,4,148,76 / 152,4,508,124 are disjoint.
+          dwrite-offscreen draws the same glyphs once per text antialias mode
+            (cleartype, grayscale, aliased), each on its OWN texture and readback, and
+            reports requested_aa/effective_aa (GetTextAntialiasMode) per item. Nothing is
+            overwritten before it is measured, so no case can be hidden by a later draw.
+          bitmap-brush fills 8,8 64x64 with a 1x1 pure-red (BGRA 0,0,255,255) bitmap brush
+            (clamp/nearest) and DrawBitmap's a 1x1 pure-green bitmap into 200,8 64x64, then
+            reports sampled_bgra, matched pixel count and region area. This separates
+            texture sampling from geometry and from glyph rasterization.
+          Mode items are judged by presence of the expected ink or colour, NOT by the
+          full-mode text rule: a solid fill is expected to be 100% dark and single-coloured,
+          so "dark must not dominate" and "unique_color_count >= 2" cannot apply. Item PASS =
+          dark > 50 with bbox >= 8x4 for ink items, and >= 90% of the region matching the
+          expected colour within +-2 per channel for colour items.
+          A FAIL on geometry items but PASS on GDI points at the D2D/D3D path, not at fonts.
+          A FAIL only on the text item points at glyph rasterization or glyph texture
+          sampling; compare dwrite-offscreen and bitmap-brush to narrow it further.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8
           Get-ChildItem text-glyph-package -File -Recurse | Sort-Object FullName | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, ([IO.Path]::GetRelativePath((Resolve-Path text-glyph-package).Path, $_.FullName))
