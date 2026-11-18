@@ -4691,7 +4691,7 @@ int run_mask_write_srv(bool warp, bool debug_layer) {
         if (g_failures != before) ++failed;
     };
 
-    auto ps_write = [&](ID3D11RenderTargetView* rtv) {
+    auto write_mask = [&](ID3D11RenderTargetView* rtv) {
         const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         g.context->ClearRenderTargetView(rtv, zero);
         g.context->OMSetRenderTargets(1, &rtv, nullptr);
@@ -4702,14 +4702,14 @@ int run_mask_write_srv(bool warp, bool debug_layer) {
         g.context->Flush();
     };
 
-    ps_write(rtv_a.Get());
+    write_mask(rtv_a.Get());
     srv_readback(srv_a.Get(), "no_uav_ps_write_srv");
 
     clear_bits(rtv_a.Get(), 65537u);
     srv_readback(srv_a.Get(), "no_uav_clear_srv");
     direct_readback(mask_a.Get(), stage_a.Get(), "no_uav_clear_direct");
 
-    ps_write(rtv_b.Get());
+    write_mask(rtv_b.Get());
     srv_readback(srv_b.Get(), "with_uav_ps_write_srv");
 
     clear_bits(rtv_b.Get(), 65537u);
