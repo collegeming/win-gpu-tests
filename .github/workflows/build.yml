@@ -117,9 +117,9 @@ jobs:
           if (-not (Select-String -Path "$dir\self-test.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing SELF_TEST=PASS' }
           # Runner evidence only. The hosted runner has no target GPU, so these
           # exits are recorded, never gated; device acceptance is separate.
-          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --log "$dir\runner-hardware.txt" | Out-Null
+          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --log "$dir\runner-hardware.txt" | Out-Null
           $hwExit = $LASTEXITCODE
-          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --log "$dir\runner-warp.txt" | Out-Null
+          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --log "$dir\runner-warp.txt" | Out-Null
           $warpExit = $LASTEXITCODE
           New-Item -ItemType Directory text-glyph-package | Out-Null
           Copy-Item $exe, text_glyph_probe.cpp text-glyph-package
@@ -138,10 +138,11 @@ jobs:
           runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
           runner_warp_exit=$warpExit (hosted runner evidence, not gated)
           hardware_device=NOT_TESTED
-          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline,a8-upload,rt-to-srv,d2d-aa-modes,text-paths (additive; full == no --mode)
+          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline,a8-upload,rt-to-srv,d2d-aa-modes,text-paths,clip-contract,mask-uint,dualsrc-blend (additive; full == no --mode)
           v2_result=NOT_TESTED (mode items judge expected ink/colour per region; device run decides)
           v3_result=NOT_TESTED (a8-contract judges A8_UNORM values; drawline separates AA paths)
-          v4_result=NOT_TESTED (a8-upload judges UpdateSubresource upload and SRV mapping; rt-to-srv judges RT->SRV; d2d-aa-modes and text-paths judge per-item ink; device run decides)
+          v4_result=NOT_TESTED (a8-upload judges UpdateSubresource upload and SRV->PS value; rt-to-srv judges RT->SRV; d2d-aa-modes and text-paths judge per-item ink; device run decides)
+          v5_result=NOT_TESTED (clip-contract judges clip/discard keep-vs-drop; mask-uint judges R32_UINT write/Load/countbits/array index; dualsrc-blend judges SRC1 blend factors; device run decides)
           "@ | Set-Content text-glyph-package\build-info.txt -Encoding utf8
           @'
           text_glyph_probe_arm64.exe
@@ -156,7 +157,10 @@ jobs:
           text_glyph_probe_arm64.exe --mode rt-to-srv
           text_glyph_probe_arm64.exe --mode d2d-aa-modes
           text_glyph_probe_arm64.exe --mode text-paths
-          text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --log C:\path\probe.txt
+          text_glyph_probe_arm64.exe --mode clip-contract
+          text_glyph_probe_arm64.exe --mode mask-uint
+          text_glyph_probe_arm64.exe --mode dualsrc-blend
+          text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --log C:\path\probe.txt
 
           Console ARM64. Creates no window, requests no focus/activation, reads no screen.
           Paths run in order d3d11_d2d then gdi; each prints its stages with HRESULT and
@@ -264,12 +268,15 @@ jobs:
             It then draws a 4x4 BGRA8 target twice from the SAME texture: once through the
             default (identity) SRV, where the PS replicates .x for R8 (or .a for A8, since an
             identity R8 view yields (r,0,0,1)) into all three colour channels with alpha 255,
-            and once through an SRV created with Shader4ComponentMapping (ZERO,ZERO,ZERO,R)
-            using a PS that returns the sampled float4 raw. Expected: identity (v,v,v,255),
-            mapping (0,0,0,v). A format the UMD refuses is reported as ITEM RESULT=SKIP with
-            the failing hr, never as a crash. hr_tex/hr_srv/hr_update/hr_draw (device removed
-            reason) are printed. Reading: upload_raw PASS with identity PASS means the upload
-            and the sample path are intact, so a lost glyph mask lies elsewhere.
+            and once through a second PS that returns the sampled float4 with x/y/z forced to
+            zero and the stored channel moved to alpha, which produces the same (0,0,0,v)
+            result that a (ZERO,ZERO,ZERO,R) component mapping would. D3D11 SRV descs have no
+            Shader4ComponentMapping field, so the mapping is done in the PS. Expected:
+            identity (v,v,v,255), mapped (0,0,0,v). A format the UMD refuses is reported as
+            ITEM RESULT=SKIP with the failing hr, never as a crash. hr_tex/hr_srv/hr_update/hr_draw
+            (device removed reason) are printed, and stage=format_support lists
+            texture2d/shader_sample/shader_load. Reading: upload_raw PASS with identity PASS
+            means the upload and the sample path are intact, so a lost glyph mask lies elsewhere.
           rt-to-srv renders 0.5 into an 8x8 R8_UNORM texture bound as RENDER_TARGET and
             SHADER_RESOURCE from one PS (expected 128 +-2), then draws a second pass that
             samples that same texture as an SRV into a BGRA8 target (expected 128,128,128
@@ -293,6 +300,50 @@ jobs:
             dark/nonwhite/unique counts and RESULT. A glyphs=N advance_sum= line and
             baseline_y= are printed for the direct run; a FAIL there with PASS on
             solid_brush points at the glyph-run path, not at the text layout.
+          v5 diagnostic modes (also additive; every earlier mode is unchanged):
+            Why these three: a D2D antialiased stroke is not MSAA. D2D rasterizes coverage
+            into a uint mask texture, a second pass turns the per-pixel coverage into alpha
+            with countbits (16x16 cells, one bit per sample), and that pass ends with
+            clip(cov - 1/32) so zero-coverage cells are dropped. Text uses the same machinery
+            with an A8 glyph atlas plus a lookup. So the suspects are clip/discard
+            translation, R32_UINT typed Load + countbits on a texture written the same frame,
+            and the dual-source blend factors; the v4 A8 swizzle question is already answered
+            by a8-upload.
+          clip-contract draws a full-screen triangle into a 64x64 BGRA8 target cleared white
+            with a PS that reads x from a cbuffer and calls clip(x - 0.5) before returning
+            opaque black. x=0.75 must paint (dark > 50 with a dark bbox at least 8x4) and
+            x=0.25 must leave the target empty (dark = 0). The same two values are repeated
+            with the discard keyword (if (x - 0.5 < 0) discard) and with the clip shader
+            forced to ps_4_0, six items in total: clip_keep, clip_discard, discard_keep,
+            discard_discard, clip_ps40_keep, clip_ps40_discard. A keep item with no ink is
+            "always discards"; a discard item with ink is "always keeps"; the SUMMARY prints
+            keep_with_ink, discard_without_ink and verdict=clip_and_discard_respected,
+            always_discards, always_keeps or mixed. EndDraw-free mode: hr_draw is the device
+            removed reason of each case.
+          mask-uint builds a 256x256 R32_UINT texture with RENDER_TARGET, SHADER_RESOURCE and
+            UNORDERED_ACCESS. ps_write_uint writes 0x00010001 from a PS and reads it back raw
+            (2 bits set); uav_store_uint writes the same value from a compute shader through a
+            typed UAV (Dispatch 16x16x1) and reads it back raw. Both are compared exactly, so
+            a lost or reformatted uint write is visible per texel. countbits_sample then
+            draws a BGRA8 target with a PS that does
+            Texture2D<uint>::Load(int3(pos.xy,0)) and writes countbits(v)/16.0 (=2/16=0.125,
+            about 32 of 255) to all channels; countbits_array_index does the same through an
+            8-entry Texture2D<uint> array indexed from a cbuffer (idx=3), the shape a coverage
+            shader uses when it binds several masks. Expected plane value 32 +-2; a SKIP with
+            reason=array_variant_unavailable means the array/constant-buffer path could not be
+            created, not that it rendered wrong.
+          dualsrc-blend clears a 64x64 BGRA8 target to white and draws one full-screen PS that
+            writes SV_Target0 = (0,0,0,1) and SV_Target1 = (0,0,0,0.5). Only the blend factors
+            change: src1_alpha_blend uses SRC1_ALPHA/INV_SRC1_ALPHA and must produce grey 128
+            (0.5 black over white), src1_color_blend uses SRC1_COLOR/INV_SRC1_COLOR where the
+            source1 rgb is black so the factor is 0 and white 255 must survive (a driver that
+            aliases SRC1_COLOR to SRC1_ALPHA reports 128 here), and src_alpha_blend uses
+            SRC_ALPHA/INV_SRC_ALPHA where source0 alpha is 1 so the result must be black 0.
+            The third item documents that an opaque source cannot produce grey through
+            SRC_ALPHA; it is a control for the factor mapping, not a second copy of the
+            SRC1_ALPHA expectation. Each item prints expected_bgra, sampled_bgra, matched
+            count, region area, dark/nonwhite/unique and RESULT; alpha is not compared (the
+            mode reports B/G/R).
           Modes never alter the full-mode numbers; a mode failure only changes the exit code
           and SUMMARY_MODES.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8

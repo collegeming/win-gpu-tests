@@ -2036,8 +2036,11 @@ int run_drawline(bool warp, bool debug_layer) {
 //   --mode a8-upload    UpdateSubresource of {0,64,128,255} into a 4x4
 //                       R8_UNORM (and A8_UNORM when the UMD accepts it)
 //                       texture: raw bytes read back, then the same texture
-//                       sampled through the default SRV and through a
-//                       (ZERO,ZERO,ZERO,R) mapped SRV into a BGRA target.
+//                       sampled through the default SRV twice, once with the
+//                       PS replicating the stored channel into RGB and once
+//                       with the PS forcing XYZ to zero and writing the stored
+//                       channel into alpha (the (ZERO,ZERO,ZERO,R) shape;
+//                       D3D11 has no component mapping on an SRV).
 //                       Answers "does an 8-bit upload land" separately from the
 //                       typed UAV store that already worked.
 //   --mode rt-to-srv    one R8_UNORM texture used as render target and then as
@@ -2270,8 +2273,18 @@ const char* print_scalar_item(const char* mode, const char* item, const char* ex
 
 // The identity view of an R8_UNORM texture hands the shader (v,0,0,1) and the
 // identity view of an A8_UNORM texture hands it (0,0,0,v), so the meaningful
-// channel differs per format; two shaders keep the expected value honest
-// instead of a max(r,a) that would read the constant alpha of the R8 view.
+// channel differs per format; the shaders are separate per format so the
+// expected value stays honest instead of a max(r,a) that would read the
+// constant alpha of the R8 view.
+//
+// D3D11 has no component mapping on a shader resource view: the
+// Shader4ComponentMapping field belongs to D3D12's D3D12_SHADER_RESOURCE_VIEW_DESC,
+// and D3D11_SHADER_RESOURCE_VIEW_DESC has only Format / ViewDimension / the
+// per-dimension union (the compiler rejects the field). So the (ZERO,ZERO,ZERO,R)
+// shape is produced in the pixel shader from the identity view: the value the
+// view hands the shader is what the readback must then show in the target
+// alpha channel, with RGB forced to zero. The two shader families below are
+// exactly that pair, and the item names say which shape each one measures.
 const char* kUploadPsReplicateR =
     "Texture2D<float4> src : register(t0);\n"
     "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
@@ -2288,17 +2301,25 @@ const char* kUploadPsReplicateA =
     "    return float4(v, v, v, 1.0);\n"
     "}\n";
 
-// Writes the sampled float4 unchanged, so the readback is exactly what the SRV
-// handed the shader. Under a (ZERO,ZERO,ZERO,R) mapping that is (0,0,0,v); a
-// driver that ignores the mapping shows (v,0,0,1) instead.
-const char* kUploadPsRaw =
+// (ZERO,ZERO,ZERO,R) output shape: x/y/z forced to 0, the sampled value in
+// alpha only. A readback of (0,0,0,v) proves the value survived the move to the
+// alpha channel; anything else shows what the SRV actually handed the shader.
+const char* kUploadPsAlphaR =
     "Texture2D<float4> src : register(t0);\n"
     "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
-    "    return src.Load(int3(int2(pos.xy), 0));\n"
+    "    float4 s = src.Load(int3(int2(pos.xy), 0));\n"
+    "    return float4(0.0, 0.0, 0.0, s.r);\n"
+    "}\n";
+
+const char* kUploadPsAlphaA =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    float4 s = src.Load(int3(int2(pos.xy), 0));\n"
+    "    return float4(0.0, 0.0, 0.0, s.a);\n"
     "}\n";
 
 // Mode 5: does UpdateSubresource into an 8-bit texture land, and does the value
-// reach a shader through the default and a remapped SRV?
+// reach a shader through the default SRV in both output shapes?
 int run_a8_upload(bool warp, bool debug_layer) {
     const char* path = "a8-upload";
     Gpu g;
@@ -2309,7 +2330,8 @@ int run_a8_upload(bool warp, bool debug_layer) {
     }
     gpu_adapter(path, g.device.Get());
 
-    ComPtr<ID3DBlob> vs_blob, ps_replicate_r_blob, ps_replicate_a_blob, ps_raw_blob;
+    ComPtr<ID3DBlob> vs_blob, ps_replicate_r_blob, ps_replicate_a_blob, ps_alpha_r_blob,
+        ps_alpha_a_blob;
     const char* used_profile = nullptr;
     HRESULT hr = a8_compile(path, "upload_vs", kA8Vs, "vs_5_0", "vs_4_0",
                             vs_blob.GetAddressOf(), &used_profile);
@@ -2320,8 +2342,11 @@ int run_a8_upload(bool warp, bool debug_layer) {
         hr = a8_compile(path, "upload_ps_replicate_a", kUploadPsReplicateA, "ps_5_0",
                         "ps_4_0", ps_replicate_a_blob.GetAddressOf(), &used_profile);
     if (SUCCEEDED(hr))
-        hr = a8_compile(path, "upload_ps_raw", kUploadPsRaw, "ps_5_0", "ps_4_0",
-                        ps_raw_blob.GetAddressOf(), &used_profile);
+        hr = a8_compile(path, "upload_ps_alpha_r", kUploadPsAlphaR, "ps_5_0", "ps_4_0",
+                        ps_alpha_r_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "upload_ps_alpha_a", kUploadPsAlphaA, "ps_5_0", "ps_4_0",
+                        ps_alpha_a_blob.GetAddressOf(), &used_profile);
     if (FAILED(hr)) {
         ++g_failures;
         out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
@@ -2332,7 +2357,8 @@ int run_a8_upload(bool warp, bool debug_layer) {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps_replicate_r;
     ComPtr<ID3D11PixelShader> ps_replicate_a;
-    ComPtr<ID3D11PixelShader> ps_raw;
+    ComPtr<ID3D11PixelShader> ps_alpha_r;
+    ComPtr<ID3D11PixelShader> ps_alpha_a;
     hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
                                       nullptr, &vs);
     out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
@@ -2351,9 +2377,17 @@ int run_a8_upload(bool warp, bool debug_layer) {
             static_cast<unsigned long>(hr));
     }
     if (SUCCEEDED(hr)) {
-        hr = g.device->CreatePixelShader(ps_raw_blob->GetBufferPointer(),
-                                        ps_raw_blob->GetBufferSize(), nullptr, &ps_raw);
-        out("MODE=%s stage=create_ps_raw hr=0x%08lx\n", path,
+        hr = g.device->CreatePixelShader(ps_alpha_r_blob->GetBufferPointer(),
+                                         ps_alpha_r_blob->GetBufferSize(), nullptr,
+                                         &ps_alpha_r);
+        out("MODE=%s stage=create_ps_alpha_r hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_alpha_a_blob->GetBufferPointer(),
+                                         ps_alpha_a_blob->GetBufferSize(), nullptr,
+                                         &ps_alpha_a);
+        out("MODE=%s stage=create_ps_alpha_a hr=0x%08lx\n", path,
             static_cast<unsigned long>(hr));
     }
     if (FAILED(hr)) {
@@ -2368,15 +2402,9 @@ int run_a8_upload(bool warp, bool debug_layer) {
         return 2;
     }
 
-    // (ZERO,ZERO,ZERO,R): output.x/.y/.z forced to 0, output.w takes the memory
-    // component 0. Three bits per component, component 0 in the low bits. The
-    // D3D11_SHADER_COMPONENT_MAPPING values are spelled out so this file does not
-    // depend on which header the SDK puts the enum in: FROM_MEMORY_COMPONENT_0
-    // is 0, FORCE_VALUE_0 is 3.
-    const UINT map_from_memory_0 = 0u;
-    const UINT map_force_value_0 = 3u;
-    const UINT swizzle_zzzr = map_force_value_0 | (map_force_value_0 << 3) |
-                              (map_force_value_0 << 6) | (map_from_memory_0 << 9);
+    // (ZERO,ZERO,ZERO,R) has to be produced by the pixel shader: D3D11 has no
+    // component mapping on a shader resource view (that field is D3D12's). See
+    // the note above kUploadPsAlphaR.
 
     const unsigned values[kUploadSize] = {0, 64, 128, 255};
     struct FmtCase {
@@ -2463,44 +2491,36 @@ int run_a8_upload(bool warp, bool debug_layer) {
 
         ComPtr<ID3D11ShaderResourceView> srv;
         const HRESULT hr_srv = g.device->CreateShaderResourceView(src.Get(), nullptr, &srv);
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = f.fmt;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MostDetailedMip = 0;
-        sd.Texture2D.MipLevels = 1;
-        sd.Shader4ComponentMapping = swizzle_zzzr;
-        ComPtr<ID3D11ShaderResourceView> srv_swz;
-        const HRESULT hr_srv_swz =
-            g.device->CreateShaderResourceView(src.Get(), &sd, &srv_swz);
-        out("MODE=%s stage=create_srv fmt=%s identity_hr=0x%08lx zzzr_hr=0x%08lx"
-            " zzzr_mapping=%u\n", path, f.name, static_cast<unsigned long>(hr_srv),
-            static_cast<unsigned long>(hr_srv_swz), swizzle_zzzr);
-        if (FAILED(hr_srv) || FAILED(hr_srv_swz)) {
+        out("MODE=%s stage=create_srv fmt=%s identity_hr=0x%08lx"
+            " component_mapping=ps_side_d3d11_srv_desc_has_no_mapping_field\n", path, f.name,
+            static_cast<unsigned long>(hr_srv));
+        if (FAILED(hr_srv)) {
             // An SRV the UMD refuses is "this format cannot be sampled", not a
             // value failure: the R8 case carries the answer.
             out("MODE=%s ITEM=%s_identity_replicate RESULT=SKIP reason=srv_create_failed\n",
                 path, f.name);
-            out("MODE=%s ITEM=%s_map_zzzr_raw RESULT=SKIP reason=srv_create_failed\n", path,
+            out("MODE=%s ITEM=%s_map_zzzr_in_ps RESULT=SKIP reason=srv_create_failed\n", path,
                 f.name);
             skipped += 2;
             continue;
         }
 
-        // 2) and 3): sample the same texture twice, once through each SRV.
+        // 2) and 3): the same identity SRV sampled by two shaders, one that
+        // replicates the stored channel into RGB, one that forces XYZ to zero and
+        // puts it in alpha (the (ZERO,ZERO,ZERO,R) output shape).
         struct SampleCase {
             const char* suffix;
-            ID3D11ShaderResourceView* view;
             ID3D11PixelShader* ps;
             bool raw_output;
             int alpha;
             const char* note;
         };
+        const bool is_a8 = (f.fmt == DXGI_FORMAT_A8_UNORM);
         const SampleCase cases[] = {
-            {"identity_replicate", srv.Get(),
-             (f.fmt == DXGI_FORMAT_A8_UNORM) ? ps_replicate_a.Get() : ps_replicate_r.Get(),
+            {"identity_replicate", is_a8 ? ps_replicate_a.Get() : ps_replicate_r.Get(),
              false, 255, "ps=stored_channel_replicated_to_rgb_alpha_255"},
-            {"map_zzzr_raw", srv_swz.Get(), ps_raw.Get(), true, 0,
-             "ps=sampled_float4_unchanged_mapping_forces_xyz_zero"},
+            {"map_zzzr_in_ps", is_a8 ? ps_alpha_a.Get() : ps_alpha_r.Get(), true, 0,
+             "ps=xyz_zero_alpha=stored_channel_d3d11_has_no_srv_mapping"},
         };
         for (const SampleCase& c : cases) {
             ComPtr<ID3D11Texture2D> dst, dst_staging;
@@ -2527,7 +2547,8 @@ int run_a8_upload(bool warp, bool debug_layer) {
             g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
             g.context->ClearRenderTargetView(rtv.Get(), clear);
             g.context->PSSetShader(c.ps, nullptr, 0);
-            g.context->PSSetShaderResources(0, 1, &c.view);
+            ID3D11ShaderResourceView* src_view = srv.Get();
+            g.context->PSSetShaderResources(0, 1, &src_view);
             g.context->Draw(3, 0);
             ID3D11ShaderResourceView* no_srvs[1] = {nullptr};
             g.context->PSSetShaderResources(0, 1, no_srvs);
@@ -3340,11 +3361,795 @@ int run_text_paths(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ============================================================================
+// v5 modes: clip/discard translation, R32_UINT coverage-mask round trips with
+// typed Load + countbits, and dual-source blend factors.
+//
+// Why these three: a D2D antialiased stroke is not MSAA. D2D rasterizes
+// coverage into a uint mask texture, then a second pass turns the per-pixel
+// coverage into alpha with countbits (a 16x16 cell packs 256 samples, each bit
+// one sample) and the mask PS ends with clip(cov - 1/32) so zero-coverage
+// cells are dropped. Text is the same machinery with an A8 glyph atlas plus a
+// lookup. So the suspects are (1) clip/discard translation to the UMD,
+// (2) R32_UINT typed Load and countbits on a texture that was just written, and
+// (3) the dual-source blend factors a coverage shader needs. Each mode below
+// isolates one of those, with a control that says what the same code does when
+// the feature works.
+// ============================================================================
+constexpr int kClipSize = 64;
+constexpr int kMaskSize = 256;
+constexpr int kDualSize = 64;
+
+// A full-cover draw either paints everywhere or paints nothing, so the only
+// question is whether ink exists; the bbox requirement is kept so a single
+// stray dark pixel cannot pass as "the quad was kept".
+const char* expect_ink_reason(const PixelStats& s, bool expect_ink) {
+    const bool ink = s.dark > kMinDarkPixels;
+    if (expect_ink) {
+        if (!ink) return "expected_ink_but_dark_zero";
+        if (!s.dark_bbox_valid) return "expected_ink_but_no_dark_bbox";
+        if (s.dark_right - s.dark_left < kItemMinBBoxWidth)
+            return "expected_ink_but_bbox_too_narrow";
+        if (s.dark_bottom - s.dark_top < kItemMinBBoxHeight)
+            return "expected_ink_but_bbox_too_short";
+        return nullptr;
+    }
+    if (ink) return "expected_discard_but_ink_present";
+    return nullptr;
+}
+
+// clip() and the discard keyword are two spellings of the same requirement:
+// when the coverage expression is negative the pixel must not be written. The
+// two variants are kept separate because a translator can support one and drop
+// the other.
+const char* kClipPs =
+    "cbuffer Args : register(b0) { float x; };\n"
+    "float4 main() : SV_Target {\n"
+    "    clip(x - 0.5);\n"
+    "    return float4(0.0, 0.0, 0.0, 1.0);\n"
+    "}\n";
+
+const char* kDiscardPs =
+    "cbuffer Args : register(b0) { float x; };\n"
+    "float4 main() : SV_Target {\n"
+    "    if (x - 0.5 < 0.0) discard;\n"
+    "    return float4(0.0, 0.0, 0.0, 1.0);\n"
+    "}\n";
+
+int run_clip_contract(bool warp, bool debug_layer) {
+    const char* path = "clip-contract";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, clip50_blob, discard50_blob, clip40_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "clip_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "clip_ps_clip_ps50", kClipPs, "ps_5_0", "ps_5_0",
+                        clip50_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "clip_ps_discard_ps50", kDiscardPs, "ps_5_0", "ps_5_0",
+                        discard50_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "clip_ps_clip_ps40", kClipPs, "ps_4_0", "ps_4_0",
+                        clip40_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps_clip50, ps_discard50, ps_clip40;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(clip50_blob->GetBufferPointer(),
+                                         clip50_blob->GetBufferSize(), nullptr, &ps_clip50);
+        out("MODE=%s stage=create_ps clip_variant=clip profile=ps_5_0 hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(discard50_blob->GetBufferPointer(),
+                                         discard50_blob->GetBufferSize(), nullptr,
+                                         &ps_discard50);
+        out("MODE=%s stage=create_ps clip_variant=discard profile=ps_5_0 hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(clip40_blob->GetBufferPointer(),
+                                         clip40_blob->GetBufferSize(), nullptr, &ps_clip40);
+        out("MODE=%s stage=create_ps clip_variant=clip profile=ps_4_0 hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    if (!small_pipeline(path, g, kClipSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.ByteWidth = 16;
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ComPtr<ID3D11Buffer> cb;
+    const HRESULT hr_cb = g.device->CreateBuffer(&cb_desc, nullptr, &cb);
+    out("MODE=%s stage=create_constant_buffer bytes=16 usage=dynamic hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_cb));
+    if (FAILED(hr_cb)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=constant_buffer_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr_cb));
+        return 2;
+    }
+
+    struct ClipCase {
+        const char* item;
+        ID3D11PixelShader* ps;
+        const char* variant;
+        const char* profile;
+        float x;
+        bool expect_ink;
+    };
+    const ClipCase cases[] = {
+        {"clip_keep", ps_clip50.Get(), "clip", "ps_5_0", 0.75f, true},
+        {"clip_discard", ps_clip50.Get(), "clip", "ps_5_0", 0.25f, false},
+        {"discard_keep", ps_discard50.Get(), "discard", "ps_5_0", 0.75f, true},
+        {"discard_discard", ps_discard50.Get(), "discard", "ps_5_0", 0.25f, false},
+        {"clip_ps40_keep", ps_clip40.Get(), "clip", "ps_4_0", 0.75f, true},
+        {"clip_ps40_discard", ps_clip40.Get(), "clip", "ps_4_0", 0.25f, false},
+    };
+    const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    int failed = 0;
+    int keep_with_ink = 0;
+    int keep_items = 0;
+    int discard_without_ink = 0;
+    int discard_items = 0;
+
+    for (const ClipCase& c : cases) {
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kClipSize,
+                           D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path, c.item);
+            continue;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv);
+        if (FAILED(hr_rtv)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed hr=0x%08lx\n", path,
+                c.item, static_cast<unsigned long>(hr_rtv));
+            continue;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped_cb{};
+        HRESULT hr_map = g.context->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cb);
+        if (FAILED(hr_map)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=constant_map_failed hr=0x%08lx\n", path,
+                c.item, static_cast<unsigned long>(hr_map));
+            continue;
+        }
+        float args[4] = {c.x, 0.0f, 0.0f, 0.0f};
+        memcpy(mapped_cb.pData, args, sizeof(args));
+        g.context->Unmap(cb.Get(), 0);
+
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->ClearRenderTargetView(rtv.Get(), white);
+        ID3D11Buffer* cb_ptr = cb.Get();
+        g.context->PSSetConstantBuffers(0, 1, &cb_ptr);
+        g.context->PSSetShader(c.ps, nullptr, 0);
+        g.context->Draw(3, 0);
+        ID3D11Buffer* no_cb = nullptr;
+        g.context->PSSetConstantBuffers(0, 1, &no_cb);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+        const SmallRead back =
+            small_read(path, g.context.Get(), tex.Get(), staging.Get(), kClipSize, 4);
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, c.item);
+            continue;
+        }
+        const PixelStats s =
+            analyze(back.bytes.data(), back.pitch, kClipSize, kClipSize,
+                    RECT{0, 0, kClipSize, kClipSize});
+        const char* reason = expect_ink_reason(s, c.expect_ink);
+        char extra[320];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " region=0,0,%d,%d variant=%s profile=%s x=%.2f expected=%s"
+                    " hr_draw=0x%08lx", kClipSize, kClipSize, c.variant, c.profile,
+                    static_cast<double>(c.x), c.expect_ink ? "ink" : "no_ink",
+                    static_cast<unsigned long>(hr_draw));
+        if (c.expect_ink) {
+            ++keep_items;
+            if (s.dark > kMinDarkPixels) ++keep_with_ink;
+        } else {
+            ++discard_items;
+            if (s.dark <= kMinDarkPixels) ++discard_without_ink;
+        }
+        if (print_ink_item_with(path, c.item, extra, s, reason)) ++failed;
+    }
+
+    const char* verdict = "mixed";
+    if (keep_with_ink == 0) {
+        verdict = "always_discards";
+    } else if (discard_without_ink == 0) {
+        verdict = "always_keeps";
+    } else if (keep_with_ink == keep_items && discard_without_ink == discard_items) {
+        verdict = "clip_and_discard_respected";
+    }
+    out("MODE=%s SUMMARY items=%d failed=%d keep_with_ink=%d/%d discard_without_ink=%d/%d"
+        " verdict=%s\n", path, keep_items + discard_items, failed, keep_with_ink, keep_items,
+        discard_without_ink, discard_items, verdict);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// mask-uint: the coverage-mask shape. A 256x256 R32_UINT texture is written by
+// a PS (one uint per pixel, bits 0 and 16 set) and by a typed UAV store, then
+// read back both as raw uint (must be exactly 0x00010001) and through a uint
+// SRV + countbits in a second pass (must be 2/16 = 0.125 -> about 32/255).
+// The array variant indexes an 8-element texture array with a cbuffer value,
+// which is how a glyph LUT/mask lookup can be spelled. A result of 0 in the
+// countbits items is the bug signature: the mask exists but reads as empty.
+// ---------------------------------------------------------------------------
+const char* kMaskPsWrite =
+    "uint4 main() : SV_Target {\n"
+    "    return uint4(65537u, 0u, 0u, 0u);\n"
+    "}\n";
+
+const char* kMaskCsStore =
+    "RWTexture2D<uint> dst : register(u0);\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) {\n"
+    "    dst[id.xy] = 65537u;\n"
+    "}\n";
+
+const char* kMaskPsSample =
+    "Texture2D<uint> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    uint v = src.Load(int3(int2(pos.xy), 0));\n"
+    "    float c = (float)countbits(v) / 16.0;\n"
+    "    return float4(c, c, c, 1.0);\n"
+    "}\n";
+
+// Dynamic index into a texture array: this is the form a LUT/mask lookup takes
+// in a compiled coverage shader, and it is the form a UMD is most likely to
+// mistranslate into a fixed slot.
+const char* kMaskPsArray =
+    "cbuffer Args : register(b0) { uint idx; };\n"
+    "Texture2D<uint> g[8] : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    uint v = g[idx].Load(int3(int2(pos.xy), 0));\n"
+    "    float c = (float)countbits(v) / 16.0;\n"
+    "    return float4(c, c, c, 1.0);\n"
+    "}\n";
+
+// Raw uint readback: every texel must be exactly the written value, so the
+// actual value is reported as min/max plus the mismatch count.
+const char* print_uint_item(const char* mode, const char* item, const char* extra,
+                            const SmallRead& r, int size, unsigned want) {
+    unsigned lo = 0xFFFFFFFFu;
+    unsigned hi = 0;
+    int bad = 0;
+    for (int y = 0; y < size; ++y) {
+        const uint8_t* row = r.bytes.data() + static_cast<size_t>(y) * r.pitch;
+        for (int x = 0; x < size; ++x) {
+            const uint8_t* p = row + x * 4;
+            const unsigned v = static_cast<unsigned>(p[0]) |
+                               (static_cast<unsigned>(p[1]) << 8) |
+                               (static_cast<unsigned>(p[2]) << 16) |
+                               (static_cast<unsigned>(p[3]) << 24);
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            if (v != want) ++bad;
+        }
+    }
+    const char* reason = bad ? "value_mismatch" : nullptr;
+    out("MODE=%s ITEM=%s%s RESULT=%s texels=%d mismatches=%d expected_uint=0x%08x"
+        " actual_min_uint=0x%08x actual_max_uint=0x%08x reason=%s\n", mode, item, extra,
+        reason ? "FAIL" : "PASS", size * size, bad, want, lo, hi,
+        reason ? reason : "ok");
+    if (reason) ++g_failures;
+    return reason;
+}
+
+int run_mask_uint(bool warp, bool debug_layer) {
+    const char* path = "mask-uint";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    UINT support = 0;
+    const HRESULT hr_support = g.device->CheckFormatSupport(DXGI_FORMAT_R32_UINT, &support);
+    out("MODE=%s stage=format_support fmt=R32_UINT hr=0x%08lx texture2d=%s render_target=%s"
+        " shader_load=%s typed_uav=%s\n", path, static_cast<unsigned long>(hr_support),
+        (support & D3D11_FORMAT_SUPPORT_TEXTURE2D) ? "yes" : "no",
+        (support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) ? "yes" : "no",
+        (support & D3D11_FORMAT_SUPPORT_SHADER_LOAD) ? "yes" : "no",
+        (support & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) ? "yes" : "no");
+
+    ComPtr<ID3DBlob> vs_blob, ps_write_blob, ps_sample_blob, ps_array_blob, cs_store_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "mask_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "mask_ps_write", kMaskPsWrite, "ps_5_0", "ps_4_0",
+                        ps_write_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "mask_ps_sample", kMaskPsSample, "ps_5_0", "ps_4_0",
+                        ps_sample_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "mask_ps_array", kMaskPsArray, "ps_5_0", "ps_5_0",
+                        ps_array_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "mask_cs_store", kMaskCsStore, "cs_5_0", "cs_4_0",
+                        cs_store_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps_write, ps_sample, ps_array;
+    ComPtr<ID3D11ComputeShader> cs_store;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_write_blob->GetBufferPointer(),
+                                         ps_write_blob->GetBufferSize(), nullptr, &ps_write);
+        out("MODE=%s stage=create_ps name=write_uint hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_sample_blob->GetBufferPointer(),
+                                         ps_sample_blob->GetBufferSize(), nullptr,
+                                         &ps_sample);
+        out("MODE=%s stage=create_ps name=countbits_sample hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_array_blob->GetBufferPointer(),
+                                         ps_array_blob->GetBufferSize(), nullptr, &ps_array);
+        out("MODE=%s stage=create_ps name=countbits_array hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreateComputeShader(cs_store_blob->GetBufferPointer(),
+                                           cs_store_blob->GetBufferSize(), nullptr,
+                                           &cs_store);
+        out("MODE=%s stage=create_cs name=uav_store_uint hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    if (!small_pipeline(path, g, kMaskSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    // One texture, three bindings: rendered to, stored to by a UAV, sampled.
+    ComPtr<ID3D11Texture2D> mask, mask_staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_R32_UINT, kMaskSize,
+                       D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+                           D3D11_BIND_UNORDERED_ACCESS,
+                       mask, mask_staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=r32uint_texture_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11UnorderedAccessView> uav;
+    const HRESULT hr_rtv = g.device->CreateRenderTargetView(mask.Get(), nullptr, &rtv);
+    const HRESULT hr_srv = g.device->CreateShaderResourceView(mask.Get(), nullptr, &srv);
+    const HRESULT hr_uav = g.device->CreateUnorderedAccessView(mask.Get(), nullptr, &uav);
+    out("MODE=%s stage=create_views rtv_hr=0x%08lx srv_hr=0x%08lx uav_hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_rtv), static_cast<unsigned long>(hr_srv),
+        static_cast<unsigned long>(hr_uav));
+    const bool have_rtv = SUCCEEDED(hr_rtv);
+    const bool have_srv = SUCCEEDED(hr_srv);
+    const bool have_uav = SUCCEEDED(hr_uav);
+
+    const unsigned want_uint = 65537u;
+    const unsigned want_count = 32u;  // 2/16 * 255 = 31.875
+    int failed = 0;
+    int items = 0;
+    int skipped = 0;
+    char extra[320];
+
+    // (a) PS writes one uint per pixel.
+    if (!have_rtv) {
+        out("MODE=%s ITEM=ps_write_uint RESULT=SKIP reason=rtv_create_failed\n", path);
+        ++skipped;
+    } else {
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), clear);
+        g.context->PSSetShader(ps_write.Get(), nullptr, 0);
+        g.context->Draw(3, 0);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+        const SmallRead back =
+            small_read(path, g.context.Get(), mask.Get(), mask_staging.Get(), kMaskSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=ps_write_uint RESULT=FAIL reason=map_read_failed\n", path);
+        } else {
+            _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                        " path=ps_uint4_to_R32_UINT expected=0x00010001"
+                        " bits_set=2 hr_draw=0x%08lx", static_cast<unsigned long>(hr_draw));
+            if (print_uint_item(path, "ps_write_uint", extra, back, kMaskSize, want_uint))
+                ++failed;
+        }
+    }
+
+    // (b) the same value from a typed UAV store in a compute shader.
+    if (!have_uav) {
+        out("MODE=%s ITEM=uav_store_uint RESULT=SKIP reason=uav_create_failed\n", path);
+        ++skipped;
+    } else {
+        g.context->CSSetShader(cs_store.Get(), nullptr, 0);
+        ID3D11UnorderedAccessView* uav_ptr = uav.Get();
+        g.context->CSSetUnorderedAccessViews(0, 1, &uav_ptr, nullptr);
+        const UINT groups = static_cast<UINT>(kMaskSize / 16);
+        g.context->Dispatch(groups, groups, 1);
+        ID3D11UnorderedAccessView* no_uav = nullptr;
+        g.context->CSSetUnorderedAccessViews(0, 1, &no_uav, nullptr);
+        g.context->CSSetShader(nullptr, nullptr, 0);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        const SmallRead back =
+            small_read(path, g.context.Get(), mask.Get(), mask_staging.Get(), kMaskSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=uav_store_uint RESULT=FAIL reason=map_read_failed\n", path);
+        } else {
+            _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                        " path=typed_uav_store expected=0x00010001 bits_set=2"
+                        " dispatch=%ux%ux1 hr_draw=0x%08lx", groups, groups,
+                        static_cast<unsigned long>(hr_draw));
+            if (print_uint_item(path, "uav_store_uint", extra, back, kMaskSize, want_uint))
+                ++failed;
+        }
+    }
+
+    // (c) and (d): the mask read through a uint SRV and countbits into BGRA.
+    ComPtr<ID3D11Texture2D> out_tex, out_staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kMaskSize,
+                       D3D11_BIND_RENDER_TARGET, out_tex, out_staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=bgra_target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> out_rtv;
+    const HRESULT hr_out_rtv = g.device->CreateRenderTargetView(out_tex.Get(), nullptr,
+                                                               &out_rtv);
+    out("MODE=%s stage=create_bgra_rtv hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_out_rtv));
+
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.ByteWidth = 16;
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ComPtr<ID3D11Buffer> cb;
+    const HRESULT hr_cb = g.device->CreateBuffer(&cb_desc, nullptr, &cb);
+    out("MODE=%s stage=create_constant_buffer bytes=16 usage=dynamic hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_cb));
+
+    struct SampleVariant {
+        const char* item;
+        ID3D11PixelShader* ps;
+        bool array_index;
+        const char* note;
+    };
+    const SampleVariant variants[] = {
+        {"countbits_sample", ps_sample.Get(), false,
+         "ps=Texture2D_uint_Load_then_countbits_div16"},
+        {"countbits_array_index", ps_array.Get(), true,
+         "ps=Texture2D_uint_array_dynamic_index_3_then_countbits"},
+    };
+
+    for (const SampleVariant& v : variants) {
+        if (!have_srv || FAILED(hr_out_rtv)) {
+            out("MODE=%s ITEM=%s RESULT=SKIP reason=srv_or_rtv_create_failed\n", path,
+                v.item);
+            ++skipped;
+            continue;
+        }
+        if (v.array_index && (FAILED(hr_cb) || !ps_array)) {
+            out("MODE=%s ITEM=%s RESULT=SKIP reason=array_variant_unavailable hr=0x%08lx\n",
+                path, v.item, static_cast<unsigned long>(hr_cb));
+            ++skipped;
+            continue;
+        }
+        if (v.array_index) {
+            D3D11_MAPPED_SUBRESOURCE mapped_cb{};
+            const HRESULT hr_map =
+                g.context->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cb);
+            if (FAILED(hr_map)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=%s RESULT=FAIL reason=constant_map_failed hr=0x%08lx\n",
+                    path, v.item, static_cast<unsigned long>(hr_map));
+                continue;
+            }
+            unsigned idx_args[4] = {3u, 0u, 0u, 0u};
+            memcpy(mapped_cb.pData, idx_args, sizeof(idx_args));
+            g.context->Unmap(cb.Get(), 0);
+        }
+
+        ID3D11RenderTargetView* out_rtv_ptr = out_rtv.Get();
+        g.context->OMSetRenderTargets(1, &out_rtv_ptr, nullptr);
+        const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(out_rtv.Get(), clear);
+        if (v.array_index) {
+            ID3D11ShaderResourceView* views[8];
+            for (int k = 0; k < 8; ++k) views[k] = srv.Get();
+            g.context->PSSetShaderResources(0, 8, views);
+            ID3D11Buffer* cb_ptr = cb.Get();
+            g.context->PSSetConstantBuffers(0, 1, &cb_ptr);
+        } else {
+            ID3D11ShaderResourceView* view = srv.Get();
+            g.context->PSSetShaderResources(0, 1, &view);
+        }
+        g.context->PSSetShader(v.ps, nullptr, 0);
+        g.context->Draw(3, 0);
+        ID3D11ShaderResourceView* no_srvs[8] = {nullptr, nullptr, nullptr, nullptr,
+                                                nullptr, nullptr, nullptr, nullptr};
+        g.context->PSSetShaderResources(0, 8, no_srvs);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+        const SmallRead back = small_read(path, g.context.Get(), out_tex.Get(),
+                                          out_staging.Get(), kMaskSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, v.item);
+            continue;
+        }
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " path=countbits_of_0x00010001 expected=32_of_255_value_range_31_to_33"
+                    " note=%s hr_draw=0x%08lx", v.note, static_cast<unsigned long>(hr_draw));
+        if (print_plane_item(path, v.item, extra, back, kMaskSize,
+                             Rgba{static_cast<int>(want_count), static_cast<int>(want_count),
+                                  static_cast<int>(want_count), 255},
+                             2))
+            ++failed;
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d skipped=%d formats=R32_UINT,B8G8R8A8_UNORM"
+        " size=%dx%d expected_uint=0x00010001 expected_countbits_value=32\n", path, items,
+        failed, skipped, kMaskSize, kMaskSize);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// dualsrc-blend: the blend factors a coverage shader uses. The PS writes an
+// opaque black to SV_Target0 and alpha 0.5 to SV_Target1, the target is cleared
+// white, and only the SrcBlend/DestBlend factors change between items.
+//   src1_alpha   SRC1_ALPHA/INV_SRC1_ALPHA  -> 0.5 black over white = 128 grey
+//   src1_color   SRC1_COLOR/INV_SRC1_COLOR  -> source1 rgb is (0,0,0), so the
+//                                              factor is 0 and white survives;
+//                                              a driver that maps SRC1_COLOR to
+//                                              SRC1_ALPHA reports 128 here
+//   src_alpha    SRC_ALPHA/INV_SRC_ALPHA    -> source0 alpha is 1, fully black
+// ---------------------------------------------------------------------------
+const char* kDualPs =
+    "struct PSOut { float4 c0 : SV_Target0; float4 c1 : SV_Target1; };\n"
+    "PSOut main() {\n"
+    "    PSOut o;\n"
+    "    o.c0 = float4(0.0, 0.0, 0.0, 1.0);\n"
+    "    o.c1 = float4(0.0, 0.0, 0.0, 0.5);\n"
+    "    return o;\n"
+    "}\n";
+
+int run_dualsrc_blend(bool warp, bool debug_layer) {
+    const char* path = "dualsrc-blend";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "dual_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "dual_ps", kDualPs, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                         ps_blob->GetBufferSize(), nullptr, &ps);
+        out("MODE=%s stage=create_ps targets=2 dual_source=yes hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    if (!small_pipeline(path, g, kDualSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    struct BlendCase {
+        const char* item;
+        D3D11_BLEND src;
+        D3D11_BLEND dst;
+        const char* factors;
+        Rgba want;
+        const char* expected_text;
+    };
+    const BlendCase cases[] = {
+        {"src1_alpha_blend", D3D11_BLEND_SRC1_ALPHA, D3D11_BLEND_INV_SRC1_ALPHA,
+         "SRC1_ALPHA/INV_SRC1_ALPHA", Rgba{128, 128, 128, 255},
+         "0.5_black_over_white_grey_128"},
+        {"src1_color_blend", D3D11_BLEND_SRC1_COLOR, D3D11_BLEND_INV_SRC1_COLOR,
+         "SRC1_COLOR/INV_SRC1_COLOR", Rgba{255, 255, 255, 255},
+         "source1_rgb_black_factor_zero_white_255"},
+        {"src_alpha_blend", D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA,
+         "SRC_ALPHA/INV_SRC_ALPHA", Rgba{0, 0, 0, 255}, "source0_alpha_one_black_0"},
+    };
+    const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    int failed = 0;
+    int items = 0;
+    int skipped = 0;
+
+    for (const BlendCase& c : cases) {
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = c.src;
+        bd.RenderTarget[0].DestBlend = c.dst;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ComPtr<ID3D11BlendState> blend;
+        const HRESULT hr_blend = g.device->CreateBlendState(&bd, &blend);
+        out("MODE=%s stage=create_blend_state factors=%s hr=0x%08lx\n", path, c.factors,
+            static_cast<unsigned long>(hr_blend));
+        if (FAILED(hr_blend)) {
+            out("MODE=%s ITEM=%s RESULT=SKIP reason=blend_state_create_failed\n", path,
+                c.item);
+            ++skipped;
+            continue;
+        }
+
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kDualSize,
+                           D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path, c.item);
+            continue;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        const HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv);
+        if (FAILED(hr_rtv)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed hr=0x%08lx\n", path,
+                c.item, static_cast<unsigned long>(hr_rtv));
+            continue;
+        }
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->ClearRenderTargetView(rtv.Get(), white);
+        const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        g.context->OMSetBlendState(blend.Get(), blend_factor, 0xffffffff);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        g.context->Draw(3, 0);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
+                                          kDualSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, c.item);
+            continue;
+        }
+        const RECT rect{0, 0, kDualSize, kDualSize};
+        const PixelStats s = analyze(back.bytes.data(), back.pitch, kDualSize, kDualSize,
+                                     rect);
+        const unsigned long long matched =
+            count_color_match(back.bytes.data(), back.pitch, rect, c.want, 2);
+        const long long area = static_cast<long long>(kDualSize) * kDualSize;
+        char extra[320];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " region=0,0,%d,%d blend=%s blend_factor=1,1,1,1"
+                    " expected=%s alpha_channel_not_compared hr_draw=0x%08lx", kDualSize,
+                    kDualSize, c.factors, c.expected_text,
+                    static_cast<unsigned long>(hr_draw));
+        // count_color_match compares B/G/R only, so the alpha channel of the
+        // readback is reported by analyze/plane stats instead of being asserted.
+        if (print_color_item(path, c.item, c.want,
+                             Rgba{back.bytes[0], back.bytes[1], back.bytes[2], back.bytes[3]},
+                             matched, area, s))
+            ++failed;
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d skipped=%d targets=%d"
+        " ps_outputs=SV_Target0_opaque_black,SV_Target1_alpha_0.5\n", path, items, failed,
+        skipped, items);
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
     if (mode == "d2d-aa-modes") return run_d2d_aa_modes(warp, debug_layer);
     if (mode == "text-paths") return run_text_paths(warp, debug_layer);
+    if (mode == "clip-contract") return run_clip_contract(warp, debug_layer);
+    if (mode == "mask-uint") return run_mask_uint(warp, debug_layer);
+    if (mode == "dualsrc-blend") return run_dualsrc_blend(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -3373,8 +4178,10 @@ void usage() {
         "                    pixels, not on dark pixels\n"
         "  --mode a8-upload  UpdateSubresource {0,64,128,255} into 4x4 R8_UNORM and\n"
         "                    A8_UNORM, read the bytes back, then sample the same\n"
-        "                    texture through the default SRV and a (ZERO,ZERO,ZERO,R)\n"
-        "                    mapped SRV into BGRA; unsupported format is SKIP\n"
+        "                    texture twice through the default SRV: PS replicates\n"
+        "                    the channel into RGB, then PS forces XYZ to 0 and puts\n"
+        "                    it in alpha (the (ZERO,ZERO,ZERO,R) shape; D3D11 SRVs\n"
+        "                    carry no component mapping); unsupported format is SKIP\n"
         "  --mode rt-to-srv  one R8_UNORM as render target and SRV in one frame:\n"
         "                    PS 0.5 -> 128 in R8 -> sampled -> 128,128,128 in BGRA\n"
         "  --mode d2d-aa-modes  six D2D primitives, each on its own target: AA and\n"
@@ -3383,6 +4190,16 @@ void usage() {
         "  --mode text-paths  six glyph paths, each on its own target: solid and\n"
         "                    bitmap brush, aliased text, direct DrawGlyphRun, and a\n"
         "                    GRAYSCALE draw into ALPHA_MODE_IGNORE and PREMULTIPLIED\n"
+        "  --mode clip-contract  clip(x-0.5) and discard with x=0.75/0.25 from a\n"
+        "                    cbuffer, plus a ps_4_0 clip pair: the keep items must\n"
+        "                    paint and the drop items must leave the target empty\n"
+        "  --mode mask-uint  R32_UINT 256x256 mask: PS write and typed UAV store of\n"
+        "                    0x00010001 read back exactly, then countbits/16 through\n"
+        "                    a Texture2D<uint> Load and through an 8-entry texture\n"
+        "                    array indexed from a cbuffer (expected about 32/255)\n"
+        "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
+        "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
+        "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -3433,6 +4250,12 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("d2d-aa-modes");
             } else if (value == L"text-paths") {
                 modes.push_back("text-paths");
+            } else if (value == L"clip-contract") {
+                modes.push_back("clip-contract");
+            } else if (value == L"mask-uint") {
+                modes.push_back("mask-uint");
+            } else if (value == L"dualsrc-blend") {
+                modes.push_back("dualsrc-blend");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
