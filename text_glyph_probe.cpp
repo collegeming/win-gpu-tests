@@ -4168,6 +4168,559 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v6: vertex/index buffer paths
+// ---------------------------------------------------------------------------
+// Every earlier mode drew with SV_VertexID and Draw(3, 0): no input layout, no
+// vertex buffer, no index buffer. D2D, however, batches geometry through
+// vertex and index buffers, and its internal "Atlas blend vertex buffer/index
+// buffer" is the only index-buffer user in the text path. These cases cover
+// what was previously invisible: explicit vertex buffers, R16 and R32 index
+// buffers, dynamic buffers refilled with Map(WRITE_DISCARD), two indexed
+// ranges in one frame, and an instanced indexed draw.
+
+const char* kQuadVsSource =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "float4 main(VSIn i) : SV_POSITION { return float4(i.pos, 0.0f, 1.0f); }\n";
+
+const char* kQuadVsInstSource =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "float4 main(VSIn i, uint id : SV_InstanceID) : SV_POSITION {\n"
+    "    float2 p = i.pos; p.x += float(id);\n"
+    "    return float4(p, 0.0f, 1.0f);\n"
+    "}\n";
+
+const char* kQuadPsSource =
+    "float4 main() : SV_Target { return float4(0.0f, 0.0f, 0.0f, 1.0f); }\n";
+
+constexpr int kVbSize = 256;
+constexpr int kVbMinDark = 5000;
+
+// A quad from x=-1..0, y=-1..1 in NDC: six vertices, no index buffer.
+const float kQuad6Left[] = {
+    -1.0f, -1.0f, -1.0f, 1.0f, 0.0f, -1.0f,
+     0.0f, -1.0f, -1.0f, 1.0f, 0.0f, 1.0f,
+};
+
+// The same quad as four vertices plus indices.
+const float kQuad4Left[] = {
+    -1.0f, -1.0f, -1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 1.0f,
+};
+
+// Left and right halves: the second range starts at vertex 4.
+const float kQuad4TwoRanges[] = {
+    -1.0f, -1.0f, -1.0f, 1.0f, 0.0f, -1.0f, 0.0f, 1.0f,
+     0.0f, -1.0f,  0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+};
+
+const unsigned short kIdx6[] = {0, 1, 2, 2, 1, 3};
+const unsigned short kIdx12[] = {0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7};
+const unsigned int kIdx6_32[] = {0, 1, 2, 2, 1, 3};
+
+bool create_buffer(const char* path, ID3D11Device* device, const void* data, UINT bytes,
+                   UINT bind, D3D11_USAGE usage, ComPtr<ID3D11Buffer>& buffer) {
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = bytes;
+    desc.Usage = usage;
+    desc.BindFlags = bind;
+    if (usage == D3D11_USAGE_DYNAMIC) desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = data;
+    const HRESULT hr = device->CreateBuffer(&desc, data ? &init : nullptr,
+                                            buffer.GetAddressOf());
+    out("MODE=%s stage=create_buffer bytes=%u bind=0x%x usage=%u hr=0x%08lx\n", path, bytes,
+        bind, static_cast<unsigned>(usage), static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+bool fill_dynamic(const char* path, ID3D11DeviceContext* context, ID3D11Buffer* buffer,
+                  const void* data, UINT bytes) {
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT hr = context->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    out("MODE=%s stage=map_write_discard bytes=%u hr=0x%08lx\n", path, bytes,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    memcpy(mapped.pData, data, bytes);
+    context->Unmap(buffer, 0);
+    return true;
+}
+
+void report_vb_item(const char* path, const char* item, const SmallRead& back,
+                    bool want_left, bool want_right) {
+    const PixelStats left = analyze(back.bytes.data(), back.pitch, kVbSize, kVbSize,
+                                    RECT{4, 4, 124, 252});
+    const PixelStats right = analyze(back.bytes.data(), back.pitch, kVbSize, kVbSize,
+                                     RECT{132, 4, 252, 252});
+    const bool left_ok = left.dark > kVbMinDark;
+    const bool right_ok = right.dark > kVbMinDark;
+    const bool ok = (!want_left || left_ok) && (!want_right || right_ok);
+    const char* reason = ok ? "ok"
+        : ((want_left && !left_ok) ? "left_ink_missing"
+        : ((want_right && !right_ok) ? "right_ink_missing" : "unexpected_ink"));
+    out("MODE=%s ITEM=%s RESULT=%s left_dark=%llu right_dark=%llu want_left=%d"
+        " want_right=%d reason=%s\n", path, item, ok ? "PASS" : "FAIL", left.dark,
+        right.dark, want_left ? 1 : 0, want_right ? 1 : 0, reason);
+    if (!ok) ++g_failures;
+}
+
+int run_vb_paths(bool warp, bool debug_layer) {
+    const char* path = "vb-paths";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, vs_inst_blob, ps_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "vb_vs", kQuadVsSource, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "vb_vs_inst", kQuadVsInstSource, "vs_5_0", "vs_5_0",
+                        vs_inst_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "vb_ps", kQuadPsSource, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11VertexShader> vs, vs_inst;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, vs.GetAddressOf());
+    out("MODE=%s stage=create_vs name=plain hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreateVertexShader(vs_inst_blob->GetBufferPointer(),
+                                          vs_inst_blob->GetBufferSize(), nullptr,
+                                          vs_inst.GetAddressOf());
+        out("MODE=%s stage=create_vs name=instanced hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(),
+                                         nullptr, ps.GetAddressOf());
+        out("MODE=%s stage=create_ps name=opaque_black hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed\n", path);
+        return 2;
+    }
+
+    D3D11_INPUT_ELEMENT_DESC elem{};
+    elem.SemanticName = "POSITION";
+    elem.SemanticIndex = 0;
+    elem.Format = DXGI_FORMAT_R32G32_FLOAT;
+    elem.InputSlot = 0;
+    elem.AlignedByteOffset = 0;
+    elem.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    elem.InstanceDataStepRate = 0;
+    ComPtr<ID3D11InputLayout> layout, layout_inst;
+    hr = g.device->CreateInputLayout(&elem, 1, vs_blob->GetBufferPointer(),
+                                     vs_blob->GetBufferSize(), layout.GetAddressOf());
+    out("MODE=%s stage=create_input_layout name=plain hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreateInputLayout(&elem, 1, vs_inst_blob->GetBufferPointer(),
+                                         vs_inst_blob->GetBufferSize(),
+                                         layout_inst.GetAddressOf());
+        out("MODE=%s stage=create_input_layout name=instanced hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=input_layout_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kVbSize,
+                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    hr = g.device->CreateRenderTargetView(tex.Get(), nullptr, rtv.GetAddressOf());
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rtv_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    if (!small_pipeline(path, g, kVbSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    int items = 0;
+    int failed = 0;
+    auto read_item = [&](const char* item, bool want_left, bool want_right, auto&& draw) {
+        const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), white);
+        draw();
+        g.context->Flush();
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
+                                          kVbSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+            return;
+        }
+        const unsigned long long before = g_failures;
+        report_vb_item(path, item, back, want_left, want_right);
+        if (g_failures != before) ++failed;
+    };
+
+    // Case 1: static vertex buffer, Draw(6, 0), no index buffer.
+    ComPtr<ID3D11Buffer> vb6;
+    if (!create_buffer(path, g.device.Get(), kQuad6Left, sizeof(kQuad6Left),
+                       D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb6)) {
+        ++g_failures;
+    } else {
+        g.context->IASetInputLayout(layout.Get());
+        g.context->VSSetShader(vs.Get(), nullptr, 0);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        ID3D11Buffer* vb = vb6.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        read_item("static_vb_nonindexed", true, false,
+                  [&]() { g.context->Draw(6, 0); });
+    }
+
+    // Case 2: static vertex buffer + R16 index buffer.
+    ComPtr<ID3D11Buffer> vb4, ib16;
+    if (!create_buffer(path, g.device.Get(), kQuad4Left, sizeof(kQuad4Left),
+                       D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb4) ||
+        !create_buffer(path, g.device.Get(), kIdx6, sizeof(kIdx6),
+                       D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, ib16)) {
+        ++g_failures;
+    } else {
+        ID3D11Buffer* vb = vb4.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetIndexBuffer(ib16.Get(), DXGI_FORMAT_R16_UINT, 0);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        read_item("static_vb_indexed_r16", true, false,
+                  [&]() { g.context->DrawIndexed(6, 0, 0); });
+    }
+
+    // Case 3: the same draw with R32 indices.
+    ComPtr<ID3D11Buffer> ib32;
+    if (!create_buffer(path, g.device.Get(), kIdx6_32, sizeof(kIdx6_32),
+                       D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DEFAULT, ib32)) {
+        ++g_failures;
+    } else {
+        ID3D11Buffer* vb = vb4.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetIndexBuffer(ib32.Get(), DXGI_FORMAT_R32_UINT, 0);
+        read_item("static_vb_indexed_r32", true, false,
+                  [&]() { g.context->DrawIndexed(6, 0, 0); });
+    }
+
+    // Case 4: dynamic vertex buffer filled through Map(WRITE_DISCARD).
+    ComPtr<ID3D11Buffer> vb_dyn6;
+    if (!create_buffer(path, g.device.Get(), nullptr, sizeof(kQuad6Left),
+                       D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC, vb_dyn6) ||
+        !fill_dynamic(path, g.context.Get(), vb_dyn6.Get(), kQuad6Left,
+                      sizeof(kQuad6Left))) {
+        ++g_failures;
+    } else {
+        ID3D11Buffer* vb = vb_dyn6.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        read_item("dynamic_vb_nonindexed", true, false,
+                  [&]() { g.context->Draw(6, 0); });
+    }
+
+    // Case 5: dynamic vertex and index buffers, indexed draw.
+    ComPtr<ID3D11Buffer> vb_dyn4, ib_dyn16;
+    if (!create_buffer(path, g.device.Get(), nullptr, sizeof(kQuad4Left),
+                       D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC, vb_dyn4) ||
+        !create_buffer(path, g.device.Get(), nullptr, sizeof(kIdx6),
+                       D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DYNAMIC, ib_dyn16) ||
+        !fill_dynamic(path, g.context.Get(), vb_dyn4.Get(), kQuad4Left,
+                      sizeof(kQuad4Left)) ||
+        !fill_dynamic(path, g.context.Get(), ib_dyn16.Get(), kIdx6, sizeof(kIdx6))) {
+        ++g_failures;
+    } else {
+        ID3D11Buffer* vb = vb_dyn4.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetIndexBuffer(ib_dyn16.Get(), DXGI_FORMAT_R16_UINT, 0);
+        read_item("dynamic_vb_indexed_r16", true, false,
+                  [&]() { g.context->DrawIndexed(6, 0, 0); });
+    }
+
+    // Case 6: one buffer pair, two indexed ranges in one frame.
+    ComPtr<ID3D11Buffer> vb_dyn8, ib_dyn12;
+    if (!create_buffer(path, g.device.Get(), nullptr, sizeof(kQuad4TwoRanges),
+                       D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DYNAMIC, vb_dyn8) ||
+        !create_buffer(path, g.device.Get(), nullptr, sizeof(kIdx12),
+                       D3D11_BIND_INDEX_BUFFER, D3D11_USAGE_DYNAMIC, ib_dyn12) ||
+        !fill_dynamic(path, g.context.Get(), vb_dyn8.Get(), kQuad4TwoRanges,
+                      sizeof(kQuad4TwoRanges)) ||
+        !fill_dynamic(path, g.context.Get(), ib_dyn12.Get(), kIdx12, sizeof(kIdx12))) {
+        ++g_failures;
+    } else {
+        ID3D11Buffer* vb = vb_dyn8.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetIndexBuffer(ib_dyn12.Get(), DXGI_FORMAT_R16_UINT, 0);
+        read_item("two_ranges_dynamic", true, true, [&]() {
+            g.context->DrawIndexed(6, 0, 0);
+            g.context->DrawIndexed(6, 6, 0);
+        });
+    }
+
+    // Case 7: instanced indexed draw, one instance per half.
+    if (vb4 && ib16) {
+        g.context->IASetInputLayout(layout_inst.Get());
+        g.context->VSSetShader(vs_inst.Get(), nullptr, 0);
+        ID3D11Buffer* vb = vb4.Get();
+        UINT stride = 8, offset = 0;
+        g.context->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+        g.context->IASetIndexBuffer(ib16.Get(), DXGI_FORMAT_R16_UINT, 0);
+        read_item("instanced_indexed", true, true,
+                  [&]() { g.context->DrawIndexedInstanced(6, 2, 0, 0, 0); });
+    } else {
+        ++failed;
+        ++g_failures;
+        out("MODE=%s ITEM=instanced_indexed RESULT=FAIL reason=buffer_create_failed\n",
+            path);
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d size=%dx%d\n", path, items, failed, kVbSize,
+        kVbSize);
+    return failed ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// v6: R32_UINT mask write vs readback
+// ---------------------------------------------------------------------------
+// mask-uint showed a PS write of 0x00010001 to an R32_UINT render target
+// reading back as zero, while a UAV store of the same value passed. That
+// texture carried RENDER_TARGET|SHADER_RESOURCE|UNORDERED_ACCESS at once, so
+// three explanations remain: the PS write is lost, the direct map of an
+// integer target is lost, or an image bound for storage cannot be a color
+// attachment on this driver. This mode separates them: a PS write read back
+// through an SRV shader, a ClearRenderTargetView read back both ways, and the
+// same pair again on a texture that also carries the UAV bind.
+
+int run_mask_write_srv(bool warp, bool debug_layer) {
+    const char* path = "mask-write-srv";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_write_blob, ps_sample_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "mws_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "mws_ps_write", kMaskPsWrite, "ps_5_0", "ps_4_0",
+                        ps_write_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "mws_ps_sample", kMaskPsSample, "ps_5_0", "ps_4_0",
+                        ps_sample_blob.GetAddressOf(), &used);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps_write, ps_sample;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, vs.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_write_blob->GetBufferPointer(),
+                                         ps_write_blob->GetBufferSize(), nullptr,
+                                         ps_write.GetAddressOf());
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_sample_blob->GetBufferPointer(),
+                                         ps_sample_blob->GetBufferSize(), nullptr,
+                                         ps_sample.GetAddressOf());
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed\n", path);
+        return 2;
+    }
+    if (!small_pipeline(path, g, kMaskSize, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=state_create_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> out_tex, out_staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kMaskSize,
+                       D3D11_BIND_RENDER_TARGET, out_tex, out_staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=bgra_target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> out_rtv;
+    hr = g.device->CreateRenderTargetView(out_tex.Get(), nullptr, out_rtv.GetAddressOf());
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=bgra_rtv_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> mask_a, stage_a, mask_b, stage_b;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_R32_UINT, kMaskSize,
+                       D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, mask_a,
+                       stage_a) ||
+        !small_texture(path, g.device.Get(), DXGI_FORMAT_R32_UINT, kMaskSize,
+                       D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE |
+                           D3D11_BIND_UNORDERED_ACCESS,
+                       mask_b, stage_b)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=mask_texture_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv_a, rtv_b;
+    ComPtr<ID3D11ShaderResourceView> srv_a, srv_b;
+    ComPtr<ID3D11UnorderedAccessView> uav_b;
+    const HRESULT hr_ra = g.device->CreateRenderTargetView(mask_a.Get(), nullptr,
+                                                           rtv_a.GetAddressOf());
+    const HRESULT hr_sa = g.device->CreateShaderResourceView(mask_a.Get(), nullptr,
+                                                             srv_a.GetAddressOf());
+    const HRESULT hr_rb = g.device->CreateRenderTargetView(mask_b.Get(), nullptr,
+                                                           rtv_b.GetAddressOf());
+    const HRESULT hr_sb = g.device->CreateShaderResourceView(mask_b.Get(), nullptr,
+                                                             srv_b.GetAddressOf());
+    const HRESULT hr_ub = g.device->CreateUnorderedAccessView(mask_b.Get(), nullptr,
+                                                              uav_b.GetAddressOf());
+    out("MODE=%s stage=create_views no_uav rtv=0x%08lx srv=0x%08lx"
+        " with_uav rtv=0x%08lx srv=0x%08lx uav=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_ra), static_cast<unsigned long>(hr_sa),
+        static_cast<unsigned long>(hr_rb), static_cast<unsigned long>(hr_sb),
+        static_cast<unsigned long>(hr_ub));
+    if (FAILED(hr_ra) || FAILED(hr_sa) || FAILED(hr_rb) || FAILED(hr_sb)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=mask_view_create_failed\n", path);
+        return 2;
+    }
+
+    int items = 0;
+    int failed = 0;
+
+    auto clear_bits = [&](ID3D11RenderTargetView* rtv, unsigned bits) {
+        float color[4];
+        memcpy(&color[0], &bits, sizeof(bits));
+        color[1] = 0.0f;
+        color[2] = 0.0f;
+        color[3] = 0.0f;
+        g.context->ClearRenderTargetView(rtv, color);
+    };
+
+    auto srv_readback = [&](ID3D11ShaderResourceView* srv, const char* item) {
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        g.context->ClearRenderTargetView(out_rtv.Get(), black);
+        g.context->OMSetRenderTargets(1, out_rtv.GetAddressOf(), nullptr);
+        g.context->PSSetShader(ps_sample.Get(), nullptr, 0);
+        g.context->PSSetShaderResources(0, 1, &srv);
+        g.context->Draw(3, 0);
+        ID3D11ShaderResourceView* none = nullptr;
+        g.context->PSSetShaderResources(0, 1, &none);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        g.context->Flush();
+        const SmallRead back = small_read(path, g.context.Get(), out_tex.Get(),
+                                          out_staging.Get(), kMaskSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+            return;
+        }
+        unsigned lo = 255, hi = 0;
+        int bad = 0;
+        for (int y = 0; y < kMaskSize; ++y) {
+            const uint8_t* row = back.bytes.data() + static_cast<size_t>(y) * back.pitch;
+            for (int x = 0; x < kMaskSize; ++x) {
+                const unsigned v = row[x * 4];
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+                if (v < 30 || v > 34) ++bad;
+            }
+        }
+        const bool ok = (bad == 0);
+        out("MODE=%s ITEM=%s RESULT=%s expected_gray=32 tolerance=2 mismatches=%d"
+            " actual_min=%u actual_max=%u reason=%s\n", path, item, ok ? "PASS" : "FAIL",
+            bad, lo, hi, ok ? "ok" : "value_mismatch");
+        if (!ok) {
+            ++failed;
+            ++g_failures;
+        }
+    };
+
+    auto direct_readback = [&](ID3D11Texture2D* tex, ID3D11Texture2D* staging,
+                               const char* item) {
+        const SmallRead back = small_read(path, g.context.Get(), tex, staging, kMaskSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+            return;
+        }
+        const unsigned want = 65537u;
+        const unsigned long long before = g_failures;
+        print_uint_item(path, item, " path=direct_map_after_clear", back, kMaskSize, want);
+        if (g_failures != before) ++failed;
+    };
+
+    auto ps_write = [&](ID3D11RenderTargetView* rtv) {
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv, zero);
+        g.context->OMSetRenderTargets(1, &rtv, nullptr);
+        g.context->PSSetShader(ps_write.Get(), nullptr, 0);
+        g.context->Draw(3, 0);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        g.context->Flush();
+    };
+
+    ps_write(rtv_a.Get());
+    srv_readback(srv_a.Get(), "no_uav_ps_write_srv");
+
+    clear_bits(rtv_a.Get(), 65537u);
+    srv_readback(srv_a.Get(), "no_uav_clear_srv");
+    direct_readback(mask_a.Get(), stage_a.Get(), "no_uav_clear_direct");
+
+    ps_write(rtv_b.Get());
+    srv_readback(srv_b.Get(), "with_uav_ps_write_srv");
+
+    clear_bits(rtv_b.Get(), 65537u);
+    srv_readback(srv_b.Get(), "with_uav_clear_srv");
+    direct_readback(mask_b.Get(), stage_b.Get(), "with_uav_clear_direct");
+
+    out("MODE=%s SUMMARY items=%d failed=%d size=%dx%d expected_uint=0x00010001"
+        " expected_gray=32\n", path, items, failed, kMaskSize, kMaskSize);
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -4176,6 +4729,8 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "clip-contract") return run_clip_contract(warp, debug_layer);
     if (mode == "mask-uint") return run_mask_uint(warp, debug_layer);
     if (mode == "dualsrc-blend") return run_dualsrc_blend(warp, debug_layer);
+    if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
+    if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -4226,6 +4781,16 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode vb-paths   explicit vertex/index buffers, which no earlier mode\n"
+        "                    used: static and dynamic vertex buffers, R16 and R32\n"
+        "                    index buffers, two indexed ranges in one frame, and an\n"
+        "                    instanced indexed draw; each case needs ink in the\n"
+        "                    expected half of a 256x256 target\n"
+        "  --mode mask-write-srv  R32_UINT mask PS write and Clear read back through\n"
+        "                    an SRV countbits shader and through a direct map, on a\n"
+        "                    texture with and without the UAV bind (RT|SRV vs\n"
+        "                    RT|SRV|UAV); separates a lost PS write from a lost\n"
+        "                    integer readback and from a dual-usage effect\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -4282,6 +4847,10 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("mask-uint");
             } else if (value == L"dualsrc-blend") {
                 modes.push_back("dualsrc-blend");
+            } else if (value == L"vb-paths") {
+                modes.push_back("vb-paths");
+            } else if (value == L"mask-write-srv") {
+                modes.push_back("mask-write-srv");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
