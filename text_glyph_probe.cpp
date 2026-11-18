@@ -6655,6 +6655,258 @@ int run_upload_paths(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// mixed-fetch: D2D's text shader (persisted as fs.8ed1f4d2...) reads a
+// Buffer<uint> and a Texture2D<float4> in the same draw: five OpImageFetch on
+// image<u32, Buffer> plus three on image<f32, 2D>. Every earlier mode bound a
+// single resource kind, so a descriptor/binding bug that only shows when both
+// are alive would not have been visible. Each case draws one fullscreen quad
+// into its own cleared 64x64 BGRA8 target and checks the centre pixel.
+// ---------------------------------------------------------------------------
+
+const char* kMixedVs =
+    "struct VSOut { float4 pos : SV_POSITION; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+// Buffer only, but through the same bitcast-then-signed-convert shape the text
+// shader uses: asint(sum) then (float) -> ConvertSToF.
+const char* kMixedPsBufferOnly =
+    "Buffer<uint> gBits : register(t0);\n"
+    "float4 main() : SV_Target {\n"
+    "    uint s = gBits.Load(0u) + gBits.Load(1u) + gBits.Load(2u) + gBits.Load(3u)\n"
+    "           + gBits.Load(4u);\n"
+    "    float v = (float)asint(s) / 255.0;\n"
+    "    return float4(v, v, v, 1.0);\n"
+    "}\n";
+
+const char* kMixedPsTextureOnly =
+    "Texture2D<float4> gLut : register(t0);\n"
+    "float4 main() : SV_Target {\n"
+    "    return gLut.Load(int3(33, 0, 0));\n"
+    "}\n";
+
+const char* kMixedPsBoth =
+    "Buffer<uint> gBits : register(t0);\n"
+    "Texture2D<float4> gLut : register(t1);\n"
+    "float4 main() : SV_Target {\n"
+    "    uint s = gBits.Load(0u) + gBits.Load(1u) + gBits.Load(2u) + gBits.Load(3u)\n"
+    "           + gBits.Load(4u);\n"
+    "    float cov = (float)asint(s) / 255.0;\n"
+    "    float4 lut = gLut.Load(int3((int)(s + 217u), 0, 0));\n"
+    "    return float4(lut.rgb * cov, 1.0);\n"
+    "}\n";
+
+// The LUT texture is 512x1 BGRA8; texel x holds (x & 255) in every channel.
+constexpr int kMixedLutWidth = 512;
+constexpr int kMixedTarget = 64;
+
+bool mixed_lut_texture(const char* path, Gpu& g, ComPtr<ID3D11Texture2D>& tex,
+                       ComPtr<ID3D11ShaderResourceView>& srv) {
+    std::vector<uint8_t> px(static_cast<size_t>(kMixedLutWidth) * 4, 0);
+    for (int x = 0; x < kMixedLutWidth; ++x) {
+        const uint8_t v = static_cast<uint8_t>(x & 255);
+        px[static_cast<size_t>(x) * 4 + 0] = v;
+        px[static_cast<size_t>(x) * 4 + 1] = v;
+        px[static_cast<size_t>(x) * 4 + 2] = v;
+        px[static_cast<size_t>(x) * 4 + 3] = 255;
+    }
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = kMixedLutWidth;
+    td.Height = 1;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = px.data();
+    init.SysMemPitch = kMixedLutWidth * 4;
+    HRESULT hr = g.device->CreateTexture2D(&td, &init, tex.GetAddressOf());
+    out("MODE=%s stage=create_lut_texture width=%d height=1 fmt=BGRA8 hr=0x%08lx\n", path,
+        kMixedLutWidth, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = td.Format;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    hr = g.device->CreateShaderResourceView(tex.Get(), &sd, srv.GetAddressOf());
+    out("MODE=%s stage=create_lut_srv hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+bool mixed_uint_buffer(const char* path, Gpu& g, ComPtr<ID3D11Buffer>& buf,
+                       ComPtr<ID3D11ShaderResourceView>& srv) {
+    const uint32_t values[5] = {51u, 51u, 51u, 51u, 51u};  // sum 255
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(values);
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = values;
+    HRESULT hr = g.device->CreateBuffer(&bd, &init, buf.GetAddressOf());
+    out("MODE=%s stage=create_uint_buffer bytes=%u hr=0x%08lx\n", path,
+        static_cast<unsigned>(sizeof(values)), static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = DXGI_FORMAT_R32_UINT;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    sd.Buffer.FirstElement = 0;
+    sd.Buffer.NumElements = 5;
+    hr = g.device->CreateShaderResourceView(buf.Get(), &sd, srv.GetAddressOf());
+    out("MODE=%s stage=create_uint_srv hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+int run_mixed_fetch(bool warp, bool debug_layer) {
+    const char* path = "mixed-fetch";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "mixed_vs", kMixedVs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=vs_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, vs.GetAddressOf());
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=vs_create_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kMixedTarget,
+                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    hr = g.device->CreateRenderTargetView(tex.Get(), nullptr, rtv.GetAddressOf());
+    out("MODE=%s stage=create_rtv hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rtv_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Buffer> bits;
+    ComPtr<ID3D11ShaderResourceView> bits_srv;
+    if (!mixed_uint_buffer(path, g, bits, bits_srv)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=uint_buffer_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11Texture2D> lut;
+    ComPtr<ID3D11ShaderResourceView> lut_srv;
+    if (!mixed_lut_texture(path, g, lut, lut_srv)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=lut_texture_failed\n", path);
+        return 2;
+    }
+
+    // name, PS source, whether the buffer is bound at t0, whether the LUT is
+    // bound at t1 (or t0 when alone), expected centre BGRA.
+    struct Case {
+        const char* name;
+        const char* ps_src;
+        bool bind_buffer;
+        bool bind_lut;
+        int expected[4];
+    };
+    const Case cases[] = {
+        {"buffer_only", kMixedPsBufferOnly, true, false, {255, 255, 255, 255}},
+        {"texture_only", kMixedPsTextureOnly, false, true, {33, 33, 33, 255}},
+        // sum 255 -> coverage 1.0, LUT index 255 + 217 = 472 -> texel 216.
+        {"buffer_and_texture", kMixedPsBoth, true, true, {216, 216, 216, 255}},
+    };
+
+    int failed = 0;
+    for (const Case& c : cases) {
+        ComPtr<ID3DBlob> ps_blob;
+        const char* ps_used = nullptr;
+        HRESULT ps_hr = a8_compile(path, c.name, c.ps_src, "ps_5_0", "ps_4_0",
+                                   ps_blob.GetAddressOf(), &ps_used);
+        if (FAILED(ps_hr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=ps_compile_failed hr=0x%08lx\n", path,
+                c.name, static_cast<unsigned long>(ps_hr));
+            ++failed;
+            continue;
+        }
+        ComPtr<ID3D11PixelShader> ps;
+        ps_hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                            ps_blob->GetBufferSize(), nullptr,
+                                            ps.GetAddressOf());
+        if (FAILED(ps_hr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=ps_create_failed hr=0x%08lx\n", path,
+                c.name, static_cast<unsigned long>(ps_hr));
+            ++failed;
+            continue;
+        }
+        if (!small_pipeline(path, g, kMixedTarget, vs.Get())) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=pipeline_failed\n", path, c.name);
+            ++failed;
+            continue;
+        }
+        const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), clear);
+        ID3D11RenderTargetView* rtv_array[1] = {rtv.Get()};
+        g.context->OMSetRenderTargets(1, rtv_array, nullptr);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = {nullptr, nullptr};
+        if (c.bind_lut && !c.bind_buffer) srvs[0] = lut_srv.Get();
+        if (c.bind_buffer) srvs[0] = bits_srv.Get();
+        if (c.bind_buffer && c.bind_lut) srvs[1] = lut_srv.Get();
+        g.context->PSSetShaderResources(0, 2, srvs);
+        g.context->Draw(6, 0);
+        const SmallRead back =
+            small_read(path, g.context.Get(), tex.Get(), staging.Get(), kMixedTarget, 4);
+        if (!back.ok) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=readback_failed\n", path, c.name);
+            ++failed;
+            continue;
+        }
+        const size_t off = static_cast<size_t>(kMixedTarget / 2) * back.pitch +
+                           static_cast<size_t>(kMixedTarget / 2) * 4;
+        const int got[4] = {back.bytes[off + 0], back.bytes[off + 1], back.bytes[off + 2],
+                            back.bytes[off + 3]};
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) {
+            if (abs(got[i] - c.expected[i]) > 2) ok = false;
+        }
+        out("MODE=%s ITEM=%s RESULT=%s got=%d,%d,%d,%d expected=%d,%d,%d,%d\n", path,
+            c.name, ok ? "PASS" : "FAIL", got[0], got[1], got[2], got[3], c.expected[0],
+            c.expected[1], c.expected[2], c.expected[3]);
+        if (!ok) ++failed;
+        ID3D11ShaderResourceView* none[2] = {nullptr, nullptr};
+        g.context->PSSetShaderResources(0, 2, none);
+    }
+
+    if (failed) ++g_failures;
+    out("MODE=%s SUMMARY cases=%d failed=%d\n", path,
+        static_cast<int>(sizeof(cases) / sizeof(cases[0])), failed);
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -6670,6 +6922,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "uint-rt-extreme") return run_uint_rt_extreme(warp, debug_layer);
     if (mode == "typed-buffer-srv") return run_typed_buffer_srv(warp, debug_layer);
     if (mode == "upload-paths") return run_upload_paths(warp, debug_layer);
+    if (mode == "mixed-fetch") return run_mixed_fetch(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -6769,6 +7022,11 @@ void usage() {
         "                    prints the stage/hr trail and expected/actual_min/\n"
         "                    actual_max/mismatches/all_zero; the texture cases also\n"
         "                    require the outside of the box to stay clear-zero\n"
+        "  --mode mixed-fetch  one draw binds a Buffer<uint> at t0 and a\n"
+        "                    Texture2D<float4> at t1, as the D2D text shader does\n"
+        "                    (five buffer fetches, then a LUT fetch); buffer_only\n"
+        "                    and texture_only are the controls, every case is\n"
+        "                    judged by an exact centre-pixel readback\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -6839,6 +7097,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("typed-buffer-srv");
             } else if (value == L"upload-paths") {
                 modes.push_back("upload-paths");
+            } else if (value == L"mixed-fetch") {
+                modes.push_back("mixed-fetch");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
