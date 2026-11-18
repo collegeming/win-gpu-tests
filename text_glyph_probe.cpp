@@ -6976,6 +6976,41 @@ const char* kIntVsDerived =
 
 constexpr int kIntSize = 256;
 
+void reflect_signatures(const char* path, const char* name, ID3DBlob* vs_blob,
+                        ID3DBlob* ps_blob) {
+    ID3DBlob* blobs[2] = {vs_blob, ps_blob};
+    const char* which[2] = {"vs", "ps"};
+    for (int b = 0; b < 2; ++b) {
+        ComPtr<ID3D11ShaderReflection> refl;
+        HRESULT hr = D3DReflect(blobs[b]->GetBufferPointer(), blobs[b]->GetBufferSize(),
+                                IID_ID3D11ShaderReflection,
+                                reinterpret_cast<void**>(refl.GetAddressOf()));
+        if (FAILED(hr)) {
+            out("MODE=%s stage=reflect name=%s who=%s hr=0x%08lx\n", path, name, which[b],
+                static_cast<unsigned long>(hr));
+            continue;
+        }
+        D3D11_SHADER_DESC d{};
+        refl->GetDesc(&d);
+        out("MODE=%s stage=reflect name=%s who=%s inputs=%u outputs=%u\n", path, name,
+            which[b], d.InputParameters, d.OutputParameters);
+        for (UINT i = 0; i < d.InputParameters; ++i) {
+            D3D11_SIGNATURE_PARAMETER_DESC p{};
+            if (SUCCEEDED(refl->GetInputParameterDesc(i, &p)))
+                out("MODE=%s stage=reflect name=%s who=%s in[%u] sem=%s%u reg=%u comp=%u"
+                    " mask=0x%x\n", path, name, which[b], i, p.SemanticName,
+                    p.SemanticIndex, p.Register, p.ComponentType, p.Mask);
+        }
+        for (UINT i = 0; i < d.OutputParameters; ++i) {
+            D3D11_SIGNATURE_PARAMETER_DESC p{};
+            if (SUCCEEDED(refl->GetOutputParameterDesc(i, &p)))
+                out("MODE=%s stage=reflect name=%s who=%s out[%u] sem=%s%u reg=%u comp=%u"
+                    " mask=0x%x\n", path, name, which[b], i, p.SemanticName,
+                    p.SemanticIndex, p.Register, p.ComponentType, p.Mask);
+        }
+    }
+}
+
 // Fullscreen quad, two triangles, y flipped in NDC is irrelevant here.
 const float kIntPos6[] = {
     -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
@@ -7168,8 +7203,26 @@ int run_int_attribs(bool warp, bool debug_layer) {
                                             nullptr, p.ps.GetAddressOf());
         out("MODE=%s stage=create_shader_pair name=%s hr=0x%08lx\n", path, name,
             static_cast<unsigned long>(h));
+        if (SUCCEEDED(h)) reflect_signatures(path, name, vb.Get(), pb.Get());
         return SUCCEEDED(h);
     };
+
+    // Case 0: clear only, no draw. If this is not magenta the clear itself is
+    // not reaching the target and every later sample is suspect.
+    {
+        Pair p;
+        if (!build_pair("clear_only", kIntVsPos, kIntPsConst, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=clear_only RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            small_pipeline(path, g, kIntSize, p.vs.Get());
+            const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+            g.context->ClearRenderTargetView(rtv.Get(), magenta);
+            const int expected[4] = {255, 0, 255, 255};
+            check_center("clear_only", p, expected);
+            dump_grid("clear_only");
+        }
+    }
 
     // Case A: constant black on a magenta clear; if the centre stays magenta the
     // quad never reached it, if it is black the draw and write mask work.
