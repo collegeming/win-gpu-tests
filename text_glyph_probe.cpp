@@ -917,8 +917,11 @@ bool target_create(const char* path, const Gpu& g, bool warp, Target& t) {
         return false;
     }
     const D2D1_SIZE_U px = t.rt->GetPixelSize();
+    FLOAT dpi_x = 0.0f;
+    FLOAT dpi_y = 0.0f;
+    t.rt->GetDpi(&dpi_x, &dpi_y);
     out("MODE=%s stage=target_ready d2d_pixel_size=%ux%u d2d_dpi=%.1fx%.1f\n", path,
-        px.width, px.height, t.rt->GetDpi().width, t.rt->GetDpi().height);
+        px.width, px.height, dpi_x, dpi_y);
     return true;
 }
 
