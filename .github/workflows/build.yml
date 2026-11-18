@@ -7,6 +7,10 @@ on:
       - 'test_d3d11.cpp'
       - 'test_vk_features.cpp'
       - 'test_vk_compute.cpp'
+      - 'test_vk_uint_rt.cpp'
+      - 'uint_rt.vert'
+      - 'uint_rt.frag'
+      - 'float_rt.frag'
       - 'text_glyph_probe.cpp'
       - 'compute.comp'
       - 'compute_nop.comp'
@@ -35,12 +39,22 @@ jobs:
           head -2 compute_spirv.h
           tail -1 compute_spirv.h
           tail -1 compute_nop_spirv.h
+          glslangValidator -V --target-env vulkan1.0 uint_rt.vert -o uint_rt_vert.spv
+          glslangValidator -V --target-env vulkan1.0 uint_rt.frag -o uint_rt_frag.spv
+          glslangValidator -V --target-env vulkan1.0 float_rt.frag -o float_rt_frag.spv
+          xxd -i -n uint_rt_vert_spirv uint_rt_vert.spv > uint_rt_vert_spirv.h
+          xxd -i -n uint_rt_frag_spirv uint_rt_frag.spv > uint_rt_frag_spirv.h
+          xxd -i -n float_rt_frag_spirv float_rt_frag.spv > float_rt_frag_spirv.h
+          ls -l uint_rt_vert_spirv.h uint_rt_frag_spirv.h float_rt_frag_spirv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
           path: |
             compute_spirv.h
             compute_nop_spirv.h
+            uint_rt_vert_spirv.h
+            uint_rt_frag_spirv.h
+            float_rt_frag_spirv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -86,12 +100,20 @@ jobs:
             vk_features_arm64.exe
             SHA256SUMS-vk.txt
           if-no-files-found: error
+      - name: Build Vulkan integer render-target test
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /std:c++17 /I third_party\vulkan\include test_vk_uint_rt.cpp /Fe:vk_uint_rt_arm64.exe
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -Command "$h=Get-FileHash .\vk_uint_rt_arm64.exe -Algorithm SHA256; $h.Hash | Tee-Object SHA256SUMS-vk-rt.txt; $b=[IO.File]::ReadAllBytes((Resolve-Path .\vk_uint_rt_arm64.exe)); $e=[BitConverter]::ToInt32($b,0x3c); 'machine=0x{0:x4}' -f [BitConverter]::ToUInt16($b,$e+4)"
       - uses: actions/upload-artifact@v4
         with:
           name: test-vk-compute-arm64
           path: |
             vk_compute_arm64.exe
             SHA256SUMS-compute.txt
+            vk_uint_rt_arm64.exe
+            SHA256SUMS-vk-rt.txt
           if-no-files-found: error
       - name: Build offscreen text glyph probe (D3D11+D2D/DirectWrite, GDI)
         shell: cmd
