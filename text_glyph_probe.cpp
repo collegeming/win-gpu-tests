@@ -7073,6 +7073,76 @@ const char* kIntPsPerInst =
     "struct PSIn { float4 pos : SV_Position; float4 g : GLYPH; };\n"
     "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
 
+// v21: isolate which part of the failing text shape breaks delivery. The
+// per-instance reversal could also be plain multi-component attribute
+// handling, so per-vertex 4-component and 2-component attributes get their
+// own cases here too.
+const char* kIntVsAttr4 =
+    "struct VSIn { float2 pos : POSITION; float4 g : GINST; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.g = i.g;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsAttr4 =
+    "struct PSIn { float4 pos : SV_Position; float4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
+const char* kIntVsAttr2 =
+    "struct VSIn { float2 pos : POSITION; float2 g : GINST; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 t : TEXY; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.t = i.g;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsAttr2 =
+    "struct PSIn { float4 pos : SV_Position; float2 t : TEXY; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.t.y, i.t.x, 0.0, 1.0); }\n";
+
+const char* kIntVsAttr2Two =
+    "struct VSIn { float2 pos : POSITION; float2 a : GA; float2 b : GB; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 t : TEXY; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.t = float2(i.a.x, i.b.y);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntVsTextVec2 =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 t : TEXY; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.t = float2(0.25, 0.75);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsTextVec2 =
+    "struct PSIn { float4 pos : SV_Position; noperspective float2 t : TEXY; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.t.y, i.t.x, 0.0, 1.0); }\n";
+
+const char* kIntVsTextFlat4 =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut {\n"
+    "    float4 pos : SV_POSITION;\n"
+    "    float a : G8; float b : G9; float c : G10; float d : G11;\n"
+    "};\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.a = 0.25; o.b = 0.5; o.c = 0.75; o.d = 1.0;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsTextFlat4 =
+    "struct PSIn {\n"
+    "    float4 pos : SV_Position;\n"
+    "    nointerpolation float a : G8;\n"
+    "    nointerpolation float b : G9;\n"
+    "    nointerpolation float c : G10;\n"
+    "    nointerpolation float d : G11;\n"
+    "};\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.a, i.b, i.c, i.d); }\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7829,6 +7899,177 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=perinst_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case V: per-vertex float4 attribute feeding an aligned varying.
+    {
+        Pair p;
+        if (!build_pair("attr4_svpos", kIntVsAttr4, kIntPsAttr4, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=attr4_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            static const float V[36] = {
+                -1,-1, 0.25f,0.5f,0.75f,1.0f,   -1,1, 0.25f,0.5f,0.75f,1.0f,
+                 1,-1, 0.25f,0.5f,0.75f,1.0f,    1,-1, 0.25f,0.5f,0.75f,1.0f,
+                -1,1, 0.25f,0.5f,0.75f,1.0f,     1,1, 0.25f,0.5f,0.75f,1.0f,
+            };
+            D3D11_INPUT_ELEMENT_DESC e[2] = {};
+            e[0].SemanticName = "POSITION"; e[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[0].InputSlot = 0; e[0].AlignedByteOffset = 0;
+            e[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            e[1].SemanticName = "GINST"; e[1].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            e[1].InputSlot = 0; e[1].AlignedByteOffset = 8;
+            e[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(e, 2, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), V, sizeof(V),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 24, nullptr, 0, false);
+                const int expected[4] = {64, 128, 191, 255};
+                check_center("attr4_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=attr4_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case W: per-vertex float2 attribute, aligned registers.
+    {
+        Pair p;
+        if (!build_pair("attr2_svpos", kIntVsAttr2, kIntPsAttr2, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=attr2_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            static const float V[24] = {
+                -1,-1, 0.25f,0.75f,  -1,1, 0.25f,0.75f,   1,-1, 0.25f,0.75f,
+                 1,-1, 0.25f,0.75f,  -1,1, 0.25f,0.75f,   1,1, 0.25f,0.75f,
+            };
+            D3D11_INPUT_ELEMENT_DESC e[2] = {};
+            e[0].SemanticName = "POSITION"; e[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[0].InputSlot = 0; e[0].AlignedByteOffset = 0;
+            e[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            e[1].SemanticName = "GINST"; e[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[1].InputSlot = 0; e[1].AlignedByteOffset = 8;
+            e[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(e, 2, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), V, sizeof(V),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 16, nullptr, 0, false);
+                const int expected[4] = {191, 64, 0, 255};
+                check_center("attr2_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=attr2_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case X: two separate float2 attributes in one buffer.
+    {
+        Pair p;
+        if (!build_pair("attr2two_svpos", kIntVsAttr2Two, kIntPsAttr2, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=attr2two_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            static const float V[36] = {
+                -1,-1, 0.75f,0.5f, 0.25f,0.25f,  -1,1, 0.75f,0.5f, 0.25f,0.25f,
+                 1,-1, 0.75f,0.5f, 0.25f,0.25f,   1,-1, 0.75f,0.5f, 0.25f,0.25f,
+                -1,1, 0.75f,0.5f, 0.25f,0.25f,    1,1, 0.75f,0.5f, 0.25f,0.25f,
+            };
+            D3D11_INPUT_ELEMENT_DESC e[3] = {};
+            e[0].SemanticName = "POSITION"; e[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[0].InputSlot = 0; e[0].AlignedByteOffset = 0;
+            e[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            e[1].SemanticName = "GA"; e[1].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[1].InputSlot = 0; e[1].AlignedByteOffset = 8;
+            e[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            e[2].SemanticName = "GB"; e[2].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[2].InputSlot = 0; e[2].AlignedByteOffset = 16;
+            e[2].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(e, 3, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), V, sizeof(V),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 24, nullptr, 0, false);
+                const int expected[4] = {64, 191, 0, 255};
+                check_center("attr2two_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=attr2two_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case Y: the text shape split — noperspective vec2 only.
+    {
+        Pair p;
+        if (!build_pair("text_vec2", kIntVsTextVec2, kIntPsTextVec2, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=text_vec2 RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {191, 64, 0, 255};
+                check_center("text_vec2", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=text_vec2 RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case Z: the text shape split — four packed flat scalars only.
+    {
+        Pair p;
+        if (!build_pair("text_flat4", kIntVsTextFlat4, kIntPsTextFlat4, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=text_flat4 RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {64, 128, 191, 255};
+                check_center("text_flat4", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=text_flat4 RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
