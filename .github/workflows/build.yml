@@ -293,7 +293,7 @@ jobs:
             dark/nonwhite/unique counts and RESULT. A glyphs=N advance_sum= line and
             baseline_y= are printed for the direct run; a FAIL there with PASS on
             solid_brush points at the glyph-run path, not at the text layout.
-          Mode items never alter the full-mode numbers; a mode failure only changes the exit code
+          Modes never alter the full-mode numbers; a mode failure only changes the exit code
           and SUMMARY_MODES.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8
           Get-ChildItem text-glyph-package -File -Recurse | Sort-Object FullName | ForEach-Object {
