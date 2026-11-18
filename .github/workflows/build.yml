@@ -134,7 +134,7 @@ jobs:
           runner=$env:RUNNER_OS/$env:RUNNER_ARCH
           machine=0x$($machine.ToString('x4')) subsystem=console
           compiler=MSVC cl /EHsc /O2 /W4 /std:c++17
-          self_test=PASS (CPU analyzer + PASS/FAIL gate, 5 synthetic cases, no device/font)
+          self_test=PASS (CPU analyzer + PASS/FAIL gate, 6 synthetic cases, no device/font)
           runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
           runner_warp_exit=$warpExit (hosted runner evidence, not gated)
           hardware_device=NOT_TESTED

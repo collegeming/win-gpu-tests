@@ -700,7 +700,9 @@ int run_self_test() {
         p[0] = b; p[1] = g; p[2] = r; p[3] = 255;
     };
     int failures = 0;
+    int cases = 0;
     auto expect = [&](const char* name, bool ok) {
+        ++cases;
         out("SELF_TEST_CASE name=%s result=%s\n", name, ok ? "PASS" : "FAIL");
         if (!ok) ++failures;
     };
@@ -749,7 +751,8 @@ int run_self_test() {
     s = analyze(buffer.data(), pitch, kWidth, kHeight, text_rect());
     expect("luma_127_is_dark", s.dark == 1600);
 
-    out("SELF_TEST=%s cases=5 failures=%d\n", failures ? "FAIL" : "PASS", failures);
+    out("SELF_TEST=%s cases=%d failures=%d\n", failures ? "FAIL" : "PASS", cases,
+        failures);
     return failures ? 2 : 0;
 }
 
