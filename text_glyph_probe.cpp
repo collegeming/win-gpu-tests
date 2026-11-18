@@ -6907,6 +6907,385 @@ int run_mixed_fetch(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// int-attribs: the D2D text vertex shader takes five attributes and forwards
+// four of them to the pixel shader as flat integers (the glyph index and run
+// data); the failing PS receives them as uint4 at one location with one flat
+// component each. Every earlier geometry mode used float attributes only, so a
+// broken integer vertex attribute fetch would have been invisible. Each case
+// draws one fullscreen quad with a known bit pattern and reads back the centre.
+// ---------------------------------------------------------------------------
+
+const char* kIntVsPos =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "float4 main(VSIn i) : SV_POSITION { return float4(i.pos, 0.0, 1.0); }\n";
+
+const char* kIntVsFloat4 =
+    "struct VSIn { float2 pos : POSITION; float4 g : GLYPH; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
+    "VSOut main(VSIn i) { VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.g = i.g; return o; }\n";
+
+const char* kIntVsUint4 =
+    "struct VSIn { float2 pos : POSITION; uint4 g : GLYPH; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; nointerpolation uint4 g : GLYPH; };\n"
+    "VSOut main(VSIn i) { VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.g = i.g; return o; }\n";
+
+const char* kIntVsUint1 =
+    "struct VSIn { float2 pos : POSITION; uint g : G16; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; nointerpolation uint g : G16; };\n"
+    "VSOut main(VSIn i) { VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.g = i.g; return o; }\n";
+
+// 0x2A63 -> low byte 99, high byte 42; g.y -> 7. Written as x,y,z so the BGRA
+// readback is 7,42,99,255.
+const char* kIntPsUint4 =
+    "struct PSIn { nointerpolation uint4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(float(i.g.x & 255u), float((i.g.x >> 8) & 255u),\n"
+    "                  float(i.g.y & 255u), 255.0) / 255.0;\n"
+    "}\n";
+
+const char* kIntPsFloat4 =
+    "struct PSIn { float4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
+const char* kIntPsUint1 =
+    "struct PSIn { nointerpolation uint g : G16; };\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(float(i.g & 255u), float((i.g >> 8) & 255u), 0.0, 255.0) / 255.0;\n"
+    "}\n";
+
+constexpr int kIntSize = 256;
+
+// Fullscreen quad, two triangles, y flipped in NDC is irrelevant here.
+const float kIntPos6[] = {
+    -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
+};
+
+int run_int_attribs(bool warp, bool debug_layer) {
+    const char* path = "int-attribs";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_pos_blob, vs_float_blob, vs_uint4_blob, vs_uint1_blob;
+    ComPtr<ID3DBlob> ps_float_blob, ps_uint4_blob, ps_uint1_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "ia_vs_pos", kIntVsPos, "vs_5_0", "vs_5_0",
+                            vs_pos_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "ia_vs_float4", kIntVsFloat4, "vs_5_0", "vs_5_0",
+                        vs_float_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "ia_vs_uint4", kIntVsUint4, "vs_5_0", "vs_5_0",
+                        vs_uint4_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "ia_vs_uint1", kIntVsUint1, "vs_5_0", "vs_5_0",
+                        vs_uint1_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "ia_ps_float4", kIntPsFloat4, "ps_5_0", "ps_5_0",
+                        ps_float_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "ia_ps_uint4", kIntPsUint4, "ps_5_0", "ps_5_0",
+                        ps_uint4_blob.GetAddressOf(), &used);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "ia_ps_uint1", kIntPsUint1, "ps_5_0", "ps_5_0",
+                        ps_uint1_blob.GetAddressOf(), &used);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    struct Pair {
+        ComPtr<ID3D11VertexShader> vs;
+        ComPtr<ID3D11PixelShader> ps;
+        ComPtr<ID3DBlob> vs_blob;
+    };
+    Pair float4_pair, uint4_pair, uint1_pair;
+    auto make_pair = [&](const char* name, ID3DBlob* vs_blob, ID3DBlob* ps_blob,
+                         Pair& pair) {
+        pair.vs_blob = vs_blob;
+        HRESULT h = g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                                 vs_blob->GetBufferSize(), nullptr,
+                                                 pair.vs.GetAddressOf());
+        if (SUCCEEDED(h))
+            h = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                            ps_blob->GetBufferSize(), nullptr,
+                                            pair.ps.GetAddressOf());
+        out("MODE=%s stage=create_shader_pair name=%s hr=0x%08lx\n", path, name,
+            static_cast<unsigned long>(h));
+        return SUCCEEDED(h);
+    };
+    if (!make_pair("float4", vs_float_blob.Get(), ps_float_blob.Get(), float4_pair) ||
+        !make_pair("uint4", vs_uint4_blob.Get(), ps_uint4_blob.Get(), uint4_pair) ||
+        !make_pair("uint1", vs_uint1_blob.Get(), ps_uint1_blob.Get(), uint1_pair)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_create_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kIntSize,
+                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    hr = g.device->CreateRenderTargetView(tex.Get(), nullptr, rtv.GetAddressOf());
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rtv_failed\n", path);
+        return 2;
+    }
+
+    int items = 0;
+    int failed = 0;
+    auto check_center = [&](const char* item, Pair& pair, const int expected[4]) {
+        g.context->Flush();
+        const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
+                                          kIntSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+            return;
+        }
+        const size_t off = static_cast<size_t>(kIntSize / 2) * back.pitch +
+                           static_cast<size_t>(kIntSize / 2) * 4;
+        const int got[4] = {back.bytes[off + 0], back.bytes[off + 1], back.bytes[off + 2],
+                            back.bytes[off + 3]};
+        bool ok = true;
+        for (int i = 0; i < 4; ++i) {
+            if (abs(got[i] - expected[i]) > 1) ok = false;
+        }
+        out("MODE=%s ITEM=%s RESULT=%s got=%d,%d,%d,%d expected=%d,%d,%d,%d\n", path,
+            item, ok ? "PASS" : "FAIL", got[0], got[1], got[2], got[3], expected[0],
+            expected[1], expected[2], expected[3]);
+        if (!ok) {
+            ++failed;
+            ++g_failures;
+        }
+        (void)pair;
+    };
+
+    auto draw_quad = [&](Pair& pair, ComPtr<ID3D11InputLayout>& layout,
+                         ID3D11Buffer* vb0, UINT stride0, ID3D11Buffer* vb1, UINT stride1,
+                         bool instanced) {
+        if (!small_pipeline(path, g, kIntSize, pair.vs.Get())) return false;
+        const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), white);
+        ID3D11RenderTargetView* rtvs[1] = {rtv.Get()};
+        g.context->OMSetRenderTargets(1, rtvs, nullptr);
+        g.context->IASetInputLayout(layout.Get());
+        g.context->VSSetShader(pair.vs.Get(), nullptr, 0);
+        g.context->PSSetShader(pair.ps.Get(), nullptr, 0);
+        ID3D11Buffer* vbs[2] = {vb0, vb1};
+        UINT strides[2] = {stride0, stride1};
+        UINT offsets[2] = {0, 0};
+        g.context->IASetVertexBuffers(0, vb1 ? 2 : 1, vbs, strides, offsets);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (instanced)
+            g.context->DrawInstanced(6, 1, 0, 0);
+        else
+            g.context->Draw(6, 0);
+        return true;
+    };
+
+    // Case 1: float4 attribute control, both attributes in slot 0.
+    {
+        struct V { float pos[2]; float g[4]; };
+        const float v = 99.0f / 255.0f, w = 42.0f / 255.0f, z = 7.0f / 255.0f;
+        V data[6];
+        for (int i = 0; i < 6; ++i) {
+            data[i].pos[0] = kIntPos6[i * 2];
+            data[i].pos[1] = kIntPos6[i * 2 + 1];
+            data[i].g[0] = v; data[i].g[1] = w; data[i].g[2] = z; data[i].g[3] = 1.0f;
+        }
+        D3D11_INPUT_ELEMENT_DESC elems[2] = {};
+        elems[0].SemanticName = "POSITION"; elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+        elems[0].InputSlot = 0; elems[0].AlignedByteOffset = 0;
+        elems[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        elems[1].SemanticName = "GLYPH"; elems[1].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        elems[1].InputSlot = 0; elems[1].AlignedByteOffset = 8;
+        elems[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        ComPtr<ID3D11InputLayout> layout;
+        HRESULT h = g.device->CreateInputLayout(elems, 2, float4_pair.vs_blob->GetBufferPointer(),
+                                                float4_pair.vs_blob->GetBufferSize(),
+                                                layout.GetAddressOf());
+        out("MODE=%s stage=create_layout name=float4 hr=0x%08lx\n", path,
+            static_cast<unsigned long>(h));
+        ComPtr<ID3D11Buffer> vb;
+        if (SUCCEEDED(h) && create_buffer(path, g.device.Get(), data, sizeof(data),
+                                          D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+            draw_quad(float4_pair, layout, vb.Get(), sizeof(V), nullptr, 0, false);
+            const int expected[4] = {7, 42, 99, 255};
+            check_center("float4_control", float4_pair, expected);
+        } else {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=float4_control RESULT=FAIL reason=setup_failed\n", path);
+        }
+    }
+
+    // Cases 2-4: uint4 attribute, one slot or two, per vertex or per instance.
+    {
+        struct VU { float pos[2]; unsigned int g[4]; };
+        VU data[6];
+        for (int i = 0; i < 6; ++i) {
+            data[i].pos[0] = kIntPos6[i * 2];
+            data[i].pos[1] = kIntPos6[i * 2 + 1];
+            data[i].g[0] = 0x2A63u;  // low 99, high 42
+            data[i].g[1] = 7u;
+            data[i].g[2] = 3u;
+            data[i].g[3] = 4u;
+        }
+        const int expected[4] = {7, 42, 99, 255};
+
+        // 2: both attributes in slot 0, stride 24.
+        {
+            D3D11_INPUT_ELEMENT_DESC elems[2] = {};
+            elems[0].SemanticName = "POSITION"; elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            elems[0].InputSlot = 0; elems[0].AlignedByteOffset = 0;
+            elems[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            elems[1].SemanticName = "GLYPH";
+            elems[1].Format = DXGI_FORMAT_R32G32B32A32_UINT;
+            elems[1].InputSlot = 0; elems[1].AlignedByteOffset = 8;
+            elems[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(
+                elems, 2, uint4_pair.vs_blob->GetBufferPointer(),
+                uint4_pair.vs_blob->GetBufferSize(), layout.GetAddressOf());
+            out("MODE=%s stage=create_layout name=uint4_one_slot hr=0x%08lx\n", path,
+                static_cast<unsigned long>(h));
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) && create_buffer(path, g.device.Get(), data, sizeof(data),
+                                              D3D11_BIND_VERTEX_BUFFER,
+                                              D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(uint4_pair, layout, vb.Get(), sizeof(VU), nullptr, 0, false);
+                check_center("uint4_per_vertex", uint4_pair, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=uint4_per_vertex RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+
+        // 3: two slots, both per vertex.
+        {
+            D3D11_INPUT_ELEMENT_DESC elems[2] = {};
+            elems[0].SemanticName = "POSITION"; elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            elems[0].InputSlot = 0; elems[0].AlignedByteOffset = 0;
+            elems[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            elems[1].SemanticName = "GLYPH";
+            elems[1].Format = DXGI_FORMAT_R32G32B32A32_UINT;
+            elems[1].InputSlot = 1; elems[1].AlignedByteOffset = 0;
+            elems[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(
+                elems, 2, uint4_pair.vs_blob->GetBufferPointer(),
+                uint4_pair.vs_blob->GetBufferSize(), layout.GetAddressOf());
+            out("MODE=%s stage=create_layout name=uint4_two_slots hr=0x%08lx\n", path,
+                static_cast<unsigned long>(h));
+            ComPtr<ID3D11Buffer> pos, glyph;
+            bool ok = SUCCEEDED(h) &&
+                      create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                                    D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, pos);
+            unsigned int glyphs[6 * 4];
+            for (int i = 0; i < 6; ++i) {
+                glyphs[i * 4 + 0] = 0x2A63u;
+                glyphs[i * 4 + 1] = 7u;
+                glyphs[i * 4 + 2] = 3u;
+                glyphs[i * 4 + 3] = 4u;
+            }
+            ok = ok && create_buffer(path, g.device.Get(), glyphs, sizeof(glyphs),
+                                     D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, glyph);
+            if (ok) {
+                draw_quad(uint4_pair, layout, pos.Get(), 8, glyph.Get(), 16, false);
+                check_center("uint4_two_slots", uint4_pair, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=uint4_two_slots RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+
+        // 4: glyph data per instance, one instance.
+        {
+            D3D11_INPUT_ELEMENT_DESC elems[2] = {};
+            elems[0].SemanticName = "POSITION"; elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            elems[0].InputSlot = 0; elems[0].AlignedByteOffset = 0;
+            elems[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            elems[1].SemanticName = "GLYPH";
+            elems[1].Format = DXGI_FORMAT_R32G32B32A32_UINT;
+            elems[1].InputSlot = 1; elems[1].AlignedByteOffset = 0;
+            elems[1].InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+            elems[1].InstanceDataStepRate = 1;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(
+                elems, 2, uint4_pair.vs_blob->GetBufferPointer(),
+                uint4_pair.vs_blob->GetBufferSize(), layout.GetAddressOf());
+            out("MODE=%s stage=create_layout name=uint4_per_instance hr=0x%08lx\n", path,
+                static_cast<unsigned long>(h));
+            ComPtr<ID3D11Buffer> pos, glyph;
+            const unsigned int gdata[4] = {0x2A63u, 7u, 3u, 4u};
+            bool ok = SUCCEEDED(h) &&
+                      create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                                    D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, pos);
+            ok = ok && create_buffer(path, g.device.Get(), gdata, sizeof(gdata),
+                                     D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, glyph);
+            if (ok) {
+                draw_quad(uint4_pair, layout, pos.Get(), 8, glyph.Get(), 16, true);
+                check_center("uint4_per_instance", uint4_pair, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=uint4_per_instance RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case 5: R16_UINT attribute, 0x2A63 -> 99/42.
+    {
+        struct V16 { float pos[2]; unsigned short g; unsigned short pad; };
+        V16 data[6];
+        for (int i = 0; i < 6; ++i) {
+            data[i].pos[0] = kIntPos6[i * 2];
+            data[i].pos[1] = kIntPos6[i * 2 + 1];
+            data[i].g = 0x2A63;
+            data[i].pad = 0;
+        }
+        D3D11_INPUT_ELEMENT_DESC elems[2] = {};
+        elems[0].SemanticName = "POSITION"; elems[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+        elems[0].InputSlot = 0; elems[0].AlignedByteOffset = 0;
+        elems[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        elems[1].SemanticName = "G16"; elems[1].Format = DXGI_FORMAT_R16_UINT;
+        elems[1].InputSlot = 0; elems[1].AlignedByteOffset = 8;
+        elems[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        ComPtr<ID3D11InputLayout> layout;
+        HRESULT h = g.device->CreateInputLayout(
+            elems, 2, uint1_pair.vs_blob->GetBufferPointer(),
+            uint1_pair.vs_blob->GetBufferSize(), layout.GetAddressOf());
+        out("MODE=%s stage=create_layout name=r16_uint hr=0x%08lx\n", path,
+            static_cast<unsigned long>(h));
+        ComPtr<ID3D11Buffer> vb;
+        if (SUCCEEDED(h) && create_buffer(path, g.device.Get(), data, sizeof(data),
+                                          D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+            draw_quad(uint1_pair, layout, vb.Get(), sizeof(V16), nullptr, 0, false);
+            const int expected[4] = {0, 42, 99, 255};
+            check_center("r16_uint", uint1_pair, expected);
+        } else {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=r16_uint RESULT=FAIL reason=setup_failed\n", path);
+        }
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d\n", path, items, failed);
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -6923,6 +7302,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "typed-buffer-srv") return run_typed_buffer_srv(warp, debug_layer);
     if (mode == "upload-paths") return run_upload_paths(warp, debug_layer);
     if (mode == "mixed-fetch") return run_mixed_fetch(warp, debug_layer);
+    if (mode == "int-attribs") return run_int_attribs(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -7027,6 +7407,10 @@ void usage() {
         "                    (five buffer fetches, then a LUT fetch); buffer_only\n"
         "                    and texture_only are the controls, every case is\n"
         "                    judged by an exact centre-pixel readback\n"
+        "  --mode int-attribs  integer vertex attributes forwarded as flat inputs,\n"
+        "                    as the D2D text shader does: float4 control, uint4 in\n"
+        "                    one slot, uint4 across two slots, uint4 per instance,\n"
+        "                    and R16_UINT, each judged by the exact centre pixel\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -7099,6 +7483,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("upload-paths");
             } else if (value == L"mixed-fetch") {
                 modes.push_back("mixed-fetch");
+            } else if (value == L"int-attribs") {
+                modes.push_back("int-attribs");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
