@@ -7019,6 +7019,13 @@ const char* kIntPsG16Svpos =
     "    return float4(float(i.g & 255u) / 255.0, float((i.g >> 8) & 255u) / 255.0, 0.0, 1.0);\n"
     "}\n";
 
+// The reverse of g16_svpos: the pixel shader demands flat but the vertex
+// shader declares a smooth float varying. The dumped D2D pairs show exactly
+// this shape (flat/noPerspective on the FS inputs, nothing on the VS outputs).
+const char* kIntPsFlatGlyphSvpos =
+    "struct PSIn { float4 pos : SV_Position; nointerpolation float4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7570,6 +7577,36 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=g16_svpos RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case J: flat demanded by the PS while the VS writes a smooth float; the
+    // mismatch the real D2D shader pairs present on this driver.
+    {
+        Pair p;
+        if (!build_pair("flat_mismatch", kIntVsConstVarying, kIntPsFlatGlyphSvpos, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=flat_mismatch RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("flat_mismatch", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=flat_mismatch RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
