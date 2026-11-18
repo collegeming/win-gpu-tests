@@ -6965,6 +6965,34 @@ const char* kIntVsConstVarying =
     "    return o;\n"
     "}\n";
 
+const char* kIntVsTexcoordVarying =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : TEXCOORD0; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.g = float4(0.5, 0.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsTexcoordVarying =
+    "struct PSIn { float4 g : TEXCOORD0; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
+const char* kIntVsColorVarying =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : COLOR0; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.g = float4(0.5, 0.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsColorVarying =
+    "struct PSIn { float4 g : COLOR0; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
+const char* kIntPsRed = "float4 main() : SV_Target { return float4(1.0, 0.0, 0.0, 1.0); }\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7129,6 +7157,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
     int items = 0;
     int failed = 0;
     auto check_center = [&](const char* item, Pair& pair, const int expected[4]) {
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
         g.context->Flush();
         const SmallRead back = small_read(path, g.context.Get(), tex.Get(), staging.Get(),
                                           kIntSize, 4);
@@ -7339,6 +7368,93 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=pos_const_varying RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case D: standard TEXCOORD semantic, constant varying.
+    {
+        Pair p;
+        if (!build_pair("texcoord_varying", kIntVsTexcoordVarying, kIntPsTexcoordVarying, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=texcoord_varying RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("texcoord_varying", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=texcoord_varying RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case E: standard COLOR semantic, constant varying.
+    {
+        Pair p;
+        if (!build_pair("color_varying", kIntVsColorVarying, kIntPsColorVarying, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=color_varying RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("color_varying", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=color_varying RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case F: no varying at all, constant red; proves the write path.
+    {
+        Pair p;
+        if (!build_pair("red_control", kIntVsPos, kIntPsRed, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=red_control RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 255, 255};
+                check_center("red_control", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=red_control RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
