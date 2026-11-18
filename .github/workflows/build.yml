@@ -139,9 +139,9 @@ jobs:
           if (-not (Select-String -Path "$dir\self-test.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing SELF_TEST=PASS' }
           # Runner evidence only. The hosted runner has no target GPU, so these
           # exits are recorded, never gated; device acceptance is separate.
-          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --mode typed-buffer-srv --log "$dir\runner-hardware.txt" | Out-Null
+          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --mode typed-buffer-srv --mode upload-paths --log "$dir\runner-hardware.txt" | Out-Null
           $hwExit = $LASTEXITCODE
-          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --mode typed-buffer-srv --log "$dir\runner-warp.txt" | Out-Null
+          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --mode uint-rt-extreme --mode typed-buffer-srv --mode upload-paths --log "$dir\runner-warp.txt" | Out-Null
           $warpExit = $LASTEXITCODE
           # Surface the evidence verdicts in the job log so a non-zero evidence
           # exit is diagnosable without the artifact; the full logs are packaged.
@@ -168,13 +168,14 @@ jobs:
           runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
           runner_warp_exit=$warpExit (hosted runner evidence, not gated)
           hardware_device=NOT_TESTED
-          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline,a8-upload,rt-to-srv,d2d-aa-modes,text-paths,clip-contract,mask-uint,dualsrc-blend,uint-rt-extreme,typed-buffer-srv (additive; full == no --mode)
+          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline,a8-upload,rt-to-srv,d2d-aa-modes,text-paths,clip-contract,mask-uint,dualsrc-blend,uint-rt-extreme,typed-buffer-srv,upload-paths (additive; full == no --mode)
           v2_result=NOT_TESTED (mode items judge expected ink/colour per region; device run decides)
           v3_result=NOT_TESTED (a8-contract judges A8_UNORM values; drawline separates AA paths)
           v4_result=NOT_TESTED (a8-upload judges UpdateSubresource upload and SRV->PS value; rt-to-srv judges RT->SRV; d2d-aa-modes and text-paths judge per-item ink; device run decides)
           v5_result=NOT_TESTED (clip-contract judges clip/discard keep-vs-drop; mask-uint judges R32_UINT write/Load/countbits/array index; dualsrc-blend judges SRC1 blend factors; device run decides)
           v7_result=NOT_TESTED (uint-rt-extreme judges bit-exact PS integer writes of float-hostile bit patterns plus an R32_FLOAT NaN-bit readback control; WARP must be exact; device run decides)
           v8_result=NOT_TESTED (typed-buffer-srv judges typed/structured/raw texel-buffer SRV fetches, a Texture2D<uint> control and a Buffer<float> control, with per-case SRV desc and staged initial-data checks; WARP must be exact; device run decides)
+          v9_result=NOT_TESTED (upload-paths judges UpdateSubresource box, CopySubresourceRegion box, DYNAMIC buffer Map(WRITE_DISCARD) and DYNAMIC texture Map(WRITE_DISCARD), each with an exact fetch/readback and clear-zero outside the box where defined; WARP must be exact; device run decides)
           "@ | Set-Content text-glyph-package\build-info.txt -Encoding utf8
           @'
           text_glyph_probe_arm64.exe
@@ -194,6 +195,7 @@ jobs:
           text_glyph_probe_arm64.exe --mode dualsrc-blend
           text_glyph_probe_arm64.exe --mode uint-rt-extreme
           text_glyph_probe_arm64.exe --mode typed-buffer-srv
+          text_glyph_probe_arm64.exe --mode upload-paths
           text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --mode a8-upload --mode rt-to-srv --mode d2d-aa-modes --mode text-paths --mode clip-contract --mode mask-uint --mode dualsrc-blend --log C:\path\probe.txt
 
           Console ARM64. Creates no window, requests no focus/activation, reads no screen.
@@ -393,19 +395,36 @@ jobs:
             so the readback path itself is shown not to convert. Each item prints expected,
             actual_min, actual_max (uint), mismatches and all_zero; WARP must be bit exact.
           typed-buffer-srv isolates the typed texel-buffer SRV path the failing D2D shader
-            uses (image<u32> dim=Buffer). Five cases, each with its own 64-word buffer or
-            64x1 texture, SRV, draw and 64x64 R32_FLOAT readback: Buffer<uint>.Load,
-            StructuredBuffer<uint>, ByteAddressBuffer.Load(idx*4), a Texture2D<uint>.Load
-            control and a Buffer<float> control. The words are 0x00010001, 0xDEADBEEF,
-            0x7FC00001, 0x12345678 plus 1..64; pixel column x reads element x through
-            SV_Position.x and the uint cases store asfloat(v), so the raw readback bits must
-            equal v. Every item prints the SRV desc (format/viewdim/first/last) and the
-            staged initial-data check, then expected, actual_min, actual_max, mismatches,
-            bad_columns, all_zero, plus denormal_expected/denormal_bad and nan_expected/
-            nan_bad because asfloat turns 0x00010001 and 1..64 into denormals and the two
-            NaN patterns can be canonicalised independently of the buffer view. WARP must be
-            bit exact; a failing Texture2D<uint> control makes the run inconclusive rather
-            than evidence against the buffer path.
+            uses (image<u32> dim=Buffer), plus the 2D texture fetches the same shader does.
+            Seven cases, each with its own resource, SRV, draw and readback:
+            Buffer<uint>.Load, StructuredBuffer<uint>, ByteAddressBuffer.Load(idx*4) and
+            Buffer<float>, each 64 words into a 64x64 R32_FLOAT target, plus a
+            Texture2D<uint>.Load control and Texture2D<float>.Load / Texture2D<float4>.Load
+            on 32x32 R32_FLOAT and B8G8R8A8_UNORM sources uploaded with UpdateSubresource.
+            The buffer words are 0x00010001, 0xDEADBEEF, 0x7FC00001, 0x12345678 plus 1..64;
+            pixel column x reads element x through SV_Position.x and the uint cases store
+            asfloat(v), so the raw readback bits must equal v. The 2D float case stores the
+            raw float bits into R32_FLOAT and the BGRA8 case compares the four bytes per
+            texel. Every item prints the SRV desc (format/viewdim/first/last), the staged
+            initial-data check where applicable, expected, actual_min, actual_max,
+            mismatches, bad_columns/all_zero and denormal/NaN counters, because asfloat
+            turns 0x00010001 and 1..64 into denormals and NaN payloads can be canonicalised
+            independently of the view. WARP must be bit exact; a failing Texture2D<uint>
+            control makes the run inconclusive rather than evidence against the buffer path.
+          upload-paths covers the write half: a 32x32 block is pushed into 64x64 resources
+            through each upload mechanism, then fetched and compared byte/word exact.
+            texture_update_box clears a DEFAULT R8_UNORM target through an RTV and then
+            UpdateSubresource a 32x32 box at (4,4); texture_copy_box clears it and
+            CopySubresourceRegion a mapped 32x32 staging texture to (4,4);
+            dynamic_buffer_map Map(WRITE_DISCARD)s 64 R32_UINT words, fetches them through a
+            typed SRV and stores the raw bits into R32_FLOAT; dynamic_texture_map
+            Map(WRITE_DISCARD)s the block into a DYNAMIC R8_UNORM texture and judges only
+            the written block because the rest of a discarded dynamic texture is undefined.
+            The texture cases also require the outside of the box to stay at the cleared
+            zero, so a shifted or full-surface write is distinguishable from a lost write.
+            Every item prints the create/map/update/copy stage trail with hr, expected,
+            actual_min, actual_max, mismatches (split inside/outside the box) and all_zero;
+            WARP must be bit exact.
           Modes never alter the full-mode numbers; a mode failure only changes the exit code
           and SUMMARY_MODES.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8

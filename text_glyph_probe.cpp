@@ -5371,6 +5371,17 @@ const char* kTypedPsBufferFloat =
     "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
     "    return float4(src.Load((uint)pos.x), 0.0f, 0.0f, 0.0f);\n"
     "}\n";
+const char* kTypedPsTexture2dFloatLoad =
+    "Texture2D<float> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    float v = src.Load(int3((int)pos.x, (int)pos.y, 0));\n"
+    "    return float4(v, 0.0f, 0.0f, 0.0f);\n"
+    "}\n";
+const char* kTypedPsTexture2dBgra8Load =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    return src.Load(int3((int)pos.x, (int)pos.y, 0));\n"
+    "}\n";
 
 const char* srv_dim_text(D3D11_SRV_DIMENSION dim) {
     switch (dim) {
@@ -5385,6 +5396,8 @@ const char* srv_format_text(DXGI_FORMAT fmt) {
     switch (fmt) {
         case DXGI_FORMAT_R32_UINT: return "R32_UINT";
         case DXGI_FORMAT_R32_FLOAT: return "R32_FLOAT";
+        case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+        case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
         case DXGI_FORMAT_R32_TYPELESS: return "R32_TYPELESS";
         case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
         default: return "other";
@@ -5535,6 +5548,52 @@ ColumnScan column_scan(const SmallRead& back, int size, const unsigned* want) {
     return s;
 }
 
+// Per-texel comparison for the 2D texture Load cases: every pixel is one
+// 32-bit word (raw float bits, or packed BGRA8 bytes), so the 32x32 result can
+// be checked without any float interpretation. The top-left 4x4 tile is kept
+// for a compact expected/actual print.
+struct TexelScan {
+    int mismatches = 0;
+    int first_bad = -1;
+    unsigned want_bad = 0;
+    unsigned got_bad = 0;
+    bool all_zero = true;
+    bool ok = false;
+    unsigned lo = 0xFFFFFFFFu;
+    unsigned hi = 0;
+    unsigned tile[16] = {0};
+};
+
+TexelScan texel_scan(const SmallRead& back, int width, int height, int bpp,
+                     const unsigned* want) {
+    TexelScan s;
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* row = back.bytes.data() + static_cast<size_t>(y) * back.pitch;
+        for (int x = 0; x < width; ++x) {
+            const uint8_t* p = row + static_cast<size_t>(x) * bpp;
+            const unsigned v = static_cast<unsigned>(p[0]) |
+                               (static_cast<unsigned>(p[1]) << 8) |
+                               (static_cast<unsigned>(p[2]) << 16) |
+                               (static_cast<unsigned>(p[3]) << 24);
+            if (x < 4 && y < 4) s.tile[y * 4 + x] = v;
+            if (v != 0) s.all_zero = false;
+            if (v < s.lo) s.lo = v;
+            if (v > s.hi) s.hi = v;
+            const int index = y * width + x;
+            if (v != want[index]) {
+                ++s.mismatches;
+                if (s.first_bad < 0) {
+                    s.first_bad = index;
+                    s.want_bad = want[index];
+                    s.got_bad = v;
+                }
+            }
+        }
+    }
+    s.ok = (s.mismatches == 0);
+    return s;
+}
+
 int run_typed_buffer_srv(bool warp, bool debug_layer) {
     const char* path = "typed-buffer-srv";
     const int size = 64;
@@ -5605,6 +5664,8 @@ int run_typed_buffer_srv(bool warp, bool debug_layer) {
     bool raw_ok = false;
     bool texture_ok = false;
     bool float_ok = false;
+    bool texture2d_float_ok = false;
+    bool texture2d_bgra8_ok = false;
     int denormal_expected_total = 0;
     int denormal_bad_total = 0;
     int nan_expected_total = 0;
@@ -5716,7 +5777,8 @@ int run_typed_buffer_srv(bool warp, bool debug_layer) {
             case D3D11_SRV_DIMENSION_BUFFEREX:
                 srv_desc.BufferEx.FirstElement = 0;
                 srv_desc.BufferEx.NumElements = static_cast<UINT>(count);
-                srv_desc.BufferEx.Flags = 0;
+                srv_desc.BufferEx.Flags =
+                    (c.kind == kRawUint) ? D3D11_BUFFEREX_SRV_FLAG_RAW : 0;
                 break;
             case D3D11_SRV_DIMENSION_TEXTURE2D:
                 srv_desc.Texture2D.MostDetailedMip = 0;
@@ -5736,9 +5798,9 @@ int run_typed_buffer_srv(bool warp, bool debug_layer) {
                 srv_dim_text(c.srv_dim), static_cast<unsigned long>(hr));
         } else if (c.srv_dim == D3D11_SRV_DIMENSION_BUFFEREX) {
             out("MODE=%s ITEM=%s stage=srv_desc format=%s viewdim=%s first=0 last=%d"
-                " elements=%d flags=0x0 hr=0x%08lx\n", path, c.item,
+                " elements=%d flags=0x%x hr=0x%08lx\n", path, c.item,
                 srv_format_text(c.srv_format), srv_dim_text(c.srv_dim), count - 1,
-                count, static_cast<unsigned long>(hr));
+                count, srv_desc.BufferEx.Flags, static_cast<unsigned long>(hr));
         } else {
             out("MODE=%s ITEM=%s stage=srv_desc format=%s viewdim=%s first=0 last=%d"
                 " elements=%d hr=0x%08lx\n", path, c.item,
@@ -5815,14 +5877,186 @@ int run_typed_buffer_srv(bool warp, bool debug_layer) {
         else float_ok = scan.ok;
     }
 
+    // The failing D2D shader also does three 2D texture OpImageFetch calls, so
+    // two texture Load cases use the same raw-bits discipline: the PS loads the
+    // stored texel and writes it out again, and the readback is compared as
+    // words (raw float bits, or the four packed BGRA8 bytes).
+    auto run_texture_load = [&](const char* item, const char* ps_source,
+                                DXGI_FORMAT fmt, const unsigned* words,
+                                const unsigned* tile, int width, int height) -> bool {
+        const int texel_bytes = 4;
+        ComPtr<ID3DBlob> lps_blob;
+        HRESULT lhr = a8_compile(path, item, ps_source, "ps_5_0", "ps_4_0",
+                                 lps_blob.GetAddressOf(), &used);
+        ComPtr<ID3D11PixelShader> lps;
+        if (SUCCEEDED(lhr))
+            lhr = g.device->CreatePixelShader(lps_blob->GetBufferPointer(),
+                                              lps_blob->GetBufferSize(), nullptr,
+                                              lps.GetAddressOf());
+        if (FAILED(lhr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=shader_create_failed\n", path,
+                item);
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC src_desc{};
+        src_desc.Width = static_cast<UINT>(width);
+        src_desc.Height = static_cast<UINT>(height);
+        src_desc.MipLevels = 1;
+        src_desc.ArraySize = 1;
+        src_desc.Format = fmt;
+        src_desc.SampleDesc.Count = 1;
+        src_desc.Usage = D3D11_USAGE_DEFAULT;
+        src_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> src;
+        lhr = g.device->CreateTexture2D(&src_desc, nullptr, src.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=create_source_texture fmt=%s size=%dx%d"
+            " upload=UpdateSubresource hr=0x%08lx\n", path, item,
+            srv_format_text(fmt), width, height,
+            static_cast<unsigned long>(lhr));
+        if (FAILED(lhr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=source_texture_create_failed\n",
+                path, item);
+            return false;
+        }
+        g.context->UpdateSubresource(src.Get(), 0, nullptr, words,
+                                     static_cast<UINT>(width) * texel_bytes, 0);
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC src_srv_desc{};
+        src_srv_desc.Format = fmt;
+        src_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        src_srv_desc.Texture2D.MostDetailedMip = 0;
+        src_srv_desc.Texture2D.MipLevels = 1;
+        ComPtr<ID3D11ShaderResourceView> src_srv;
+        lhr = g.device->CreateShaderResourceView(src.Get(), &src_srv_desc,
+                                                 src_srv.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=srv_desc format=%s viewdim=%s mip=0 levels=1"
+            " hr=0x%08lx\n", path, item, srv_format_text(fmt),
+            srv_dim_text(D3D11_SRV_DIMENSION_TEXTURE2D),
+            static_cast<unsigned long>(lhr));
+        if (FAILED(lhr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=srv_create_failed\n", path,
+                item);
+            return false;
+        }
+
+        if (!small_pipeline(path, g, width, vs.Get())) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=pipeline_failed\n", path, item);
+            return false;
+        }
+
+        ComPtr<ID3D11Texture2D> target, staging;
+        if (!small_texture(path, g.device.Get(), fmt, width,
+                           D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+                           target, staging)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path,
+                item);
+            return false;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        lhr = g.device->CreateRenderTargetView(target.Get(), nullptr,
+                                               rtv.GetAddressOf());
+        if (FAILED(lhr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed\n", path, item);
+            return false;
+        }
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), zero);
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->PSSetShader(lps.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* bound = src_srv.Get();
+        g.context->PSSetShaderResources(0, 1, &bound);
+        g.context->Draw(3, 0);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        ID3D11ShaderResourceView* no_srv = nullptr;
+        g.context->PSSetShaderResources(0, 1, &no_srv);
+        g.context->Flush();
+        const SmallRead lback = small_read(path, g.context.Get(), target.Get(),
+                                           staging.Get(), width, texel_bytes);
+        if (!lback.ok) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+            return false;
+        }
+
+        const TexelScan lscan = texel_scan(lback, width, height, texel_bytes, words);
+        char tile_expected[220], tile_actual[220];
+        format_uints(tile_expected, sizeof(tile_expected), tile, 16);
+        format_uints(tile_actual, sizeof(tile_actual), lscan.tile, 16);
+        out("MODE=%s ITEM=%s RESULT=%s source=%s target=%s size=%dx%d texels=%d"
+            " upload=UpdateSubresource mismatches=%d first_bad=%d want=0x%08x"
+            " got=0x%08x actual_min=0x%08x actual_max=0x%08x all_zero=%s"
+            " expected_tile=%s reason=%s\n", path, item,
+            lscan.ok ? "PASS" : "FAIL", srv_format_text(fmt),
+            srv_format_text(fmt), width, height, width * height, lscan.mismatches,
+            lscan.first_bad, lscan.want_bad, lscan.got_bad, lscan.lo, lscan.hi,
+            lscan.all_zero ? "yes" : "no", tile_expected,
+            lscan.ok ? "ok" : (lscan.all_zero ? "all_zero" : "value_mismatch"));
+        out("MODE=%s ITEM=%s stage=tile_actual values=%s\n", path, item,
+            tile_actual);
+        return lscan.ok;
+    };
+
+    const int texture_side = 32;
+    const unsigned float_tile[16] = {
+        0x3F800000u, 0x00010001u, 0xDEADBEEFu, 0x7FC00001u,
+        0xBF800000u, 0x3F000000u, 0x12345678u, 0x00000000u,
+        0x7FC00001u, 0xDEADBEEFu, 0x3F800000u, 0x00010001u,
+        0x00000000u, 0x12345678u, 0x3F000000u, 0xBF800000u,
+    };
+    unsigned float_words[texture_side * texture_side];
+    for (int y = 0; y < texture_side; ++y) {
+        for (int x = 0; x < texture_side; ++x) {
+            float_words[y * texture_side + x] = float_tile[(y % 4) * 4 + (x % 4)];
+        }
+    }
+
+    unsigned bgra8_tile[16];
+    for (int ty = 0; ty < 4; ++ty) {
+        for (int tx = 0; tx < 4; ++tx) {
+            const unsigned b = static_cast<unsigned>(tx * 64);
+            const unsigned g = static_cast<unsigned>(ty * 64);
+            const unsigned r = static_cast<unsigned>((tx + ty) * 32);
+            bgra8_tile[ty * 4 + tx] =
+                b | (g << 8) | (r << 16) | (255u << 24);
+        }
+    }
+    unsigned bgra8_words[texture_side * texture_side];
+    for (int y = 0; y < texture_side; ++y) {
+        for (int x = 0; x < texture_side; ++x) {
+            bgra8_words[y * texture_side + x] = bgra8_tile[(y % 4) * 4 + (x % 4)];
+        }
+    }
+
+    ++items;
+    if (run_texture_load("texture2d_float_load", kTypedPsTexture2dFloatLoad,
+                         DXGI_FORMAT_R32_FLOAT, float_words, float_tile,
+                         texture_side, texture_side)) {
+        texture2d_float_ok = true;
+    } else {
+        ++failed;
+        ++g_failures;
+    }
+    ++items;
+    if (run_texture_load("texture2d_bgra8_load", kTypedPsTexture2dBgra8Load,
+                         DXGI_FORMAT_B8G8R8A8_UNORM, bgra8_words, bgra8_tile,
+                         texture_side, texture_side)) {
+        texture2d_bgra8_ok = true;
+    } else {
+        ++failed;
+        ++g_failures;
+    }
+
     out("MODE=%s SUMMARY items=%d failed=%d driver=%s uint_buffer_cases=%d"
         " uint_buffer_exact=%d typed_r32_uint=%s structured_uint=%s"
         " raw_byteaddress=%s texture2d_control=%s typed_r32_float=%s"
+        " texture2d_float_load=%s texture2d_bgra8_load=%s"
         " denormal_expected=%d denormal_bad=%d nan_expected=%d nan_bad=%d\n", path,
         items, failed, warp ? "warp" : "hardware", uint_buffer_cases,
         uint_buffer_exact, typed_uint_ok ? "yes" : "no",
         structured_ok ? "yes" : "no", raw_ok ? "yes" : "no",
         texture_ok ? "yes" : "no", float_ok ? "yes" : "no",
+        texture2d_float_ok ? "yes" : "no", texture2d_bgra8_ok ? "yes" : "no",
         denormal_expected_total, denormal_bad_total, nan_expected_total,
         nan_bad_total);
     if (failed == 0) {
@@ -5850,6 +6084,576 @@ int run_typed_buffer_srv(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ---- upload-paths ----------------------------------------------------------
+
+// The upload path is the other half of the text failure: glyph bitmaps and LUTs
+// are first written into a texture or buffer, then fetched. If the upload lands
+// in the wrong place, or not at all, everything downstream reads zero. These
+// cases write a known 32x32 block through each upload mechanism and compare the
+// fetched bytes with the block, including the expected zero outside the box.
+
+const char* kUploadPsR8Load =
+    "Texture2D<float> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    float v = src.Load(int3((int)pos.x, (int)pos.y, 0));\n"
+    "    return float4(v, v, v, 1.0f);\n"
+    "}\n";
+
+struct ByteScan {
+    int checked = 0;
+    int mismatches = 0;
+    int inside_mismatches = 0;
+    int outside_mismatches = 0;
+    int first_bad = -1;
+    unsigned want_bad = 0;
+    unsigned got_bad = 0;
+    bool all_zero = true;
+    bool ok = false;
+    unsigned lo = 0xFF;
+    unsigned hi = 0;
+};
+
+// check[] is 0 (do not judge), 1 (outside the written box, expected 0) or
+// 2 (inside the box, expected pattern). The split lets a lost write be told
+// apart from a shifted write.
+ByteScan byte_scan(const SmallRead& back, int width, int height,
+                   const uint8_t* want, const uint8_t* check) {
+    ByteScan s;
+    for (int y = 0; y < height; ++y) {
+        const uint8_t* row = back.bytes.data() + static_cast<size_t>(y) * back.pitch;
+        for (int x = 0; x < width; ++x) {
+            const int index = y * width + x;
+            if (check[index] == 0) continue;
+            ++s.checked;
+            const unsigned v = row[x];
+            if (v != 0) s.all_zero = false;
+            if (v < s.lo) s.lo = v;
+            if (v > s.hi) s.hi = v;
+            if (v != want[index]) {
+                ++s.mismatches;
+                if (check[index] == 2) ++s.inside_mismatches;
+                else ++s.outside_mismatches;
+                if (s.first_bad < 0) {
+                    s.first_bad = index;
+                    s.want_bad = want[index];
+                    s.got_bad = v;
+                }
+            }
+        }
+    }
+    s.ok = (s.mismatches == 0);
+    return s;
+}
+
+int run_upload_paths(bool warp, bool debug_layer) {
+    const char* path = "upload-paths";
+    const int size = 64;
+    const int box_x = 4;
+    const int box_y = 4;
+    const int box_w = 32;
+    const int box_h = 32;
+
+    uint8_t pattern[32 * 32];
+    for (int y = 0; y < box_h; ++y) {
+        for (int x = 0; x < box_w; ++x) {
+            pattern[y * box_w + x] =
+                static_cast<uint8_t>((x * 8 + y * 4) & 0xFF);
+        }
+    }
+
+    uint8_t want_all[64 * 64];
+    uint8_t check_all[64 * 64];
+    uint8_t want_box[64 * 64];
+    uint8_t check_box[64 * 64];
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            const int index = y * size + x;
+            const bool inside = x >= box_x && x < box_x + box_w &&
+                                y >= box_y && y < box_y + box_h;
+            const uint8_t v =
+                inside ? pattern[(y - box_y) * box_w + (x - box_x)] : 0;
+            want_all[index] = v;
+            check_all[index] = inside ? 2 : 1;
+            want_box[index] = v;
+            check_box[index] = inside ? 2 : 0;
+        }
+    }
+
+    out("MODE=%s stage=data box=%d,%d..%d,%d block=32x32 pattern=gradient"
+        " outside=clear0\n", path, box_x, box_y, box_x + box_w, box_y + box_h);
+
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob;
+    const char* used = nullptr;
+    HRESULT hr = a8_compile(path, "upload_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used);
+    ComPtr<ID3D11VertexShader> vs;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                          vs_blob->GetBufferSize(), nullptr,
+                                          vs.GetAddressOf());
+    if (FAILED(hr) || !small_pipeline(path, g, size, vs.Get())) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=setup_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3DBlob> r8_blob;
+    hr = a8_compile(path, "upload_ps_r8_load", kUploadPsR8Load, "ps_5_0",
+                    "ps_4_0", r8_blob.GetAddressOf(), &used);
+    ComPtr<ID3D11PixelShader> r8_ps;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(r8_blob->GetBufferPointer(),
+                                         r8_blob->GetBufferSize(), nullptr,
+                                         r8_ps.GetAddressOf());
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=r8_ps_create_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3DBlob> buf_blob;
+    hr = a8_compile(path, "upload_ps_buffer_uint", kTypedPsBufferUint, "ps_5_0",
+                    "ps_4_0", buf_blob.GetAddressOf(), &used);
+    ComPtr<ID3D11PixelShader> buffer_ps;
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(buf_blob->GetBufferPointer(),
+                                         buf_blob->GetBufferSize(), nullptr,
+                                         buffer_ps.GetAddressOf());
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=buffer_ps_create_failed\n", path);
+        return 2;
+    }
+
+    auto clear_tex_zero = [&](const char* item, ID3D11Texture2D* tex) -> bool {
+        ComPtr<ID3D11RenderTargetView> rtv;
+        HRESULT lhr =
+            g.device->CreateRenderTargetView(tex, nullptr, rtv.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=clear_zero_create_rtv hr=0x%08lx\n", path, item,
+            static_cast<unsigned long>(lhr));
+        if (FAILED(lhr)) return false;
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), zero);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        g.context->Flush();
+        out("MODE=%s ITEM=%s stage=clear_zero color=0,0,0,0 hr=0x%08lx\n", path,
+            item, 0L);
+        return true;
+    };
+
+    auto make_tex_srv = [&](const char* item, ID3D11Texture2D* tex,
+                            DXGI_FORMAT fmt,
+                            ComPtr<ID3D11ShaderResourceView>& srv) -> HRESULT {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = fmt;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MostDetailedMip = 0;
+        sd.Texture2D.MipLevels = 1;
+        const HRESULT lhr =
+            g.device->CreateShaderResourceView(tex, &sd, srv.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=srv_desc format=%s viewdim=TEXTURE2D mip=0"
+            " levels=1 hr=0x%08lx\n", path, item, srv_format_text(fmt),
+            static_cast<unsigned long>(lhr));
+        return lhr;
+    };
+
+    auto render_to_readback = [&](const char* item, ID3D11ShaderResourceView* srv,
+                                  ID3D11PixelShader* ps, DXGI_FORMAT fmt,
+                                  int bpp, SmallRead* back) -> bool {
+        ComPtr<ID3D11Texture2D> target, staging;
+        if (!small_texture(path, g.device.Get(), fmt, size,
+                           D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+                           target, staging)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path,
+                item);
+            return false;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        HRESULT lhr = g.device->CreateRenderTargetView(target.Get(), nullptr,
+                                                       rtv.GetAddressOf());
+        if (FAILED(lhr)) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed"
+                " hr=0x%08lx\n", path, item, static_cast<unsigned long>(lhr));
+            return false;
+        }
+        const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g.context->ClearRenderTargetView(rtv.Get(), zero);
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->PSSetShader(ps, nullptr, 0);
+        ID3D11ShaderResourceView* bound = srv;
+        g.context->PSSetShaderResources(0, 1, &bound);
+        g.context->Draw(3, 0);
+        ID3D11RenderTargetView* no_rtv = nullptr;
+        g.context->OMSetRenderTargets(1, &no_rtv, nullptr);
+        ID3D11ShaderResourceView* no_srv = nullptr;
+        g.context->PSSetShaderResources(0, 1, &no_srv);
+        g.context->Flush();
+        *back = small_read(path, g.context.Get(), target.Get(), staging.Get(),
+                           size, bpp);
+        if (!back->ok) {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, item);
+            return false;
+        }
+        return true;
+    };
+
+    auto print_byte_item = [&](const char* item, const ByteScan& b) {
+        out("MODE=%s ITEM=%s RESULT=%s target=R8_UNORM size=%dx%d texels=%d"
+            " checked=%d mismatches=%d inside_mismatches=%d"
+            " outside_mismatches=%d expected=gradient_box actual_min=%u"
+            " actual_max=%u all_zero=%s first_bad=%d want=%u got=%u reason=%s\n",
+            path, item, b.ok ? "PASS" : "FAIL", size, size, size * size,
+            b.checked, b.mismatches, b.inside_mismatches, b.outside_mismatches,
+            b.lo, b.hi, b.all_zero ? "yes" : "no", b.first_bad, b.want_bad,
+            b.got_bad, b.ok ? "ok" : (b.all_zero ? "all_zero" : "value_mismatch"));
+    };
+
+    int items = 0;
+    int failed = 0;
+    bool update_ok = false;
+    bool copy_ok = false;
+    bool buffer_ok = false;
+    bool dyn_tex_ok = false;
+
+    // 1. UpdateSubresource with a destination box into a cleared DEFAULT texture.
+    ++items;
+    {
+        const char* item = "texture_update_box";
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(size);
+        desc.Height = static_cast<UINT>(size);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> tex;
+        HRESULT lhr = g.device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=create usage=DEFAULT bind=RT|SRV fmt=R8_UNORM"
+            " size=%dx%d hr=0x%08lx\n", path, item, size, size,
+            static_cast<unsigned long>(lhr));
+        bool ok = false;
+        if (SUCCEEDED(lhr) && clear_tex_zero(item, tex.Get())) {
+            D3D11_BOX dst_box{};
+            dst_box.left = static_cast<UINT>(box_x);
+            dst_box.top = static_cast<UINT>(box_y);
+            dst_box.front = 0;
+            dst_box.right = static_cast<UINT>(box_x + box_w);
+            dst_box.bottom = static_cast<UINT>(box_y + box_h);
+            dst_box.back = 1;
+            g.context->UpdateSubresource(tex.Get(), 0, &dst_box, pattern, box_w, 0);
+            out("MODE=%s ITEM=%s stage=update_box dst_box=%d,%d..%d,%d"
+                " src_pitch=%d bytes=%d hr=0x%08lx\n", path, item, box_x, box_y,
+                box_x + box_w, box_y + box_h, box_w, box_w * box_h, 0L);
+            ComPtr<ID3D11ShaderResourceView> srv;
+            lhr = make_tex_srv(item, tex.Get(), DXGI_FORMAT_R8_UNORM, srv);
+            SmallRead back;
+            if (SUCCEEDED(lhr) && render_to_readback(item, srv.Get(), r8_ps.Get(),
+                                                     DXGI_FORMAT_R8_UNORM, 1,
+                                                     &back)) {
+                const ByteScan b = byte_scan(back, size, size, want_all, check_all);
+                print_byte_item(item, b);
+                ok = b.ok;
+            } else {
+                out("MODE=%s ITEM=%s RESULT=FAIL reason=update_readback_failed\n",
+                    path, item);
+            }
+        } else {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=update_setup_failed\n", path,
+                item);
+        }
+        if (ok) update_ok = true;
+        else {
+            ++failed;
+            ++g_failures;
+        }
+    }
+
+    // 2. CopySubresourceRegion from a known staging texture into a cleared
+    //    DEFAULT texture at (4,4).
+    ++items;
+    {
+        const char* item = "texture_copy_box";
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(size);
+        desc.Height = static_cast<UINT>(size);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> dst;
+        HRESULT lhr = g.device->CreateTexture2D(&desc, nullptr, dst.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=create usage=DEFAULT bind=RT|SRV fmt=R8_UNORM"
+            " size=%dx%d hr=0x%08lx\n", path, item, size, size,
+            static_cast<unsigned long>(lhr));
+        bool ok = false;
+        if (SUCCEEDED(lhr) && clear_tex_zero(item, dst.Get())) {
+            D3D11_TEXTURE2D_DESC stage_desc = desc;
+            stage_desc.Width = static_cast<UINT>(box_w);
+            stage_desc.Height = static_cast<UINT>(box_h);
+            stage_desc.Usage = D3D11_USAGE_STAGING;
+            stage_desc.BindFlags = 0;
+            stage_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            stage_desc.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> src;
+            lhr = g.device->CreateTexture2D(&stage_desc, nullptr,
+                                            src.GetAddressOf());
+            out("MODE=%s ITEM=%s stage=create_staging_source fmt=R8_UNORM"
+                " size=%dx%d usage=STAGING cpu=WRITE hr=0x%08lx\n", path, item,
+                box_w, box_h, static_cast<unsigned long>(lhr));
+            if (SUCCEEDED(lhr)) {
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                lhr = g.context->Map(src.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
+                out("MODE=%s ITEM=%s stage=map_write row_pitch=%u hr=0x%08lx\n",
+                    path, item, mapped.RowPitch,
+                    static_cast<unsigned long>(lhr));
+                if (SUCCEEDED(lhr)) {
+                    for (int y = 0; y < box_h; ++y) {
+                        memcpy(static_cast<uint8_t*>(mapped.pData) +
+                                   static_cast<size_t>(y) * mapped.RowPitch,
+                               pattern + y * box_w, box_w);
+                    }
+                    g.context->Unmap(src.Get(), 0);
+                    D3D11_BOX src_box{};
+                    src_box.left = 0;
+                    src_box.top = 0;
+                    src_box.front = 0;
+                    src_box.right = static_cast<UINT>(box_w);
+                    src_box.bottom = static_cast<UINT>(box_h);
+                    src_box.back = 1;
+                    g.context->CopySubresourceRegion(dst.Get(), 0, box_x, box_y,
+                                                     0, src.Get(), 0, &src_box);
+                    out("MODE=%s ITEM=%s stage=copy_region dst=%d,%d,0"
+                        " src_box=0,0..%d,%d hr=0x%08lx\n", path, item, box_x,
+                        box_y, box_w, box_h, 0L);
+                    ComPtr<ID3D11ShaderResourceView> srv;
+                    lhr = make_tex_srv(item, dst.Get(), DXGI_FORMAT_R8_UNORM, srv);
+                    SmallRead back;
+                    if (SUCCEEDED(lhr) &&
+                        render_to_readback(item, srv.Get(), r8_ps.Get(),
+                                           DXGI_FORMAT_R8_UNORM, 1, &back)) {
+                        const ByteScan b =
+                            byte_scan(back, size, size, want_all, check_all);
+                        print_byte_item(item, b);
+                        ok = b.ok;
+                    } else {
+                        out("MODE=%s ITEM=%s RESULT=FAIL"
+                            " reason=copy_readback_failed\n", path, item);
+                    }
+                } else {
+                    out("MODE=%s ITEM=%s RESULT=FAIL reason=staging_map_failed\n",
+                        path, item);
+                }
+            } else {
+                out("MODE=%s ITEM=%s RESULT=FAIL reason=staging_create_failed\n",
+                    path, item);
+            }
+        } else {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=copy_setup_failed\n", path,
+                item);
+        }
+        if (ok) copy_ok = true;
+        else {
+            ++failed;
+            ++g_failures;
+        }
+    }
+
+    // 3. DYNAMIC buffer: Map(WRITE_DISCARD), write 64 uint words, fetch through
+    //    a typed SRV and store the raw bits into R32_FLOAT.
+    ++items;
+    {
+        const char* item = "dynamic_buffer_map";
+        unsigned data[64];
+        for (int i = 0; i < 64; ++i) data[i] = static_cast<unsigned>(i + 1);
+        data[0] = 0x00010001u;
+        data[1] = 0xDEADBEEFu;
+        data[2] = 0x7FC00001u;
+        data[3] = 0x12345678u;
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = 64 * 4;
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ComPtr<ID3D11Buffer> buffer;
+        HRESULT lhr = g.device->CreateBuffer(&desc, nullptr,
+                                             buffer.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=create usage=DYNAMIC bytes=%d cpu=WRITE"
+            " hr=0x%08lx\n", path, item, 64 * 4,
+            static_cast<unsigned long>(lhr));
+        bool ok = false;
+        if (SUCCEEDED(lhr)) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            lhr = g.context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                 &mapped);
+            out("MODE=%s ITEM=%s stage=map_write_discard row_pitch=%u"
+                " hr=0x%08lx\n", path, item, mapped.RowPitch,
+                static_cast<unsigned long>(lhr));
+            if (SUCCEEDED(lhr)) {
+                memcpy(mapped.pData, data, sizeof(data));
+                g.context->Unmap(buffer.Get(), 0);
+                out("MODE=%s ITEM=%s stage=unmap words=%d bytes=%zu\n", path, item,
+                    count, sizeof(data));
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+                sd.Format = DXGI_FORMAT_R32_UINT;
+                sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+                sd.Buffer.FirstElement = 0;
+                sd.Buffer.NumElements = 64;
+                ComPtr<ID3D11ShaderResourceView> srv;
+                lhr = g.device->CreateShaderResourceView(buffer.Get(), &sd,
+                                                         srv.GetAddressOf());
+                out("MODE=%s ITEM=%s stage=srv_desc format=R32_UINT viewdim=BUFFER"
+                    " first=0 elements=64 hr=0x%08lx\n", path, item,
+                    static_cast<unsigned long>(lhr));
+                SmallRead back;
+                if (SUCCEEDED(lhr) &&
+                    render_to_readback(item, srv.Get(), buffer_ps.Get(),
+                                       DXGI_FORMAT_R32_FLOAT, 4, &back)) {
+                    const ColumnScan scan = column_scan(back, size, data);
+                    char expected_text[1200], row0_text[1200];
+                    format_uints(expected_text, sizeof(expected_text), data, 64);
+                    format_uints(row0_text, sizeof(row0_text), scan.row0, 64);
+                    out("MODE=%s ITEM=%s RESULT=%s target=R32_FLOAT size=%dx%d"
+                        " texels=%d mismatches=%d bad_columns=%d expected=%s"
+                        " actual_min=0x%08x actual_max=0x%08x all_zero=%s"
+                        " denormal_expected=%d denormal_bad=%d nan_expected=%d"
+                        " nan_bad=%d reason=%s\n", path, item,
+                        scan.ok ? "PASS" : "FAIL", size, size, size * size,
+                        scan.mismatches, scan.bad_columns, expected_text, scan.lo,
+                        scan.hi, scan.all_zero ? "yes" : "no",
+                        scan.denormal_expected, scan.denormal_bad,
+                        scan.nan_expected, scan.nan_bad,
+                        scan.ok ? "ok"
+                                : (scan.all_zero ? "all_zero"
+                                                 : "value_mismatch"));
+                    out("MODE=%s ITEM=%s stage=row0_actual values=%s\n", path,
+                        item, row0_text);
+                    ok = scan.ok;
+                } else {
+                    out("MODE=%s ITEM=%s RESULT=FAIL"
+                        " reason=buffer_readback_failed\n", path, item);
+                }
+            } else {
+                out("MODE=%s ITEM=%s RESULT=FAIL reason=buffer_map_failed\n",
+                    path, item);
+            }
+        } else {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=buffer_create_failed\n", path,
+                item);
+        }
+        if (ok) buffer_ok = true;
+        else {
+            ++failed;
+            ++g_failures;
+        }
+    }
+
+    // 4. DYNAMIC texture: Map(WRITE_DISCARD) and write only the 32x32 block at
+    //    (4,4). The rest of a discarded dynamic texture is undefined, so only
+    //    the written block is judged.
+    ++items;
+    {
+        const char* item = "dynamic_texture_map";
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(size);
+        desc.Height = static_cast<UINT>(size);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ComPtr<ID3D11Texture2D> tex;
+        HRESULT lhr = g.device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf());
+        out("MODE=%s ITEM=%s stage=create usage=DYNAMIC bind=SRV fmt=R8_UNORM"
+            " size=%dx%d cpu=WRITE hr=0x%08lx\n", path, item, size, size,
+            static_cast<unsigned long>(lhr));
+        bool ok = false;
+        if (SUCCEEDED(lhr)) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            lhr = g.context->Map(tex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                 &mapped);
+            out("MODE=%s ITEM=%s stage=map_write_discard row_pitch=%u"
+                " hr=0x%08lx\n", path, item, mapped.RowPitch,
+                static_cast<unsigned long>(lhr));
+            if (SUCCEEDED(lhr)) {
+                for (int y = 0; y < box_h; ++y) {
+                    memcpy(static_cast<uint8_t*>(mapped.pData) +
+                               static_cast<size_t>(box_y + y) * mapped.RowPitch +
+                               box_x,
+                           pattern + y * box_w, box_w);
+                }
+                g.context->Unmap(tex.Get(), 0);
+                out("MODE=%s ITEM=%s stage=unmap block=%d,%d..%d,%d judged=block\n",
+                    path, item, box_x, box_y, box_x + box_w, box_y + box_h);
+                ComPtr<ID3D11ShaderResourceView> srv;
+                lhr = make_tex_srv(item, tex.Get(), DXGI_FORMAT_R8_UNORM, srv);
+                SmallRead back;
+                if (SUCCEEDED(lhr) &&
+                    render_to_readback(item, srv.Get(), r8_ps.Get(),
+                                       DXGI_FORMAT_R8_UNORM, 1, &back)) {
+                    const ByteScan b =
+                        byte_scan(back, size, size, want_box, check_box);
+                    print_byte_item(item, b);
+                    ok = b.ok;
+                } else {
+                    out("MODE=%s ITEM=%s RESULT=FAIL"
+                        " reason=dynamic_texture_readback_failed\n", path, item);
+                }
+            } else {
+                out("MODE=%s ITEM=%s RESULT=FAIL reason=dynamic_texture_map_failed\n",
+                    path, item);
+            }
+        } else {
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=dynamic_texture_create_failed\n",
+                path, item);
+        }
+        if (ok) dyn_tex_ok = true;
+        else {
+            ++failed;
+            ++g_failures;
+        }
+    }
+
+    out("MODE=%s SUMMARY items=%d failed=%d driver=%s texture_update_box=%s"
+        " texture_copy_box=%s dynamic_buffer_map=%s dynamic_texture_map=%s\n",
+        path, items, failed, warp ? "warp" : "hardware",
+        update_ok ? "yes" : "no", copy_ok ? "yes" : "no",
+        buffer_ok ? "yes" : "no", dyn_tex_ok ? "yes" : "no");
+    if (failed == 0) {
+        out("MODE=%s VERDICT=upload_paths_bit_exact driver=%s items=%d\n", path,
+            warp ? "warp" : "hardware", items);
+    } else if (!update_ok && !copy_ok) {
+        out("MODE=%s VERDICT=update_and_copy_broken driver=%s"
+            " dynamic_buffer=%s dynamic_texture=%s\n", path,
+            warp ? "warp" : "hardware", buffer_ok ? "exact" : "failed",
+            dyn_tex_ok ? "exact" : "failed");
+    } else if (!buffer_ok) {
+        out("MODE=%s VERDICT=dynamic_buffer_broken driver=%s\n", path,
+            warp ? "warp" : "hardware");
+    } else if (!dyn_tex_ok) {
+        out("MODE=%s VERDICT=dynamic_texture_broken driver=%s\n", path,
+            warp ? "warp" : "hardware");
+    } else {
+        out("MODE=%s VERDICT=upload_paths_partial driver=%s\n", path,
+            warp ? "warp" : "hardware");
+    }
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -5864,6 +6668,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "uint-order") return run_uint_order(warp, debug_layer);
     if (mode == "uint-rt-extreme") return run_uint_rt_extreme(warp, debug_layer);
     if (mode == "typed-buffer-srv") return run_typed_buffer_srv(warp, debug_layer);
+    if (mode == "upload-paths") return run_upload_paths(warp, debug_layer);
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
@@ -5949,6 +6754,20 @@ void usage() {
         "                    its own buffer, SRV, draw and readback; the SRV desc\n"
         "                    and the staged initial-data check are printed, and\n"
         "                    WARP must be bit exact\n"
+        "  --mode upload-paths  the upload half of the text path: four independent\n"
+        "                    writes of a known 32x32 block into 64x64 resources,\n"
+        "                    each followed by a fetch and an exact readback.\n"
+        "                    texture_update_box clears a DEFAULT R8_UNORM target\n"
+        "                    and UpdateSubresource a box at (4,4);\n"
+        "                    texture_copy_box clears it and CopySubresourceRegion\n"
+        "                    a 32x32 staging texture to (4,4); dynamic_buffer_map\n"
+        "                    Map(WRITE_DISCARD)s 64 R32_UINT words and fetches them\n"
+        "                    through a typed SRV into R32_FLOAT; dynamic_texture_map\n"
+        "                    Map(WRITE_DISCARD)s the block into a DYNAMIC R8_UNORM\n"
+        "                    texture and judges only the written block. Every item\n"
+        "                    prints the stage/hr trail and expected/actual_min/\n"
+        "                    actual_max/mismatches/all_zero; the texture cases also\n"
+        "                    require the outside of the box to stay clear-zero\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -6017,6 +6836,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("uint-rt-extreme");
             } else if (value == L"typed-buffer-srv") {
                 modes.push_back("typed-buffer-srv");
+            } else if (value == L"upload-paths") {
+                modes.push_back("upload-paths");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
