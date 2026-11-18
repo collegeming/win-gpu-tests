@@ -6956,6 +6956,15 @@ const char* kIntPsUint1 =
 
 const char* kIntPsConst = "float4 main() : SV_Target { return float4(0.0, 0.0, 0.0, 1.0); }\n";
 
+const char* kIntVsConstVarying =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.g = float4(0.5, 0.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7072,6 +7081,19 @@ int run_int_attribs(bool warp, bool debug_layer) {
                            static_cast<size_t>(kIntSize / 2) * 4;
         const int got[4] = {back.bytes[off + 0], back.bytes[off + 1], back.bytes[off + 2],
                             back.bytes[off + 3]};
+        auto sample = [&](int x, int* dst) {
+            const size_t o = static_cast<size_t>(kIntSize / 2) * back.pitch +
+                             static_cast<size_t>(x) * 4;
+            dst[0] = back.bytes[o + 0];
+            dst[1] = back.bytes[o + 1];
+            dst[2] = back.bytes[o + 2];
+        };
+        int s0[3], s64[3], s192[3], s255[3];
+        sample(0, s0); sample(64, s64); sample(192, s192); sample(255, s255);
+        out("MODE=%s ITEM=%s SAMPLES x0=%d,%d,%d x64=%d,%d,%d x128=%d,%d,%d"
+            " x192=%d,%d,%d x255=%d,%d,%d\n", path, item, s0[0], s0[1], s0[2], s64[0],
+            s64[1], s64[2], got[0], got[1], got[2], s192[0], s192[1], s192[2], s255[0],
+            s255[1], s255[2]);
         bool ok = true;
         for (int i = 0; i < 4; ++i) {
             if (abs(got[i] - expected[i]) > 1) ok = false;
@@ -7185,6 +7207,36 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=pos_derived RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case C: constant varying 0.5 -> 128; isolates the VS->PS link from any
+    // attribute fetch beyond position.
+    {
+        Pair p;
+        if (!build_pair("pos_const_varying", kIntVsConstVarying, kIntPsFloat4, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=pos_const_varying RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {0, 0, 128, 255};
+                check_center("pos_const_varying", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=pos_const_varying RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
