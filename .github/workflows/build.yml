@@ -96,7 +96,7 @@ jobs:
       - name: Build offscreen text glyph probe (D3D11+D2D/DirectWrite, GDI)
         shell: cmd
         run: |
-          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 text_glyph_probe.cpp /Fe:text_glyph_probe_arm64.exe d3d11.lib dxgi.lib d2d1.lib dwrite.lib gdi32.lib user32.lib ole32.lib version.lib
+          cl /nologo /EHsc /O2 /W4 /std:c++17 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 text_glyph_probe.cpp /Fe:text_glyph_probe_arm64.exe d3d11.lib dxgi.lib d2d1.lib dwrite.lib d3dcompiler.lib gdi32.lib user32.lib ole32.lib version.lib
           if errorlevel 1 exit /b 1
       - name: Self-test, runner evidence snapshot and package text glyph probe
         shell: pwsh
@@ -117,9 +117,9 @@ jobs:
           if (-not (Select-String -Path "$dir\self-test.txt" -SimpleMatch 'SELF_TEST=PASS' -Quiet)) { throw 'Missing SELF_TEST=PASS' }
           # Runner evidence only. The hosted runner has no target GPU, so these
           # exits are recorded, never gated; device acceptance is separate.
-          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --log "$dir\runner-hardware.txt" | Out-Null
+          & $exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --log "$dir\runner-hardware.txt" | Out-Null
           $hwExit = $LASTEXITCODE
-          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --log "$dir\runner-warp.txt" | Out-Null
+          & $exe --driver warp --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --log "$dir\runner-warp.txt" | Out-Null
           $warpExit = $LASTEXITCODE
           New-Item -ItemType Directory text-glyph-package | Out-Null
           Copy-Item $exe, text_glyph_probe.cpp text-glyph-package
@@ -138,8 +138,9 @@ jobs:
           runner_hardware_exit=$hwExit (hosted runner evidence, not gated)
           runner_warp_exit=$warpExit (hosted runner evidence, not gated)
           hardware_device=NOT_TESTED
-          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush (additive; full == no --mode)
+          modes=full,d2d-primitives,dwrite-offscreen,bitmap-brush,a8-contract,drawline (additive; full == no --mode)
           v2_result=NOT_TESTED (mode items judge expected ink/colour per region; device run decides)
+          v3_result=NOT_TESTED (a8-contract judges A8_UNORM values; drawline separates AA paths)
           "@ | Set-Content text-glyph-package\build-info.txt -Encoding utf8
           @'
           text_glyph_probe_arm64.exe
@@ -148,7 +149,9 @@ jobs:
           text_glyph_probe_arm64.exe --mode d2d-primitives
           text_glyph_probe_arm64.exe --mode dwrite-offscreen
           text_glyph_probe_arm64.exe --mode bitmap-brush
-          text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --log C:\path\probe.txt
+          text_glyph_probe_arm64.exe --mode a8-contract
+          text_glyph_probe_arm64.exe --mode drawline
+          text_glyph_probe_arm64.exe --mode full --mode d2d-primitives --mode dwrite-offscreen --mode bitmap-brush --mode a8-contract --mode drawline --log C:\path\probe.txt
 
           Console ARM64. Creates no window, requests no focus/activation, reads no screen.
           Paths run in order d3d11_d2d then gdi; each prints its stages with HRESULT and
@@ -191,6 +194,51 @@ jobs:
           A FAIL on geometry items but PASS on GDI points at the D2D/D3D path, not at fonts.
           A FAIL only on the text item points at glyph rasterization or glyph texture
           sampling; compare dwrite-offscreen and bitmap-brush to narrow it further.
+
+          v3 diagnostic modes (also additive; v1/v2 lines are unchanged):
+          a8-contract pins down the A8_UNORM value contract, because text masks are normally
+            sampled from A8 and a wrong channel or a lost fractional value looks exactly like
+            "no glyphs". It first prints CheckFormatSupport for A8_UNORM (texture2d /
+            render_target / blendable / shader_sample / typed_uav), then five independent
+            cases, each on its OWN 256x256 A8_UNORM texture cleared by itself and read back
+            through its own staging copy:
+              clear_zero            Clear(0,0,0,0)                 expected 0
+              ps_half_no_blend      PS float4(1,1,1,0.5), blend off expected 128 or 255
+              ps_half_src_alpha_blend  same PS, SRC_ALPHA/INV_SRC_ALPHA, cleared 0
+                                                                expected 64, 128 or 255
+              clear_one             Clear(0,0,0,1)                 expected 255
+              uav_store_then_srv    typed UAV store float4(0.5,0.5,0.5,0.5) at 128,128, then
+                                    an SRV sample into a second A8 target  expected 128
+            Several expected values are listed where A8_UNORM makes more than one outcome
+            legal: the format has one channel and does not fix which shader component feeds
+            it, so float4(1,1,1,0.5) may be stored from .x (255) or from .w (128), and the
+            blend may land on 64 (.w source through the RGB equations), 128 or 255. The
+            UAV case stores 0.5 in all four channels precisely so its expected value stays
+            unambiguous, and the .x-vs-.w question is answered once, by ps_half_no_blend.
+            Five points (128,128 / 16,16 / 240,240 / 64,192 / 192,64) must each be within
+            +-2 of one of the listed values, so a single lucky pixel cannot pass a case.
+            A8CASE lines carry hr_ps / hr_draw / value / expected / RESULT; A8DETAIL lines
+            carry the five points, tolerance, hr_map and case detail. hr_draw is
+            ID3D11Device::GetDeviceRemovedReason() taken after the draw plus Flush, because
+            ID3D11DeviceContext::Draw returns void and a removed device or a hang is
+            observable only there. hr_ps is the shader compile/create code (S_OK where the
+            case uses no shader).
+            Reading: clear_zero FAIL means the readback channel is not what this probe
+            assumes. ps_half_no_blend value 128 or 255 both mean the fractional value was
+            quantized, not truncated, and which one also tells you which shader component
+            A8 stores. ps_half_src_alpha_blend FAIL at value 0 means the blend dropped the
+            source entirely, which is the path a DirectWrite mask blend would take; 64 vs
+            128 vs 255 tells you which blend equations and which component applied.
+            uav_store_then_srv separates the A8 store side from the A8 sample side.
+          drawline re-draws a 2px horizontal line at y=100, x=8..240, once with
+            D2D1_ANTIALIAS_MODE_ANTIALIASED and once with ALIASED, each on its own target and
+            readback, and judges region 0,84,512,118. A 1px hairline measured ~100% white
+            while a 64x64 solid fill measured correct in the v2 device run, so the suspicion
+            is the AA/coverage rasterizer rather than the whole D2D pipeline. This item needs
+            dark > 50 and a dark bbox at least 100 px wide, because a long thin line is
+            expected to be sparse in a tall analysis rect.
+          Modes never alter the full-mode numbers; a mode failure only changes the exit code
+          and SUMMARY_MODES.
           '@ | Set-Content text-glyph-package\usage.txt -Encoding utf8
           Get-ChildItem text-glyph-package -File -Recurse | Sort-Object FullName | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, ([IO.Path]::GetRelativePath((Resolve-Path text-glyph-package).Path, $_.FullName))

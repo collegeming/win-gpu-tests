@@ -31,6 +31,7 @@
 #include <dxgi.h>
 #include <d2d1.h>
 #include <dwrite.h>
+#include <d3dcompiler.h>
 #include <winver.h>
 #include <wrl/client.h>
 #include <cstdarg>
@@ -777,6 +778,15 @@ int run_self_test() {
 //   --mode bitmap-brush     a 1x1 known-colour bitmap brush and a 16x16
 //                           DrawBitmap, to separate texture sampling from
 //                           geometry.
+//   --mode a8-contract      the A8_UNORM value contract through Clear, a pixel
+//                           shader with and without blending, and a typed UAV
+//                           store followed by an SRV sample. Text masks are A8,
+//                           so a wrong channel or a truncated fraction looks
+//                           exactly like "no glyphs".
+//   --mode drawline         one long 2px line, antialiased and aliased, each on
+//                           its own target: a solid fill measured correct while
+//                           a 1px stroke measured white points at the coverage
+//                           rasterizer rather than at the D2D surface path.
 //
 // Items are judged by presence of the expected pixels, not by the full-mode
 // text rule: a solid fill is expected to be 100% dark and single-coloured, so
@@ -986,9 +996,20 @@ const char* color_reason(unsigned long long matched, long long area) {
     return nullptr;
 }
 
-const char* print_ink_item(const char* mode, const char* item, const char* extra,
-                           const PixelStats& s) {
-    const char* reason = ink_reason(s);
+const char* line_reason(const PixelStats& s) {
+    if (s.dark <= kMinDarkPixels) return "dark_pixels_too_few";
+    if (!s.dark_bbox_valid) return "dark_bbox_missing";
+    const int w = s.dark_right - s.dark_left;
+    const int h = s.dark_bottom - s.dark_top;
+    // A 2px stroke is legitimately flat, so only width and a lower bound of
+    // one row are required here; the text rule's 40x8 would reject it.
+    if (w < 100) return "dark_bbox_too_narrow";
+    if (h < 1) return "dark_bbox_too_flat";
+    return nullptr;
+}
+
+const char* print_ink_item_with(const char* mode, const char* item, const char* extra,
+                                const PixelStats& s, const char* reason) {
     char bbox[64] = "none";
     if (s.nonwhite_bbox_valid) {
         _snprintf_s(bbox, sizeof(bbox), _TRUNCATE, "%d,%d,%d,%d", s.nonwhite_left,
@@ -1001,6 +1022,16 @@ const char* print_ink_item(const char* mode, const char* item, const char* extra
         s.dark_bbox_valid ? s.dark_bottom - s.dark_top : 0, reason ? reason : "ok");
     if (reason) ++g_failures;
     return reason;
+}
+
+const char* print_ink_item(const char* mode, const char* item, const char* extra,
+                           const PixelStats& s) {
+    return print_ink_item_with(mode, item, extra, s, ink_reason(s));
+}
+
+const char* print_line_item(const char* mode, const char* item, const char* extra,
+                            const PixelStats& s) {
+    return print_ink_item_with(mode, item, extra, s, line_reason(s));
 }
 
 const char* print_color_item(const char* mode, const char* item, Rgba want, Rgba got,
@@ -1295,10 +1326,670 @@ int run_bitmap_brush(bool warp, bool debug_layer) {
     return (red_reason || green_reason) ? 2 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v3: A8_UNORM value contract, and AA-dependent line drawing.
+//
+// The A8 contract mode answers: for an A8_UNORM render target, does a value
+// written by Clear, by a pixel shader, by a blended pixel shader, or by a typed
+// UAV store land in the single channel that a readback sees as R?
+//
+// Every case gets its own texture and its own clear, so no case can be polluted
+// by a previous write. Five probe points are read and every one of them must be
+// within kA8Tolerance of the expected value.
+// ---------------------------------------------------------------------------
+
+constexpr int kA8Size = 256;
+constexpr UINT kA8Tolerance = 2;
+
+const char* kA8Vs =
+    "struct VSOut { float4 pos : SV_POSITION; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kA8PsHalf =
+    "float4 main() : SV_Target {\n"
+    "    return float4(1.0, 1.0, 1.0, 0.5);\n"
+    "}\n";
+
+// The shader replicates the sampled value into all four channels: for A8_UNORM
+// the readback channel and the shader component that carries the value are not
+// guaranteed to agree, and this case must measure the sampled value, not the
+// component mapping.
+const char* kA8PsSample =
+    "Texture2D<float4> src : register(t0);\n"
+    "float4 main() : SV_Target {\n"
+    "    float4 s = src.Load(int3(128, 128, 0));\n"
+    "    float v = max(s.r, s.a);\n"
+    "    return float4(v, v, v, v);\n"
+    "}\n";
+
+// The value is 0.5 in all four channels on purpose: A8_UNORM does not promise
+// which shader component it stores, so a value written only to .w would be
+// ambiguous here. Storing the same value everywhere makes the expected readback
+// (128) independent of the channel question. The channel question is measured
+// once, separately, by ps_half_no_blend, which writes .x=1.0 and .w=0.5.
+const char* kA8CsStore =
+    "RWTexture2D<float4> dst : register(u0);\n"
+    "[numthreads(16, 16, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) {\n"
+    "    if (id.x == 128u && id.y == 128u) dst[id.xy] = float4(0.5, 0.5, 0.5, 0.5);\n"
+    "}\n";
+
+HRESULT a8_compile(const char* path, const char* label, const char* source, const char* hi,
+                   const char* lo, ID3DBlob** blob, const char** used) {
+    ID3DBlob* errors = nullptr;
+    HRESULT hr = D3DCompile(source, strlen(source), label, nullptr, nullptr, "main", hi, 0, 0,
+                            blob, &errors);
+    if (SUCCEEDED(hr)) {
+        *used = hi;
+        out("MODE=%s stage=compile_shader shader=%s profile=%s hr=0x%08lx\n", path, label, hi,
+            static_cast<unsigned long>(hr));
+        return hr;
+    }
+    if (errors) {
+        const char* text = static_cast<const char*>(errors->GetBufferPointer());
+        char first[200];
+        size_t n = 0;
+        while (n < sizeof(first) - 1 && text[n] != 0 && text[n] != '\n' && text[n] != '\r') {
+            first[n] = text[n];
+            ++n;
+        }
+        first[n] = 0;
+        out("MODE=%s stage=compile_shader shader=%s profile=%s hr=0x%08lx error=\"%s\"\n", path,
+            label, hi, static_cast<unsigned long>(hr), first);
+        errors->Release();
+    }
+    ID3DBlob* retry = nullptr;
+    hr = D3DCompile(source, strlen(source), label, nullptr, nullptr, "main", lo, 0, 0, &retry,
+                    nullptr);
+    out("MODE=%s stage=compile_shader shader=%s profile=%s retry_hr=0x%08lx\n", path, label, lo,
+        static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        *blob = retry;
+        *used = lo;
+    }
+    return hr;
+}
+
+void a8_support(const char* path, ID3D11Device* device) {
+    UINT flags = 0;
+    const HRESULT hr = device->CheckFormatSupport(DXGI_FORMAT_A8_UNORM, &flags);
+    const char* yes_no[] = {"no", "yes"};
+    out("MODE=%s stage=format_support fmt=A8_UNORM hr=0x%08lx flags=0x%08x texture2d=%s"
+        " render_target=%s blendable=%s shader_sample=%s typed_uav=%s\n", path,
+        static_cast<unsigned long>(hr), flags,
+        yes_no[(flags & D3D11_FORMAT_SUPPORT_TEXTURE2D) ? 1 : 0],
+        yes_no[(flags & D3D11_FORMAT_SUPPORT_RENDER_TARGET) ? 1 : 0],
+        yes_no[(flags & D3D11_FORMAT_SUPPORT_BLENDABLE) ? 1 : 0],
+        yes_no[(flags & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) ? 1 : 0],
+        yes_no[(flags & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) ? 1 : 0]);
+}
+
+bool a8_target(const char* path, ID3D11Device* device, UINT bind_flags,
+               ComPtr<ID3D11Texture2D>& tex, ComPtr<ID3D11Texture2D>& staging) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = kA8Size;
+    desc.Height = kA8Size;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = bind_flags;
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &tex);
+    out("MODE=%s stage=create_a8_texture size=%dx%d bind=0x%x hr=0x%08lx\n", path, kA8Size,
+        kA8Size, bind_flags, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) return false;
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = device->CreateTexture2D(&staging_desc, nullptr, &staging);
+    out("MODE=%s stage=create_a8_staging hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
+}
+
+struct A8Probe {
+    unsigned values[5] = {0, 0, 0, 0, 0};
+    unsigned center = 0;
+    bool ok = false;
+    HRESULT hr_map = E_FAIL;
+};
+
+A8Probe a8_read(const char* path, ID3D11DeviceContext* context, ID3D11Texture2D* tex,
+                ID3D11Texture2D* staging) {
+    A8Probe probe;
+    context->CopyResource(staging, tex);
+    context->Flush();
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    probe.hr_map = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(probe.hr_map)) {
+        out("MODE=%s stage=map_a8_read hr=0x%08lx\n", path,
+            static_cast<unsigned long>(probe.hr_map));
+        return probe;
+    }
+    const int xs[5] = {128, 16, 240, 64, 192};
+    const int ys[5] = {128, 16, 240, 192, 64};
+    for (int i = 0; i < 5; ++i) {
+        const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) +
+                             static_cast<size_t>(ys[i]) * mapped.RowPitch;
+        probe.values[i] = row[xs[i]];
+    }
+    probe.center = probe.values[0];
+    probe.ok = true;
+    context->Unmap(staging, 0);
+    return probe;
+}
+
+unsigned a8_absdiff(unsigned a, unsigned b) {
+    return a > b ? a - b : b - a;
+}
+
+// hr_ps is the pixel shader creation/compile result for this case (S_OK for the
+// clear-only cases, which use no shader at all). hr_draw is
+// ID3D11Device::GetDeviceRemovedReason() taken after the draw plus Flush, since
+// ID3D11DeviceContext::Draw returns void; a device removal or hang shows up here
+// and nowhere else. hr_map is reported separately on the A8DETAIL line.
+//
+// Several expected values are allowed where the D3D11 format rules make more than
+// one outcome legal for A8_UNORM, e.g. a shader output float4(1,1,1,0.5) may be
+// stored from .x (255) or from .w (128) because A8 has a single channel and does
+// not fix which shader component feeds it. Every allowed value is listed on the
+// A8CASE line, so a legal-but-unexpected mapping is visible instead of being
+// reported as a device defect.
+const char* print_a8_case_values(const char* mode, const char* name, HRESULT hr_ps,
+                                 HRESULT hr_draw, const A8Probe& probe,
+                                 const unsigned* expected, int expected_count,
+                                 const char* detail) {
+    const char* reason = nullptr;
+    if (!probe.ok) {
+        reason = "map_read_failed";
+    } else {
+        for (int i = 0; i < 5; ++i) {
+            bool matched = false;
+            for (int e = 0; e < expected_count; ++e) {
+                if (a8_absdiff(probe.values[i], expected[e]) <= kA8Tolerance) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                reason = "value_mismatch";
+                break;
+            }
+        }
+    }
+    char expected_text[48] = "0";
+    size_t used = 0;
+    for (int e = 0; e < expected_count && used < sizeof(expected_text) - 8; ++e) {
+        const int written = _snprintf_s(expected_text + used, sizeof(expected_text) - used,
+                                        _TRUNCATE, e ? "|%u" : "%u", expected[e]);
+        if (written <= 0) break;
+        used += static_cast<size_t>(written);
+    }
+    out("A8CASE %s hr_ps=0x%08lx hr_draw=0x%08lx value=%u expected=%s RESULT=%s\n", name,
+        static_cast<unsigned long>(hr_ps), static_cast<unsigned long>(hr_draw), probe.center,
+        expected_text, reason ? "FAIL" : "PASS");
+    out("A8DETAIL %s points=%u,%u,%u,%u,%u tolerance=%u hr_map=0x%08lx detail=%s reason=%s\n",
+        name, probe.values[0], probe.values[1], probe.values[2], probe.values[3],
+        probe.values[4], kA8Tolerance, static_cast<unsigned long>(probe.hr_map),
+        detail ? detail : "-", reason ? reason : "ok");
+    out("MODE=%s ITEM=%s RESULT=%s reason=%s\n", mode, name, reason ? "FAIL" : "PASS",
+        reason ? reason : "ok");
+    if (reason) ++g_failures;
+    return reason;
+}
+
+const char* print_a8_case(const char* mode, const char* name, HRESULT hr_ps, HRESULT hr_draw,
+                          const A8Probe& probe, unsigned expected, const char* detail) {
+    return print_a8_case_values(mode, name, hr_ps, hr_draw, probe, &expected, 1, detail);
+}
+
+int run_a8_contract(bool warp, bool debug_layer) {
+    const char* path = "a8-contract";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    a8_support(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob;
+    ComPtr<ID3DBlob> ps_half_blob;
+    ComPtr<ID3DBlob> ps_sample_blob;
+    ComPtr<ID3DBlob> cs_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "a8_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "a8_ps_half", kA8PsHalf, "ps_5_0", "ps_4_0",
+                        ps_half_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "a8_ps_sample", kA8PsSample, "ps_5_0", "ps_4_0",
+                        ps_sample_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "a8_cs_store", kA8CsStore, "cs_5_0", "cs_4_0",
+                        cs_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps_half;
+    ComPtr<ID3D11PixelShader> ps_sample;
+    ComPtr<ID3D11ComputeShader> cs;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    out("MODE=%s stage=create_vs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_half_blob->GetBufferPointer(),
+                                         ps_half_blob->GetBufferSize(), nullptr, &ps_half);
+        out("MODE=%s stage=create_ps_half hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreatePixelShader(ps_sample_blob->GetBufferPointer(),
+                                         ps_sample_blob->GetBufferSize(), nullptr, &ps_sample);
+        out("MODE=%s stage=create_ps_sample hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = g.device->CreateComputeShader(cs_blob->GetBufferPointer(),
+                                          cs_blob->GetBufferSize(), nullptr, &cs);
+        out("MODE=%s stage=create_cs hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    }
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_object_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    D3D11_BLEND_DESC blend_off{};
+    blend_off.RenderTarget[0].BlendEnable = FALSE;
+    blend_off.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D11BlendState> bs_off;
+    HRESULT hr_blend_off = g.device->CreateBlendState(&blend_off, &bs_off);
+    out("MODE=%s stage=create_blend_state name=off hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_blend_off));
+
+    D3D11_BLEND_DESC blend_src_alpha{};
+    blend_src_alpha.RenderTarget[0].BlendEnable = TRUE;
+    blend_src_alpha.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blend_src_alpha.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_src_alpha.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blend_src_alpha.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_src_alpha.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    blend_src_alpha.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blend_src_alpha.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D11BlendState> bs_src_alpha;
+    HRESULT hr_blend_src = g.device->CreateBlendState(&blend_src_alpha, &bs_src_alpha);
+    out("MODE=%s stage=create_blend_state name=src_alpha_inv_src_alpha alpha=one_zero"
+        " hr=0x%08lx\n", path, static_cast<unsigned long>(hr_blend_src));
+    if (FAILED(hr_blend_off) || FAILED(hr_blend_src)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=blend_state_create_failed\n", path);
+        return 2;
+    }
+
+    // Culling off and depth off: these cases must fail on A8 value handling and
+    // on nothing else, so no raster state default may silently discard the
+    // fullscreen triangle or the covered pixels.
+    D3D11_RASTERIZER_DESC raster_desc{};
+    raster_desc.FillMode = D3D11_FILL_SOLID;
+    raster_desc.CullMode = D3D11_CULL_NONE;
+    raster_desc.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> raster;
+    HRESULT hr_raster = g.device->CreateRasterizerState(&raster_desc, &raster);
+    out("MODE=%s stage=create_rasterizer_state cull=none depth_test=default hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_raster));
+    if (FAILED(hr_raster)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rasterizer_state_create_failed\n", path);
+        return 2;
+    }
+    g.context->RSSetState(raster.Get());
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<FLOAT>(kA8Size);
+    viewport.Height = static_cast<FLOAT>(kA8Size);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    g.context->RSSetViewports(1, &viewport);
+    g.context->IASetInputLayout(nullptr);
+    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.context->VSSetShader(vs.Get(), nullptr, 0);
+
+    const float zero4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float one4[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int failed = 0;
+
+    // 1) Clear(0,0,0,0) -> 0
+    {
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!a8_target(path, g.device.Get(), D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=clear_zero RESULT=FAIL reason=a8_texture_create_failed\n", path);
+        } else {
+            ComPtr<ID3D11RenderTargetView> rtv;
+            HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv);
+            out("MODE=%s stage=create_a8_rtv item=clear_zero hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr_rtv));
+            if (FAILED(hr_rtv)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=clear_zero RESULT=FAIL reason=rtv_create_failed\n", path);
+            } else {
+                g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                g.context->ClearRenderTargetView(rtv.Get(), zero4);
+                g.context->OMSetRenderTargets(0, nullptr, nullptr);
+                g.context->Flush();
+                const HRESULT hr_reason = g.device->GetDeviceRemovedReason();
+                const A8Probe probe =
+                    a8_read(path, g.context.Get(), tex.Get(), staging.Get());
+                if (print_a8_case(path, "clear_zero", S_OK, hr_reason, probe, 0,
+                                  "clear=0,0,0,0 no_shader"))
+                    ++failed;
+            }
+        }
+    }
+
+    // 2) PS float4(1,1,1,0.5), no blend -> 128
+    {
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!a8_target(path, g.device.Get(), D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=ps_half_no_blend RESULT=FAIL reason=a8_texture_create_failed\n",
+                path);
+        } else {
+            ComPtr<ID3D11RenderTargetView> rtv;
+            HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv);
+            out("MODE=%s stage=create_a8_rtv item=ps_half_no_blend hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr_rtv));
+            if (FAILED(hr_rtv)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=ps_half_no_blend RESULT=FAIL reason=rtv_create_failed\n",
+                    path);
+            } else {
+                g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                g.context->OMSetBlendState(bs_off.Get(), blend_factor, 0xffffffff);
+                g.context->PSSetShader(ps_half.Get(), nullptr, 0);
+                g.context->ClearRenderTargetView(rtv.Get(), zero4);
+                g.context->Draw(3, 0);
+                g.context->Flush();
+                const HRESULT hr_reason = g.device->GetDeviceRemovedReason();
+                g.context->OMSetRenderTargets(0, nullptr, nullptr);
+                const A8Probe probe =
+                    a8_read(path, g.context.Get(), tex.Get(), staging.Get());
+                const unsigned expected[2] = {128, 255};
+                if (print_a8_case_values(path, "ps_half_no_blend", S_OK, hr_reason, probe,
+                                         expected, 2,
+                                         "ps=float4(1,1,1,0.5) blend=off; 128=stored_from_w"
+                                         " 255=stored_from_x"))
+                    ++failed;
+            }
+        }
+    }
+
+    // 3) Same PS with SRC_ALPHA/INV_SRC_ALPHA blending -> 128
+    {
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!a8_target(path, g.device.Get(), D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=ps_half_src_alpha_blend RESULT=FAIL"
+                " reason=a8_texture_create_failed\n", path);
+        } else {
+            ComPtr<ID3D11RenderTargetView> rtv;
+            HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv);
+            out("MODE=%s stage=create_a8_rtv item=ps_half_src_alpha_blend hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr_rtv));
+            if (FAILED(hr_rtv)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=ps_half_src_alpha_blend RESULT=FAIL"
+                    " reason=rtv_create_failed\n", path);
+            } else {
+                g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                g.context->OMSetBlendState(bs_src_alpha.Get(), blend_factor, 0xffffffff);
+                g.context->PSSetShader(ps_half.Get(), nullptr, 0);
+                g.context->ClearRenderTargetView(rtv.Get(), zero4);
+                g.context->Draw(3, 0);
+                g.context->Flush();
+                const HRESULT hr_reason = g.device->GetDeviceRemovedReason();
+                g.context->OMSetRenderTargets(0, nullptr, nullptr);
+                const A8Probe probe =
+                    a8_read(path, g.context.Get(), tex.Get(), staging.Get());
+                const unsigned expected[3] = {64, 128, 255};
+                if (print_a8_case_values(path, "ps_half_src_alpha_blend", S_OK, hr_reason,
+                                         probe, expected, 3,
+                                         "blend=src_alpha/inv_src_alpha alpha=one/zero"
+                                         " cleared=0; 64_or_128_or_255_are_legal_blends"
+                                         " 0_means_blend_dropped_the_source"))
+                    ++failed;
+            }
+        }
+    }
+
+    // 4) Clear(0,0,0,1) -> 255
+    {
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!a8_target(path, g.device.Get(), D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=clear_one RESULT=FAIL reason=a8_texture_create_failed\n", path);
+        } else {
+            ComPtr<ID3D11RenderTargetView> rtv;
+            HRESULT hr_rtv = g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv);
+            out("MODE=%s stage=create_a8_rtv item=clear_one hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr_rtv));
+            if (FAILED(hr_rtv)) {
+                ++failed;
+                ++g_failures;
+                out("MODE=%s ITEM=clear_one RESULT=FAIL reason=rtv_create_failed\n", path);
+            } else {
+                g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                g.context->ClearRenderTargetView(rtv.Get(), one4);
+                g.context->OMSetRenderTargets(0, nullptr, nullptr);
+                g.context->Flush();
+                const HRESULT hr_reason = g.device->GetDeviceRemovedReason();
+                const A8Probe probe =
+                    a8_read(path, g.context.Get(), tex.Get(), staging.Get());
+                if (print_a8_case(path, "clear_one", S_OK, hr_reason, probe, 255,
+                                  "clear=0,0,0,1 no_shader"))
+                    ++failed;
+            }
+        }
+    }
+
+    // 5) typed UAV store float4(0,0,0,0.5), then SRV sample -> 128
+    {
+        ComPtr<ID3D11Texture2D> src_tex, src_staging;
+        const UINT src_bind = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if (!a8_target(path, g.device.Get(), src_bind, src_tex, src_staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=uav_store_then_srv RESULT=FAIL"
+                " reason=a8_uav_texture_create_failed\n", path);
+        } else {
+            ComPtr<ID3D11UnorderedAccessView> uav;
+            HRESULT hr_uav = g.device->CreateUnorderedAccessView(src_tex.Get(), nullptr, &uav);
+            out("MODE=%s stage=create_a8_uav hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr_uav));
+            ComPtr<ID3D11ShaderResourceView> srv;
+            HRESULT hr_srv = g.device->CreateShaderResourceView(src_tex.Get(), nullptr, &srv);
+            out("MODE=%s stage=create_a8_srv hr=0x%08lx\n", path,
+                static_cast<unsigned long>(hr_srv));
+            if (FAILED(hr_uav) || FAILED(hr_srv)) {
+                ++failed;
+                ++g_failures;
+                out("A8CASE uav_store_then_srv hr_ps=0x%08lx hr_draw=0x%08lx value=0"
+                    " expected=128 RESULT=FAIL\n", static_cast<unsigned long>(hr_uav),
+                    static_cast<unsigned long>(hr_srv));
+                out("A8DETAIL uav_store_then_srv points=0,0,0,0,0 tolerance=%u hr_map=0x%08lx"
+                    " detail=uav_or_srv_create_failed reason=\n", kA8Tolerance, 0ul);
+                out("MODE=%s ITEM=uav_store_then_srv RESULT=FAIL reason=uav_or_srv_create_failed\n",
+                    path);
+            } else {
+                g.context->CSSetShader(cs.Get(), nullptr, 0);
+                ID3D11UnorderedAccessView* uavs[1] = {uav.Get()};
+                g.context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+                g.context->Dispatch(kA8Size / 16, kA8Size / 16, 1);
+                ID3D11UnorderedAccessView* no_uavs[1] = {nullptr};
+                g.context->CSSetUnorderedAccessViews(0, 1, no_uavs, nullptr);
+                g.context->CSSetShader(nullptr, nullptr, 0);
+                g.context->Flush();
+                const HRESULT hr_dispatch = g.device->GetDeviceRemovedReason();
+                const A8Probe uav_stage =
+                    a8_read(path, g.context.Get(), src_tex.Get(), src_staging.Get());
+
+                ComPtr<ID3D11Texture2D> dst_tex, dst_staging;
+                if (!a8_target(path, g.device.Get(), D3D11_BIND_RENDER_TARGET, dst_tex,
+                               dst_staging)) {
+                    ++failed;
+                    ++g_failures;
+                    out("MODE=%s ITEM=uav_store_then_srv RESULT=FAIL"
+                        " reason=dst_texture_create_failed\n", path);
+                } else {
+                    ComPtr<ID3D11RenderTargetView> rtv;
+                    HRESULT hr_rtv =
+                        g.device->CreateRenderTargetView(dst_tex.Get(), nullptr, &rtv);
+                    out("MODE=%s stage=create_a8_rtv item=uav_store_then_srv hr=0x%08lx\n",
+                        path, static_cast<unsigned long>(hr_rtv));
+                    if (FAILED(hr_rtv)) {
+                        ++failed;
+                        ++g_failures;
+                        out("MODE=%s ITEM=uav_store_then_srv RESULT=FAIL"
+                            " reason=rtv_create_failed\n", path);
+                    } else {
+                        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                        g.context->OMSetBlendState(bs_off.Get(), blend_factor, 0xffffffff);
+                        g.context->PSSetShader(ps_sample.Get(), nullptr, 0);
+                        g.context->PSSetShaderResources(0, 1, srv.GetAddressOf());
+                        g.context->ClearRenderTargetView(rtv.Get(), zero4);
+                        g.context->Draw(3, 0);
+                        ID3D11ShaderResourceView* no_srvs[1] = {nullptr};
+                        g.context->PSSetShaderResources(0, 1, no_srvs);
+                        g.context->Flush();
+                        const HRESULT hr_reason = g.device->GetDeviceRemovedReason();
+                        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+                        const A8Probe probe =
+                            a8_read(path, g.context.Get(), dst_tex.Get(), dst_staging.Get());
+                        char detail[160];
+                        _snprintf_s(detail, sizeof(detail), _TRUNCATE,
+                                    "uav_stage_value=%u dispatch_hr=0x%08lx uav_store_point=128,128"
+                                    " srv_load_point=128,128", uav_stage.center,
+                                    static_cast<unsigned long>(hr_dispatch));
+                        const unsigned expected[1] = {128};
+                        if (print_a8_case_values(path, "uav_store_then_srv", S_OK, hr_reason,
+                                                 probe, expected, 1, detail))
+                            ++failed;
+                    }
+                }
+            }
+        }
+    }
+
+    out("MODE=%s SUMMARY cases=5 failed=%d format=A8_UNORM size=%dx%d probe_points=5"
+        " tolerance=%u\n", path, failed, kA8Size, kA8Size, kA8Tolerance);
+    return failed ? 2 : 0;
+}
+
+// Optional companion mode: is the lost 1px stroke an antialiasing-path problem?
+int run_drawline(bool warp, bool debug_layer) {
+    const char* path = "drawline";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    struct LineCase {
+        D2D1_ANTIALIAS_MODE mode;
+        const char* name;
+    };
+    const LineCase cases[] = {
+        {D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, "line_per_primitive"},
+        {D2D1_ANTIALIAS_MODE_ALIASED, "line_aliased"},
+    };
+
+    int failed = 0;
+    for (const LineCase& c : cases) {
+        Target t;
+        if (!target_create(path, g, warp, t)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path, c.name);
+            continue;
+        }
+        t.rt->SetAntialiasMode(c.mode);
+        const D2D1_ANTIALIAS_MODE effective = t.rt->GetAntialiasMode();
+        ComPtr<ID2D1SolidColorBrush> black;
+        HRESULT hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s stage=d2d_solid_brush hr=0x%08lx RESULT=FAIL\n", path, c.name,
+                static_cast<unsigned long>(hr));
+            continue;
+        }
+        t.rt->BeginDraw();
+        t.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
+        t.rt->DrawLine(D2D1::Point2F(8.0f, 100.0f), D2D1::Point2F(240.0f, 100.0f), black.Get(),
+                       2.0f);
+        hr = t.rt->EndDraw();
+        char extra[96];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " requested_aa=%d effective_aa=%d end_draw_hr=0x%08lx",
+                    static_cast<int>(c.mode), static_cast<int>(effective),
+                    static_cast<unsigned long>(hr));
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=end_draw_failed\n", path, c.name, extra);
+            continue;
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (!target_map(path, g, t, mapped)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s%s RESULT=FAIL reason=map_read_failed\n", path, c.name, extra);
+            continue;
+        }
+        const PixelStats s =
+            analyze(static_cast<const uint8_t*>(mapped.pData),
+                    static_cast<int>(mapped.RowPitch), kWidth, kHeight, RECT{0, 84, 512, 118});
+        g.context->Unmap(t.staging.Get(), 0);
+        if (print_line_item(path, c.name, extra, s)) ++failed;
+    }
+    out("MODE=%s SUMMARY items=%d failed=%d line=y100 x8..240 width=2"
+        " ink_rule=dark_gt_50_and_bbox_width_ge_100\n", path,
+        static_cast<int>(ARRAYSIZE(cases)), failed);
+    return failed ? 2 : 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "d2d-primitives") return run_d2d_primitives(warp, debug_layer);
     if (mode == "dwrite-offscreen") return run_dwrite_offscreen(warp, debug_layer);
     if (mode == "bitmap-brush") return run_bitmap_brush(warp, debug_layer);
+    if (mode == "a8-contract") return run_a8_contract(warp, debug_layer);
+    if (mode == "drawline") return run_drawline(warp, debug_layer);
     out("MODE=%s RESULT=FAIL reason=unknown_mode\n", mode.c_str());
     return 2;
 }
@@ -1314,6 +2005,10 @@ void usage() {
         "                    each on its own texture and readback\n"
         "  --mode bitmap-brush  1x1 known-colour bitmap brush + DrawBitmap,\n"
         "                    separates texture sampling from geometry\n"
+        "  --mode a8-contract  A8_UNORM value contract: clear 0/255, PS 0.5 with and\n"
+        "                    without blending, typed UAV store then SRV sample\n"
+        "  --mode drawline   long 2px line, antialiased vs aliased, on separate\n"
+        "                    targets\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -1352,6 +2047,10 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("dwrite-offscreen");
             } else if (value == L"bitmap-brush") {
                 modes.push_back("bitmap-brush");
+            } else if (value == L"a8-contract") {
+                modes.push_back("a8-contract");
+            } else if (value == L"drawline") {
+                modes.push_back("drawline");
             } else {
                 out("invalid --mode=%s\n", utf8(value.c_str()).c_str());
                 usage();
