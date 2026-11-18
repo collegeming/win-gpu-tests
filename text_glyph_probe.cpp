@@ -7143,6 +7143,23 @@ const char* kIntPsTextFlat4 =
     "};\n"
     "float4 main(PSIn i) : SV_Target { return float4(i.a, i.b, i.c, i.d); }\n";
 
+// Minimal mixed-width repro: SV_Position + a 2-wide varying + a used 4-wide
+// varying. If the linkage packs by cumulative components instead of
+// (location, component) pairs, the second varying reads shifted data.
+const char* kIntVsShiftCheck =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 t : TEXY; float4 u : PADY; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.t = float2(0.25, 0.75);\n"
+    "    o.u = float4(0.1, 0.2, 0.3, 0.4);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsShiftCheck =
+    "struct PSIn { float4 pos : SV_Position; float2 t : TEXY; float4 u : PADY; };\n"
+    "float4 main(PSIn i) : SV_Target { return i.u; }\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7856,7 +7873,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
-                const int expected[4] = {128, 64, 191, 255};
+                const int expected[4] = {191, 64, 128, 255};
                 check_center("text_shape", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -7894,7 +7911,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kInstData, sizeof(kInstData),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, inst)) {
                 draw_quad(p, layout, pos.Get(), 8, inst.Get(), 16, true);
-                const int expected[4] = {64, 128, 191, 255};
+                const int expected[4] = {191, 128, 64, 255};
                 check_center("perinst_svpos", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -7931,7 +7948,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), V, sizeof(V),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 24, nullptr, 0, false);
-                const int expected[4] = {64, 128, 191, 255};
+                const int expected[4] = {191, 128, 64, 255};
                 check_center("attr4_svpos", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -7967,7 +7984,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), V, sizeof(V),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 16, nullptr, 0, false);
-                const int expected[4] = {191, 64, 0, 255};
+                const int expected[4] = {0, 64, 191, 255};
                 check_center("attr2_svpos", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -8007,7 +8024,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), V, sizeof(V),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 24, nullptr, 0, false);
-                const int expected[4] = {64, 191, 0, 255};
+                const int expected[4] = {0, 191, 64, 255};
                 check_center("attr2two_svpos", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -8036,7 +8053,7 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
-                const int expected[4] = {191, 64, 0, 255};
+                const int expected[4] = {0, 64, 191, 255};
                 check_center("text_vec2", p, expected);
             } else {
                 ++failed; ++g_failures;
@@ -8065,11 +8082,40 @@ int run_int_attribs(bool warp, bool debug_layer) {
                 create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
                               D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
                 draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
-                const int expected[4] = {64, 128, 191, 255};
+                const int expected[4] = {191, 128, 64, 255};
                 check_center("text_flat4", p, expected);
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=text_flat4 RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case Y2: minimal mixed-width repro, three inputs only.
+    {
+        Pair p;
+        if (!build_pair("shift_check", kIntVsShiftCheck, kIntPsShiftCheck, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=shift_check RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {77, 51, 26, 102};
+                check_center("shift_check", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=shift_check RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
