@@ -7026,6 +7026,53 @@ const char* kIntPsFlatGlyphSvpos =
     "struct PSIn { float4 pos : SV_Position; nointerpolation float4 g : GLYPH; };\n"
     "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
 
+// v20: the text pair's exact varying shapes under aligned registers. The VS
+// writes a const vec2 at register 1 (noperspective on the FS side) and four
+// const scalars packed into register 2 components 0-3 (flat on the FS side).
+const char* kIntVsTextShape =
+    "struct VSIn { float2 pos : POSITION; };\n"
+    "struct VSOut {\n"
+    "    float4 pos : SV_POSITION;\n"
+    "    float2 t : TEXY;\n"
+    "    float4 pad : PADY;\n"
+    "    float a : G8; float b : G9; float c : G10; float d : G11;\n"
+    "};\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0);\n"
+    "    o.t = float2(0.25, 0.75);\n"
+    "    o.pad = 0.0;\n"
+    "    o.a = 0.25; o.b = 0.5; o.c = 0.75; o.d = 1.0;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsTextShape =
+    "struct PSIn {\n"
+    "    float4 pos : SV_Position;\n"
+    "    float2 t : TEXY;\n"
+    "    float4 pad : PADY;\n"
+    "    nointerpolation float a : G8;\n"
+    "    nointerpolation float b : G9;\n"
+    "    nointerpolation float c : G10;\n"
+    "    nointerpolation float d : G11;\n"
+    "};\n"
+    "float4 main(PSIn i) : SV_Target {\n"
+    "    return float4(i.t.y + i.a - 0.5, i.t.x + i.b - 0.5, i.c, i.d);\n"
+    "}\n";
+
+// Per-instance float attribute at slot 1 with SV_Position in the PS, so the
+// register indices align across the stages.
+const char* kIntVsPerInst =
+    "struct VSIn { float2 pos : POSITION; float4 g : GINST; };\n"
+    "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
+    "VSOut main(VSIn i) {\n"
+    "    VSOut o; o.pos = float4(i.pos, 0.0, 1.0); o.g = i.g;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kIntPsPerInst =
+    "struct PSIn { float4 pos : SV_Position; float4 g : GLYPH; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.g.rgb, 1.0); }\n";
+
 const char* kIntVsDerived =
     "struct VSIn { float2 pos : POSITION; };\n"
     "struct VSOut { float4 pos : SV_POSITION; float4 g : GLYPH; };\n"
@@ -7607,6 +7654,181 @@ int run_int_attribs(bool warp, bool debug_layer) {
             } else {
                 ++failed; ++g_failures;
                 out("MODE=%s ITEM=flat_mismatch RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case S1: scissor enabled with a rect covering the target; the center
+    // must show the drawn red. D2D clips text batches through scissor rects.
+    {
+        Pair p;
+        if (!build_pair("scissor_full", kIntVsPos, kIntPsRed, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=scissor_full RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE;
+            rd.ScissorEnable = TRUE; rd.DepthClipEnable = TRUE;
+            ComPtr<ID3D11RasterizerState> rs;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb) &&
+                SUCCEEDED(g.device->CreateRasterizerState(&rd, rs.GetAddressOf()))) {
+                if (!small_pipeline(path, g, kIntSize, p.vs.Get())) {
+                    ++failed; ++g_failures;
+                    out("MODE=%s ITEM=scissor_full RESULT=FAIL reason=pipeline\n", path);
+                } else {
+                    D3D11_RECT full = {0, 0, (LONG)kIntSize, (LONG)kIntSize};
+                    g.context->RSSetState(rs.Get());
+                    g.context->RSSetScissorRects(1, &full);
+                    const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+                    g.context->ClearRenderTargetView(rtv.Get(), magenta);
+                    ID3D11RenderTargetView* rtvs[1] = {rtv.Get()};
+                    g.context->OMSetRenderTargets(1, rtvs, nullptr);
+                    g.context->IASetInputLayout(layout.Get());
+                    g.context->VSSetShader(p.vs.Get(), nullptr, 0);
+                    g.context->PSSetShader(p.ps.Get(), nullptr, 0);
+                    ID3D11Buffer* vbs[1] = {vb.Get()};
+                    UINT strides[1] = {8}; UINT offs[1] = {0};
+                    g.context->IASetVertexBuffers(0, 1, vbs, strides, offs);
+                    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    g.context->Draw(6, 0);
+                    const int expected[4] = {0, 0, 255, 255};
+                    check_center("scissor_full", p, expected);
+                }
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=scissor_full RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case S2: scissor restricted to a corner; the center must stay magenta.
+    {
+        Pair p;
+        if (!build_pair("scissor_corner", kIntVsPos, kIntPsRed, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=scissor_corner RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE;
+            rd.ScissorEnable = TRUE; rd.DepthClipEnable = TRUE;
+            ComPtr<ID3D11RasterizerState> rs;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb) &&
+                SUCCEEDED(g.device->CreateRasterizerState(&rd, rs.GetAddressOf()))) {
+                if (!small_pipeline(path, g, kIntSize, p.vs.Get())) {
+                    ++failed; ++g_failures;
+                    out("MODE=%s ITEM=scissor_corner RESULT=FAIL reason=pipeline\n", path);
+                } else {
+                    D3D11_RECT corner = {0, 0, 8, 8};
+                    g.context->RSSetState(rs.Get());
+                    g.context->RSSetScissorRects(1, &corner);
+                    const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+                    g.context->ClearRenderTargetView(rtv.Get(), magenta);
+                    ID3D11RenderTargetView* rtvs[1] = {rtv.Get()};
+                    g.context->OMSetRenderTargets(1, rtvs, nullptr);
+                    g.context->IASetInputLayout(layout.Get());
+                    g.context->VSSetShader(p.vs.Get(), nullptr, 0);
+                    g.context->PSSetShader(p.ps.Get(), nullptr, 0);
+                    ID3D11Buffer* vbs[1] = {vb.Get()};
+                    UINT strides[1] = {8}; UINT offs[1] = {0};
+                    g.context->IASetVertexBuffers(0, 1, vbs, strides, offs);
+                    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    g.context->Draw(6, 0);
+                    const int expected[4] = {255, 0, 255, 255};
+                    check_center("scissor_corner", p, expected);
+                }
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=scissor_corner RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case T: the text pair's exact varying shape, registers aligned
+    // (SV_Position v0, vec2 v1, pad v2, four flat scalars packed at v3).
+    {
+        Pair p;
+        if (!build_pair("text_shape", kIntVsTextShape, kIntPsTextShape, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=text_shape RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e{};
+            e.SemanticName = "POSITION"; e.Format = DXGI_FORMAT_R32G32_FLOAT;
+            e.InputSlot = 0; e.AlignedByteOffset = 0;
+            e.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(&e, 1, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            ComPtr<ID3D11Buffer> vb;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, vb)) {
+                draw_quad(p, layout, vb.Get(), 8, nullptr, 0, false);
+                const int expected[4] = {128, 64, 191, 255};
+                check_center("text_shape", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=text_shape RESULT=FAIL reason=setup_failed\n", path);
+            }
+        }
+    }
+
+    // Case U: per-instance attribute at slot 1 feeding a register-aligned
+    // varying, the glyph instancing shape.
+    {
+        Pair p;
+        if (!build_pair("perinst_svpos", kIntVsPerInst, kIntPsPerInst, p)) {
+            ++failed; ++g_failures;
+            out("MODE=%s ITEM=perinst_svpos RESULT=FAIL reason=shader_failed\n", path);
+        } else {
+            D3D11_INPUT_ELEMENT_DESC e[2] = {};
+            e[0].SemanticName = "POSITION"; e[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+            e[0].InputSlot = 0; e[0].AlignedByteOffset = 0;
+            e[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            e[1].SemanticName = "GINST"; e[1].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            e[1].InputSlot = 1; e[1].AlignedByteOffset = 0;
+            e[1].InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+            e[1].InstanceDataStepRate = 1;
+            ComPtr<ID3D11InputLayout> layout;
+            HRESULT h = g.device->CreateInputLayout(e, 2, p.vs_blob->GetBufferPointer(),
+                                                    p.vs_blob->GetBufferSize(),
+                                                    layout.GetAddressOf());
+            static const float kInstData[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+            ComPtr<ID3D11Buffer> inst;
+            ComPtr<ID3D11Buffer> pos;
+            if (SUCCEEDED(h) &&
+                create_buffer(path, g.device.Get(), kIntPos6, sizeof(kIntPos6),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, pos) &&
+                create_buffer(path, g.device.Get(), kInstData, sizeof(kInstData),
+                              D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_DEFAULT, inst)) {
+                draw_quad(p, layout, pos.Get(), 8, inst.Get(), 16, true);
+                const int expected[4] = {64, 128, 191, 255};
+                check_center("perinst_svpos", p, expected);
+            } else {
+                ++failed; ++g_failures;
+                out("MODE=%s ITEM=perinst_svpos RESULT=FAIL reason=setup_failed\n", path);
             }
         }
     }
