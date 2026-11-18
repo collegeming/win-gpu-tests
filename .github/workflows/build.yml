@@ -335,11 +335,15 @@ jobs:
             a lost or reformatted uint write is visible per texel. countbits_sample then
             draws a BGRA8 target with a PS that does
             Texture2D<uint>::Load(int3(pos.xy,0)) and writes countbits(v)/16.0 (=2/16=0.125,
-            about 32 of 255) to all channels; countbits_array_index does the same through an
-            8-entry Texture2D<uint> array indexed from a cbuffer (idx=3), the shape a coverage
-            shader uses when it binds several masks. Expected plane value 32 +-2; a SKIP with
-            reason=array_variant_unavailable means the array/constant-buffer path could not be
-            created, not that it rendered wrong.
+            about 32 of 255) to all channels; countbits_array_index does the same through
+            eight separately bound Texture2D<uint> SRVs chosen by a cbuffer value (idx=3).
+            The literal "Texture2D<uint> g[8]; g[idx]" form does not compile in HLSL
+            (X3512: sampler array index must be a literal expression), so the item tests the
+            part a driver actually translates: several uint SRVs bound at once plus a
+            non-constant choice between them. Expected plane value 32 +-2; a SKIP with
+            reason=array_variant_unavailable means the cbuffer or the array shader could not
+            be created, not that it rendered wrong. A compile failure is reported as
+            reason=shader_compile_failed with the compiler message, never as a silent skip.
           dualsrc-blend clears a 64x64 BGRA8 target to white and draws one full-screen PS that
             writes SV_Target0 = (0,0,0,1) and SV_Target1 = (0,0,0,0.5). Only the blend factors
             change: src1_alpha_blend uses SRC1_ALPHA/INV_SRC1_ALPHA and must produce grey 128

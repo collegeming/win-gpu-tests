@@ -3636,14 +3636,33 @@ const char* kMaskPsSample =
     "    return float4(c, c, c, 1.0);\n"
     "}\n";
 
-// Dynamic index into a texture array: this is the form a LUT/mask lookup takes
-// in a compiled coverage shader, and it is the form a UMD is most likely to
-// mistranslate into a fixed slot.
+// Eight separately bound uint SRVs selected from a cbuffer value. The literal
+// shape "Texture2D<uint> g[8]; g[idx]" does NOT compile: HLSL reports
+// "X3512: sampler array index must be a literal expression", so a compiled
+// shader can only reach one of several masks through a chain like this (or
+// through an array-slice coordinate). This item therefore tests the part a
+// driver actually has to translate: several uint SRVs bound at once plus a
+// non-constant choice between them.
 const char* kMaskPsArray =
     "cbuffer Args : register(b0) { uint idx; };\n"
-    "Texture2D<uint> g[8] : register(t0);\n"
+    "Texture2D<uint> g0 : register(t0);\n"
+    "Texture2D<uint> g1 : register(t1);\n"
+    "Texture2D<uint> g2 : register(t2);\n"
+    "Texture2D<uint> g3 : register(t3);\n"
+    "Texture2D<uint> g4 : register(t4);\n"
+    "Texture2D<uint> g5 : register(t5);\n"
+    "Texture2D<uint> g6 : register(t6);\n"
+    "Texture2D<uint> g7 : register(t7);\n"
     "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
-    "    uint v = g[idx].Load(int3(int2(pos.xy), 0));\n"
+    "    int3 p = int3(int2(pos.xy), 0);\n"
+    "    uint v = g0.Load(p);\n"
+    "    if (idx == 1u) v = g1.Load(p);\n"
+    "    else if (idx == 2u) v = g2.Load(p);\n"
+    "    else if (idx == 3u) v = g3.Load(p);\n"
+    "    else if (idx == 4u) v = g4.Load(p);\n"
+    "    else if (idx == 5u) v = g5.Load(p);\n"
+    "    else if (idx == 6u) v = g6.Load(p);\n"
+    "    else if (idx == 7u) v = g7.Load(p);\n"
     "    float c = (float)countbits(v) / 16.0;\n"
     "    return float4(c, c, c, 1.0);\n"
     "}\n";
@@ -3707,9 +3726,6 @@ int run_mask_uint(bool warp, bool debug_layer) {
         hr = a8_compile(path, "mask_ps_sample", kMaskPsSample, "ps_5_0", "ps_4_0",
                         ps_sample_blob.GetAddressOf(), &used_profile);
     if (SUCCEEDED(hr))
-        hr = a8_compile(path, "mask_ps_array", kMaskPsArray, "ps_5_0", "ps_5_0",
-                        ps_array_blob.GetAddressOf(), &used_profile);
-    if (SUCCEEDED(hr))
         hr = a8_compile(path, "mask_cs_store", kMaskCsStore, "cs_5_0", "cs_4_0",
                         cs_store_blob.GetAddressOf(), &used_profile);
     if (FAILED(hr)) {
@@ -3718,6 +3734,16 @@ int run_mask_uint(bool warp, bool debug_layer) {
             static_cast<unsigned long>(hr));
         return 2;
     }
+
+    // The eight-SRV variant is optional: if the compiler rejects it the other
+    // items still produce values and this one is reported as SKIP, so a probe
+    // shader problem never hides the evidence the mode exists to collect.
+    const HRESULT hr_array_profile =
+        a8_compile(path, "mask_ps_array", kMaskPsArray, "ps_5_0", "ps_5_0",
+                   ps_array_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr_array_profile))
+        out("MODE=%s stage=optional_shader_unavailable shader=mask_ps_array hr=0x%08lx\n",
+            path, static_cast<unsigned long>(hr_array_profile));
 
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps_write, ps_sample, ps_array;
@@ -3738,7 +3764,7 @@ int run_mask_uint(bool warp, bool debug_layer) {
         out("MODE=%s stage=create_ps name=countbits_sample hr=0x%08lx\n", path,
             static_cast<unsigned long>(hr));
     }
-    if (SUCCEEDED(hr)) {
+    if (SUCCEEDED(hr) && ps_array_blob) {
         hr = g.device->CreatePixelShader(ps_array_blob->GetBufferPointer(),
                                          ps_array_blob->GetBufferSize(), nullptr, &ps_array);
         out("MODE=%s stage=create_ps name=countbits_array hr=0x%08lx\n", path,
@@ -3888,7 +3914,7 @@ int run_mask_uint(bool warp, bool debug_layer) {
         {"countbits_sample", ps_sample.Get(), false,
          "ps=Texture2D_uint_Load_then_countbits_div16"},
         {"countbits_array_index", ps_array.Get(), true,
-         "ps=Texture2D_uint_array_dynamic_index_3_then_countbits"},
+         "ps=eight_uint_SRVs_cbuffer_selected_idx3_then_countbits"},
     };
 
     for (const SampleVariant& v : variants) {
@@ -4195,8 +4221,8 @@ void usage() {
         "                    paint and the drop items must leave the target empty\n"
         "  --mode mask-uint  R32_UINT 256x256 mask: PS write and typed UAV store of\n"
         "                    0x00010001 read back exactly, then countbits/16 through\n"
-        "                    a Texture2D<uint> Load and through an 8-entry texture\n"
-        "                    array indexed from a cbuffer (expected about 32/255)\n"
+        "                    a Texture2D<uint> Load and through eight uint SRVs\n"
+        "                    selected from a cbuffer (expected about 32/255)\n"
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
