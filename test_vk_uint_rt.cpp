@@ -284,8 +284,12 @@ struct RtApi {
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
     PFN_vkBindImageMemory BindImageMemory;
     PFN_vkCreateImageView CreateImageView;
+    PFN_vkDestroyImageView DestroyImageView;
+    PFN_vkDestroyImage DestroyImage;
     PFN_vkCreateRenderPass CreateRenderPass;
     PFN_vkCreateFramebuffer CreateFramebuffer;
+    PFN_vkDestroyFramebuffer DestroyFramebuffer;
+    PFN_vkDestroyRenderPass DestroyRenderPass;
     PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
     PFN_vkCmdBeginRenderPass CmdBeginRenderPass;
     PFN_vkCmdEndRenderPass CmdEndRenderPass;
@@ -309,8 +313,12 @@ static bool load_rt_api(RtApi &a, PFN_vkGetDeviceProcAddr gdpa, VkDevice dev,
     LOADRT(GetImageMemoryRequirements);
     LOADRT(BindImageMemory);
     LOADRT(CreateImageView);
+    LOADRT(DestroyImageView);
+    LOADRT(DestroyImage);
     LOADRT(CreateRenderPass);
     LOADRT(CreateFramebuffer);
+    LOADRT(DestroyFramebuffer);
+    LOADRT(DestroyRenderPass);
     LOADRT(CreateGraphicsPipelines);
     LOADRT(CmdBeginRenderPass);
     LOADRT(CmdEndRenderPass);
@@ -584,7 +592,7 @@ static int run_rt_case(const char *label, VkFormat fmt, uint32_t expected,
         VkBufferImageCopy bic{};
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         bic.imageExtent = {W, H, 1};
-        rt.CmdCopyImageToBuffer(cmd, buf, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 1, &bic);
+        rt.CmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &bic);
         if (!ok("vkEndCommandBuffer", api.EndCommandBuffer(cmd)))
             break;
 
