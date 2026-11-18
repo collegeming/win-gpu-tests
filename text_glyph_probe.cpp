@@ -6505,7 +6505,8 @@ int run_upload_paths(bool warp, bool debug_layer) {
                 memcpy(mapped.pData, data, sizeof(data));
                 g.context->Unmap(buffer.Get(), 0);
                 out("MODE=%s ITEM=%s stage=unmap words=%d bytes=%zu\n", path, item,
-                    count, sizeof(data));
+                    static_cast<int>(sizeof(data) / sizeof(data[0])),
+                    sizeof(data));
                 D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
                 sd.Format = DXGI_FORMAT_R32_UINT;
                 sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
