@@ -22,6 +22,8 @@ on:
       - 'sanity_novb.vert'
       - 'desc_const.frag'
       - 'd2d_feed.vert'
+      - 'fiveattr.vert'
+      - 'lut_read.frag'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -63,12 +65,16 @@ jobs:
           glslangValidator -V --target-env vulkan1.0 sanity_novb.vert -o sanity_novb_vert.spv
           glslangValidator -V --target-env vulkan1.0 desc_const.frag -o desc_const_fs.spv
           glslangValidator -V --target-env vulkan1.0 d2d_feed.vert -o d2d_feed_vs.spv
+          glslangValidator -V --target-env vulkan1.0 fiveattr.vert -o fiveattr_vs.spv
+          glslangValidator -V --target-env vulkan1.0 lut_read.frag -o lut_read_fs.spv
           xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
           xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
           xxd -i -n sanity_novb_vs_spv sanity_novb_vert.spv > sanity_novb_vs_spv.h
           xxd -i -n desc_const_fs_spv desc_const_fs.spv > desc_const_fs_spv.h
           xxd -i -n d2d_feed_vs_spv d2d_feed_vs.spv > d2d_feed_vs_spv.h
-          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h
+          xxd -i -n fiveattr_vs_spv fiveattr_vs.spv > fiveattr_vs_spv.h
+          xxd -i -n lut_read_fs_spv lut_read_fs.spv > lut_read_fs_spv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -83,6 +89,8 @@ jobs:
             sanity_novb_vs_spv.h
             desc_const_fs_spv.h
             d2d_feed_vs_spv.h
+            fiveattr_vs_spv.h
+            lut_read_fs_spv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -199,6 +207,21 @@ jobs:
                           d2d FS, all-zero t0, LUT .z rows 0/1. PASS = no clear
                           pixels -> real d2d FS executes and writes; stats show
                           whether the decoded math reproduces SIG_ZERO exactly.
+            fiveattr_vs_control  loophole closer: healthy compiler-generated VS
+                          with the exact 5-attr input interface of the real d2d
+                          VS (loc0-3 f32vec2 + loc4 f32, same 36-byte vertex
+                          buffer) + proven desc_const FS. PASS = the harness
+                          vertex-input wiring is innocent -> the d2d-VS
+                          execution verdict is final. FAIL = the wiring itself
+                          is the defect -> verdict reversed to harness input.
+            lut_read_control   t1 readback: sanity_novb VS + a lut_read FS
+                          fetching known LUT texels through the exact
+                          staging->image pre-pass + SAMPLED_IMAGE descriptor
+                          (texelFetch on samplerless texture2D = OpImageFetch,
+                          same opcode as the real FS). PASS (all {20,128,10,10})
+                          = LUT upload + 2D fetch healthy -> the real FS's
+                          uniform (0,0,0,0) isolates to its own index math;
+                          FAIL = harness upload defect, real FS exonerated.
 
           Reading the verdict line:
             LAYER=DXVK_MAPPING       both replays behave as computed -> the D2D text
@@ -208,9 +231,18 @@ jobs:
                                      and desc_const all paint correctly -> the real D2D
                                      pair itself fails to execute; SPIR-V/PanVK
                                      execution defect.
-            LAYER=SPIRV_EXEC_VS      pair all-clear + d2d_vs_trivial_fs all-clear while
-                                     trivial_vs_d2d_fs writes -> the real d2d VERTEX
-                                     shader fails to rasterize; FS is healthy.
+            LAYER=SPIRV_EXEC_VS_CONFIRMED  pair all-clear + d2d_vs_trivial_fs
+                                     all-clear + fiveattr_vs_control PASSES ->
+                                     the real d2d VERTEX shader fails to
+                                     rasterize through input wiring the healthy
+                                     control rasterizes perfectly; FS healthy;
+                                     verdict final.
+            LAYER=HARNESS_VERTEX_INPUT  fiveattr_vs_control also all-clear ->
+                                     the harness 5-attr vertex input itself is
+                                     broken; d2d-VS verdict withdrawn (SUSPECT).
+            LAYER=SPIRV_EXEC_VS      (legacy label, superseded by
+                                     SPIRV_EXEC_VS_CONFIRMED when fiveattr
+                                     passes)
             LAYER=SPIRV_EXEC_FS      pair all-clear + trivial_vs_d2d_fs all-clear while
                                      d2d_vs_trivial_fs paints -> the real d2d FRAGMENT
                                      shader (5x u32 texel fetch + 3x LUT chain) fails
