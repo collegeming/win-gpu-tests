@@ -61,6 +61,8 @@
 #include "sanity_novb_vs_spv.h"
 #include "desc_const_fs_spv.h"
 #include "d2d_feed_vs_spv.h"
+#include "fiveattr_vs_spv.h"
+#include "lut_read_fs_spv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -449,6 +451,9 @@ static const uint8_t SIG_SANITY[4] = {191, 128, 64, 255};
 // desc_const FS expected output: R=-m.z=1.0 (cb0.z=-1 delivered), G=(t0[0]&63)/63=1.0
 // (texel 0 = 63 delivered), B=0.75, A=1.0.
 static const uint8_t SIG_DESC[4] = {191, 255, 255, 255};
+// lut_read control: FS out (10/255, 0.5, 20/255, 10/255) -> BGRA8 bytes
+// {B=20, G=128, R=10, A=10} when the LUT upload + 2D fetch are healthy.
+static const uint8_t SIG_LUTREAD[4] = {20, 128, 10, 10};
 
 static bool samples_match(const PixStats &s, const uint8_t sig[4]) {
     for (int i = 0; i < 5; ++i)
@@ -1378,18 +1383,33 @@ static bool run_desc_const(VkDevice dev, VkQueue queue,
 
 // ---------------------------------------------------------------------------
 // bisect: internal bisection of the real D2D pair.
-//   d2d_vs=true  "d2d_vs_trivial_fs": real d2d VS (replay vertex input + cb0)
-//                + the proven desc_const FS.  PASS (all SIG_DESC) -> the real
-//                VS rasterizes the fullscreen triangle and a healthy FS
-//                writes through it: VS side healthy.
-//   d2d_vs=false "trivial_vs_d2d_fs": the d2d_feed VS (gl_VertexIndex
-//                fullscreen, FS-interface outputs) + the real d2d FS, all-zero
-//                t0 dataset, LUT rows 0/1 with .z values.  PASS (no clear
-//                pixels) -> the real FS executes and writes everywhere: FS
-//                side healthy.  The stats then also show whether the decoded
-//                math reproduces SIG_ZERO (20,200,10,200 BGRA) exactly.
+//   mode=1 "d2d_vs_trivial_fs": real d2d VS (replay vertex input + cb0)
+//          + the proven desc_const FS.  PASS (all SIG_DESC) -> the real
+//          VS rasterizes the fullscreen triangle and a healthy FS
+//          writes through it: VS side healthy.
+//   mode=0 "trivial_vs_d2d_fs": the d2d_feed VS (gl_VertexIndex
+//          fullscreen, FS-interface outputs) + the real d2d FS, all-zero
+//          t0 dataset, LUT rows 0/1 with .z values.  PASS (no clear
+//          pixels) -> the real FS executes and writes everywhere: FS
+//          side healthy.  The stats then also show whether the decoded
+//          math reproduces SIG_ZERO (20,200,10,200 BGRA) exactly.
+//   mode=2 "fiveattr_vs_control": a healthy compiler-generated VS with the
+//          exact 5-attribute input interface of the real d2d VS (loc0-3
+//          f32vec2 + loc4 f32, same 36-byte vertex buffer) paired with the
+//          proven desc_const FS.  PASS (all SIG_DESC) -> the harness vertex
+//          input wiring is innocent and the real d2d VS verdict is final;
+//          FAIL -> the wiring itself is the defect and the d2d-VS verdict
+//          is withdrawn.
+//   mode=3 "lut_read_control": the proven sanity_novb VS + a lut_read FS
+//          that fetches KNOWN LUT texels ((0,0),(434,0),(0,1)) through the
+//          exact staging->image pre-pass + SAMPLED_IMAGE descriptor the
+//          replay uses.  PASS (all SIG_LUTREAD {20,128,10,10}) -> the LUT
+//          upload + 2D OpImageFetch are healthy, so the real d2d FS's
+//          uniform (0,0,0,0) output isolates to its own index math / flat
+//          input handling; FAIL -> the upload path is the harness defect
+//          and the real FS is exonerated.
 // ---------------------------------------------------------------------------
-static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue queue,
+static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
                        const DevApi &api, const RtApi &rt,
                        const VkPhysicalDeviceMemoryProperties &mp,
                        PixStats *out) {
@@ -1420,8 +1440,10 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb, &rbmem))
             break;
 
-        // Vertex data for the d2d_vs mode: identical to run_replay's triangle.
-        if (d2d_vs) {
+        // Vertex data for the mode!=0 cases: identical to run_replay's
+        // triangle, feeding either the real d2d VS (mode 1) or the healthy
+        // fiveattr control VS (mode 2).
+        if (mode != 0) {
             float verts[3][9];
             for (int v = 0; v < 3; ++v) {
                 float *f = verts[v];
@@ -1451,10 +1473,10 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
         if (!fill_host_buffer(api, dev, ubomem, cb0, sizeof cb0))
             break;
 
-        // t0: d2d_vs mode needs the desc_const fill (texel 0 = 63); the
-        // d2d_fs mode needs the all-zero dataset.
+        // t0: mode!=0 pairs with the desc_const FS (texel 0 = 63); the
+        // mode-0 real d2d FS gets the all-zero dataset.
         std::vector<uint32_t> t0(T0_TEXELS, 0u);
-        if (d2d_vs)
+        if (mode != 0)
             t0[0] = 63u;
         if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)T0_TEXELS * 4,
                                VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, &t0buf, &t0mem))
@@ -1470,10 +1492,11 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
         if (!ok("vkCreateBufferView(t0)", rt.CreateBufferView(dev, &bvci, nullptr, &t0view)))
             break;
 
-        // t1: d2d_vs mode uploads zeros (the desc_const FS never samples);
-        // the d2d_fs mode uploads the .z LUT rows 0/1 identical as run_replay.
+        // t1: modes 1,2 pair with the desc_const FS (never samples; upload
+        // zeros); modes 0 and 3 upload the .z LUT rows 0/1 identical as
+        // run_replay (mode 3 = lut_read control reads known texels back).
         std::vector<float> lut((size_t)LUT_W * LUT_H * 4, 0.0f);
-        if (!d2d_vs) {
+        if (mode == 0 || mode == 3) {
             for (uint32_t row = 0; row <= 1; ++row) {
                 for (uint32_t x = 0; x < LUT_W; ++x) {
                     float v = 0.0f;
@@ -1511,9 +1534,15 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
 
         VkShaderModuleCreateInfo smci{};
         smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        if (d2d_vs) {
+        if (mode == 1) {
             smci.codeSize = d2d_text_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(d2d_text_vs_spv);
+        } else if (mode == 2) {
+            smci.codeSize = fiveattr_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(fiveattr_vs_spv);
+        } else if (mode == 3) {
+            smci.codeSize = sanity_novb_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(sanity_novb_vs_spv);
         } else {
             smci.codeSize = d2d_feed_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(d2d_feed_vs_spv);
@@ -1521,12 +1550,15 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
         if (!ok("vkCreateShaderModule(bisect vs)",
                 api.CreateShaderModule(dev, &smci, nullptr, &vs)))
             break;
-        if (d2d_vs) {
-            smci.codeSize = desc_const_fs_spv_len;
-            smci.pCode = reinterpret_cast<const uint32_t *>(desc_const_fs_spv);
-        } else {
+        if (mode == 0) {
             smci.codeSize = d2d_text_fs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(d2d_text_fs_spv);
+        } else if (mode == 3) {
+            smci.codeSize = lut_read_fs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(lut_read_fs_spv);
+        } else {
+            smci.codeSize = desc_const_fs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(desc_const_fs_spv);
         }
         if (!ok("vkCreateShaderModule(bisect fs)",
                 api.CreateShaderModule(dev, &smci, nullptr, &fs)))
@@ -1652,7 +1684,7 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
         attrs[4].offset = 32;
         VkPipelineVertexInputStateCreateInfo vist{};
         vist.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        if (d2d_vs) {
+        if (mode == 1 || mode == 2) {
             vist.vertexBindingDescriptionCount = 1;
             vist.pVertexBindingDescriptions = &bind;
             vist.vertexAttributeDescriptionCount = 5;
@@ -1718,7 +1750,7 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
             bool bind_vb;
             VkBuffer stage;
             VkImage t1;
-        } ctx{&rt, &api, pipe, pl, dsets, vb, d2d_vs, stage, t1};
+        } ctx{&rt, &api, pipe, pl, dsets, vb, (mode == 1 || mode == 2), stage, t1};
         auto pre = [](VkCommandBuffer cmd, void *ud) {
             Ctx *c = static_cast<Ctx *>(ud);
             VkImageMemoryBarrier to_dst{};
@@ -1770,11 +1802,18 @@ static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue que
         if (!readback_pixels(dev, api, rbmem, out))
             break;
 
-        if (d2d_vs) {
-            // desc_const FS through the real d2d VS: expected everywhere
-            // SIG_DESC {191,255,255,255}.
+        if (mode == 1 || mode == 2) {
+            // desc_const FS through a 5-attr-fed VS (real d2d or healthy
+            // fiveattr control): expected everywhere SIG_DESC
+            // {191,255,255,255}.
             pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
                     out->n_zero == 0 && samples_match(*out, SIG_DESC));
+        } else if (mode == 3) {
+            // lut_read control: a healthy staging->image upload + 2D
+            // OpImageFetch must paint SIG_LUTREAD {20,128,10,10}
+            // everywhere.
+            pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
+                    out->n_zero == 0 && samples_match(*out, SIG_LUTREAD));
         } else {
             // Real d2d FS through the feed VS: it writes everywhere (the
             // clear colour is unreachable: its alpha is the G channel value,
@@ -2241,10 +2280,11 @@ int main(int argc, char **argv) {
     std::printf("probe=vk_d2d_replay\n");
     std::printf("icd_path=%s\n", dll);
     std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u "
-                "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u d2d_feed_vs_spv_len=%u\n",
+                "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u d2d_feed_vs_spv_len=%u "
+                "fiveattr_vs_spv_len=%u lut_read_fs_spv_len=%u\n",
                 d2d_text_vs_spv_len, d2d_text_fs_spv_len, sanity_vs_spv_len,
                 sanity_fs_spv_len, sanity_novb_vs_spv_len, desc_const_fs_spv_len,
-                d2d_feed_vs_spv_len);
+                d2d_feed_vs_spv_len, fiveattr_vs_spv_len, lut_read_fs_spv_len);
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) {
@@ -2368,7 +2408,7 @@ int main(int argc, char **argv) {
     }
 
     PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{}, st_bvs{},
-             st_bfs{};
+             st_bfs{}, st_five{}, st_lut{};
     // Order matters: cheapest base controls first so an early death still
     // leaves the most diagnostic evidence in the log.
     bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
@@ -2378,14 +2418,22 @@ int main(int argc, char **argv) {
     bool clear_ok = run_clear_only(dev, queue, api, rt, mp, &st_clear);
     bool zero_ok = run_replay("replay_zero", true, dev, queue, api, rt, mp, &st_zero);
     bool ramp_ok = run_replay("replay_ramp", false, dev, queue, api, rt, mp, &st_ramp);
-    bool bisect_vs = run_bisect("d2d_vs_trivial_fs", true, dev, queue, api, rt, mp, &st_bvs);
-    bool bisect_fs = run_bisect("trivial_vs_d2d_fs", false, dev, queue, api, rt, mp, &st_bfs);
+    bool bisect_vs = run_bisect("d2d_vs_trivial_fs", 1, dev, queue, api, rt, mp, &st_bvs);
+    bool bisect_fs = run_bisect("trivial_vs_d2d_fs", 0, dev, queue, api, rt, mp, &st_bfs);
+    bool fiveattr_ok = run_bisect("fiveattr_vs_control", 2, dev, queue, api, rt, mp, &st_five);
+    bool lut_ok = run_bisect("lut_read_control", 3, dev, queue, api, rt, mp, &st_lut);
 
-    std::printf("MODE=vk-d2d-replay SUMMARY items=9 novb=%d upload=%d sanity=%d desc=%d "
-                "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d\n",
+    std::printf("MODE=vk-d2d-replay SUMMARY items=11 novb=%d upload=%d sanity=%d desc=%d "
+                "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d fiveattr=%d lut=%d\n",
                 novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, desc_ok ? 1 : 0,
                 clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0,
-                bisect_vs ? 1 : 0, bisect_fs ? 1 : 0);
+                bisect_vs ? 1 : 0, bisect_fs ? 1 : 0, fiveattr_ok ? 1 : 0,
+                lut_ok ? 1 : 0);
+    std::printf("CONTROLS fiveattr=%d lut_read=%d (fiveattr PASS closes the 5-attr "
+                "vertex-input loophole behind the d2d-VS verdict; lut_read PASS "
+                "validates the LUT staging->image upload + 2D fetch that the "
+                "real FS's (0,0,0,0) output put in question)\n",
+                fiveattr_ok ? 1 : 0, lut_ok ? 1 : 0);
 
     int exit_code = 2;
     if (!novb) {
@@ -2438,13 +2486,35 @@ int main(int argc, char **argv) {
             std::printf("RESULT: VERDICT\n");
             exit_code = 0;
         } else if (!bisect_vs && bisect_fs) {
-            std::printf("LAYER=SPIRV_EXEC_VS (the real d2d FS is healthy: it writes "
-                        "through the d2d_feed VS + verified descriptor path; the real "
-                        "d2d VS fails to rasterize a fullscreen triangle from the proven "
-                        "vertex input + cb0 - the D2D text ink=0 defect sits in the d2d "
-                        "vertex-shader execution on this PanVK stack)\n");
-            std::printf("RESULT: VERDICT\n");
-            exit_code = 0;
+            if (fiveattr_ok) {
+                std::printf("LAYER=SPIRV_EXEC_VS_CONFIRMED (the real d2d FS is healthy: "
+                            "it writes through the d2d_feed VS + verified descriptor "
+                            "path; the real d2d VS fails to rasterize a fullscreen "
+                            "triangle from the same vertex input + cb0 that the "
+                            "healthy fiveattr control VS rasterizes perfectly - the "
+                            "5-attr vertex-input wiring is exonerated and the D2D "
+                            "text ink=0 defect sits in the d2d vertex-shader "
+                            "execution on this PanVK stack; t1_upload=%s)\n",
+                            lut_ok ? "OK (LUT staging->image upload + 2D fetch "
+                                      "validated; the real FS's uniform (0,0,0,0) "
+                                      "output isolates to its own index math / flat "
+                                      "input handling, a secondary FS-side question)"
+                                   : "BROKEN (lut_read control also reads wrong - "
+                                      "the harness LUT upload path is the "
+                                      "explanation for the real FS's (0,0,0,0) "
+                                      "output; real FS fully exonerated)");
+                std::printf("RESULT: VERDICT\n");
+                exit_code = 0;
+            } else {
+                std::printf("LAYER=HARNESS_VERTEX_INPUT (the healthy fiveattr "
+                            "control VS ALSO paints nothing through the same "
+                            "5-attribute / 36-byte vertex input that feeds the real "
+                            "d2d VS - the harness vertex-input wiring, not the d2d "
+                            "VS execution, is the defect; the SPIRV_EXEC_VS verdict "
+                            "is WITHDRAWN and the replay all-clear becomes a harness "
+                            "artifact)\n");
+                std::printf("RESULT: SUSPECT\n");
+            }
         } else {
             std::printf("LAYER=PAIR_LINKAGE_SUSPECT (both halves also paint nothing "
                         "alone through verified feeds; the common surface of the two "
