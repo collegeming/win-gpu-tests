@@ -1470,10 +1470,11 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
             break;
 
         // Vertex data per mode.  Every vertex-fed variant encodes the same
-        // covering triangle: loc0 carries 0/256 as raw f32 bits (read as
-        // ordinary floats 0.0/256.0 by the healthy control shaders, or
-        // bitcast by the real d2d VS), giving NDC corners (-1,-1),
-        // (511,-1), (-1,511).
+        // covering triangle: loc0 carries 0/256 as raw u32 bit patterns in
+        // f32 slots (bits 0x00000100 decode - via the real d2d VS's
+        // Bitcast->i32->ConvertSToF chain or the control VSs' identical
+        // floatBitsToInt decode - to the float 256.0), giving NDC corners
+        // (-1,-1), (511,-1), (-1,511).
         //   mode 1,2: 5 attrs, stride 36 (the d2d-shaped config)
         //   mode 4:   1 attr,  stride 36   (stride dimension alone)
         //   mode 5:   2 attrs, stride 16   (count>=2 at a small stride)
