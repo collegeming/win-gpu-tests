@@ -20,6 +20,7 @@ on:
       - 'sanity.vert'
       - 'sanity.frag'
       - 'sanity_novb.vert'
+      - 'desc_const.frag'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -59,10 +60,12 @@ jobs:
           glslangValidator -V --target-env vulkan1.0 sanity.vert -o sanity_vert.spv
           glslangValidator -V --target-env vulkan1.0 sanity.frag -o sanity_frag.spv
           glslangValidator -V --target-env vulkan1.0 sanity_novb.vert -o sanity_novb_vert.spv
+          glslangValidator -V --target-env vulkan1.0 desc_const.frag -o desc_const_fs.spv
           xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
           xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
           xxd -i -n sanity_novb_vs_spv sanity_novb_vert.spv > sanity_novb_vs_spv.h
-          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h
+          xxd -i -n desc_const_fs_spv desc_const_fs.spv > desc_const_fs_spv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -75,6 +78,7 @@ jobs:
             sanity_vs_spv.h
             sanity_fs_spv.h
             sanity_novb_vs_spv.h
+            desc_const_fs_spv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -167,6 +171,14 @@ jobs:
                           the run is UPLOAD_BROKEN.
             sanity_const  trivial VS/FS fed from a CPU-filled vertex buffer; same
                           coverage expectation as sanity_novb.
+            desc_const    trivial shaders through the FULL replay descriptor machinery
+                          (3-set pipeline layout, cb0 UBO + u32 texel-buffer view +
+                          sampled image, CmdBindDescriptorSets(firstSet=1,count=2),
+                          pre-pass LUT staging->image upload). FS encodes both feeds
+                          into the colour: R=-m.z (cb0.z=-1 -> 255), G=(t0[0]&63)/63
+                          (t0[0]=63 -> 255), B=191, A=255; expected everywhere
+                          (191,255,255,255 BGRA). Failing it means the replays cannot
+                          be judged through this harness (descriptor feeding suspect).
             clear_only    clear (10,200,20,255) with no draw; must be 65536 clear pixels.
             replay_zero   the real dumped D2D text VS+FS pair (vs.fdce93f5...spv /
                           fs.8ed1f4d2...spv), u32 texel buffer 1024 texels all zero,
@@ -180,7 +192,10 @@ jobs:
             LAYER=DXVK_MAPPING       both replays behave as computed -> the D2D text
                                      ink defect sits in DXVK descriptor/pipeline mapping.
             LAYER=SPIRV_EXEC         both replays render as pure clear colour regardless
-                                     of buffer content -> SPIR-V/PanVK execution defect.
+                                     of buffer content while sanity_novb, sanity_const
+                                     and desc_const all paint correctly -> the real D2D
+                                     pair itself fails to execute; SPIR-V/PanVK
+                                     execution defect.
             LAYER=UPLOAD_BROKEN      sanity_novb paints but CPU-written mapped memory
                                      is not seen by the GPU (cpu_echo / gpu_copy
                                      evidence above) -> replay unfed; redo with
