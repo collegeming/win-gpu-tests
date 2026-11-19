@@ -841,11 +841,12 @@ static bool run_sanity_novb(VkDevice dev, VkQueue queue,
 
         struct Ctx {
             const RtApi *rt;
+            const DevApi *api;
             VkPipeline pipe;
-        } ctx{&rt, pipe};
+        } ctx{&rt, &api, pipe};
         auto draw = [](VkCommandBuffer cmd, void *ud) {
             Ctx *c = static_cast<Ctx *>(ud);
-            c->rt->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
+            c->api->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
             c->rt->CmdDraw(cmd, 3, 1, 0, 0);
         };
         if (!render_and_readback("sanity_novb", dev, queue, api, rt, frame, rb, rbmem,
@@ -924,7 +925,9 @@ static bool run_vb_roundtrip(VkDevice dev, VkQueue queue,
         cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (!ok("vkBeginCommandBuffer", api.BeginCommandBuffer(cmd, &cbbi)))
             break;
-        api.CmdCopyBuffer(cmd, vb, dst, sizeof words);
+        VkBufferCopy cpregion{};
+        cpregion.size = sizeof words;
+        api.CmdCopyBuffer(cmd, vb, dst, 1, &cpregion);
         if (!ok("vkEndCommandBuffer", api.EndCommandBuffer(cmd)))
             break;
         VkFenceCreateInfo fci{};
