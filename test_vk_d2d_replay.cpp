@@ -60,6 +60,7 @@
 #include "sanity_fs_spv.h"
 #include "sanity_novb_vs_spv.h"
 #include "desc_const_fs_spv.h"
+#include "d2d_feed_vs_spv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -1376,6 +1377,442 @@ static bool run_desc_const(VkDevice dev, VkQueue queue,
 }
 
 // ---------------------------------------------------------------------------
+// bisect: internal bisection of the real D2D pair.
+//   d2d_vs=true  "d2d_vs_trivial_fs": real d2d VS (replay vertex input + cb0)
+//                + the proven desc_const FS.  PASS (all SIG_DESC) -> the real
+//                VS rasterizes the fullscreen triangle and a healthy FS
+//                writes through it: VS side healthy.
+//   d2d_vs=false "trivial_vs_d2d_fs": the d2d_feed VS (gl_VertexIndex
+//                fullscreen, FS-interface outputs) + the real d2d FS, all-zero
+//                t0 dataset, LUT rows 0/1 with .z values.  PASS (no clear
+//                pixels) -> the real FS executes and writes everywhere: FS
+//                side healthy.  The stats then also show whether the decoded
+//                math reproduces SIG_ZERO (20,200,10,200 BGRA) exactly.
+// ---------------------------------------------------------------------------
+static bool run_bisect(const char *label, bool d2d_vs, VkDevice dev, VkQueue queue,
+                       const DevApi &api, const RtApi &rt,
+                       const VkPhysicalDeviceMemoryProperties &mp,
+                       PixStats *out) {
+    Frame frame;
+    VkBuffer vb = VK_NULL_HANDLE, rb = VK_NULL_HANDLE, ubo = VK_NULL_HANDLE,
+            t0buf = VK_NULL_HANDLE, stage = VK_NULL_HANDLE;
+    VkDeviceMemory vbmem = VK_NULL_HANDLE, rbmem = VK_NULL_HANDLE, ubomem = VK_NULL_HANDLE,
+                   t0mem = VK_NULL_HANDLE, stagemem = VK_NULL_HANDLE;
+    VkBufferView t0view = VK_NULL_HANDLE;
+    VkImage t1 = VK_NULL_HANDLE;
+    VkDeviceMemory t1mem = VK_NULL_HANDLE;
+    VkImageView t1view = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl_empty = VK_NULL_HANDLE, dsl_set1 = VK_NULL_HANDLE,
+                          dsl_set2 = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkDescriptorSet dsets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipeline pipe = VK_NULL_HANDLE;
+
+    const uint32_t LUT_W = 1024, LUT_H = 4, T0_TEXELS = 1024;
+    bool pass = false;
+
+    do {
+        if (!frame.init(rt, api, dev, mp))
+            break;
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)Frame::W * Frame::H * 4,
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb, &rbmem))
+            break;
+
+        // Vertex data for the d2d_vs mode: identical to run_replay's triangle.
+        if (d2d_vs) {
+            float verts[3][9];
+            for (int v = 0; v < 3; ++v) {
+                float *f = verts[v];
+                f[0] = int_bits_float(v == 1 ? 256u : 0u);
+                f[1] = int_bits_float(v == 2 ? 256u : 0u);
+                f[2] = 0.0f;
+                f[3] = 0.0f;
+                f[4] = int_bits_float(1u);
+                f[5] = int_bits_float(1u);
+                f[6] = int_bits_float(0x8001u);
+                f[7] = 0.0f;
+                f[8] = 0.0f;
+            }
+            if (!create_buffer_mem(api, dev, mp, sizeof verts,
+                                   VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &vb, &vbmem))
+                break;
+            if (!fill_host_buffer(api, dev, vbmem, verts, sizeof verts))
+                break;
+        }
+
+        // cb0: both modes bind it (the d2d VS consumes it; the feed VS ignores
+        // it; the desc_const FS reads m.z from the fragment stage).
+        const float cb0[4] = {1.0f / 64.0f, 1.0f / 64.0f, -1.0f, -1.0f};
+        if (!create_buffer_mem(api, dev, mp, sizeof cb0, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                               &ubo, &ubomem))
+            break;
+        if (!fill_host_buffer(api, dev, ubomem, cb0, sizeof cb0))
+            break;
+
+        // t0: d2d_vs mode needs the desc_const fill (texel 0 = 63); the
+        // d2d_fs mode needs the all-zero dataset.
+        std::vector<uint32_t> t0(T0_TEXELS, 0u);
+        if (d2d_vs)
+            t0[0] = 63u;
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)T0_TEXELS * 4,
+                               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, &t0buf, &t0mem))
+            break;
+        if (!fill_host_buffer(api, dev, t0mem, t0.data(), (VkDeviceSize)t0.size() * 4))
+            break;
+        VkBufferViewCreateInfo bvci{};
+        bvci.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+        bvci.buffer = t0buf;
+        bvci.format = VK_FORMAT_R32_UINT;
+        bvci.offset = 0;
+        bvci.range = (VkDeviceSize)T0_TEXELS * 4;
+        if (!ok("vkCreateBufferView(t0)", rt.CreateBufferView(dev, &bvci, nullptr, &t0view)))
+            break;
+
+        // t1: d2d_vs mode uploads zeros (the desc_const FS never samples);
+        // the d2d_fs mode uploads the .z LUT rows 0/1 identical as run_replay.
+        std::vector<float> lut((size_t)LUT_W * LUT_H * 4, 0.0f);
+        if (!d2d_vs) {
+            for (uint32_t row = 0; row <= 1; ++row) {
+                for (uint32_t x = 0; x < LUT_W; ++x) {
+                    float v = 0.0f;
+                    if (x <= 216) {
+                        v = (x == 0) ? 10.0f / 255.0f : 0.05f + 0.85f * ((float)x / 216.0f);
+                    } else if (x <= 433) {
+                        v = (x == 217) ? 200.0f / 255.0f
+                                       : 200.0f / 255.0f + 0.15f * ((float)(x - 217) / 216.0f);
+                    } else if (x <= 650) {
+                        v = (x == 434) ? 20.0f / 255.0f
+                                       : 0.15f + 0.5f * ((float)(x - 434) / 216.0f);
+                    }
+                    lut[((size_t)row * LUT_W + x) * 4 + 2] = v;
+                }
+            }
+        }
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)lut.size() * 4,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &stage, &stagemem))
+            break;
+        if (!fill_host_buffer(api, dev, stagemem, lut.data(), (VkDeviceSize)lut.size() * 4))
+            break;
+        if (!create_image_dev_local(rt, api, dev, mp, LUT_W, LUT_H,
+                                   VK_FORMAT_R32G32B32A32_SFLOAT,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   &t1, &t1mem))
+            break;
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = t1;
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (!ok("vkCreateImageView(t1)", rt.CreateImageView(dev, &ivci, nullptr, &t1view)))
+            break;
+
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        if (d2d_vs) {
+            smci.codeSize = d2d_text_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(d2d_text_vs_spv);
+        } else {
+            smci.codeSize = d2d_feed_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(d2d_feed_vs_spv);
+        }
+        if (!ok("vkCreateShaderModule(bisect vs)",
+                api.CreateShaderModule(dev, &smci, nullptr, &vs)))
+            break;
+        if (d2d_vs) {
+            smci.codeSize = desc_const_fs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(desc_const_fs_spv);
+        } else {
+            smci.codeSize = d2d_text_fs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(d2d_text_fs_spv);
+        }
+        if (!ok("vkCreateShaderModule(bisect fs)",
+                api.CreateShaderModule(dev, &smci, nullptr, &fs)))
+            break;
+
+        // Set layouts: the desc_const FS reads set1 from the fragment stage,
+        // so the UBO stage mask is VERTEX|FRAGMENT in both modes.
+        VkDescriptorSetLayoutCreateInfo eci{};
+        eci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        if (!ok("vkCreateDescriptorSetLayout(empty)",
+                api.CreateDescriptorSetLayout(dev, &eci, nullptr, &dsl_empty)))
+            break;
+        VkDescriptorSetLayoutBinding ubo_bind{};
+        ubo_bind.binding = 0;
+        ubo_bind.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ubo_bind.descriptorCount = 1;
+        ubo_bind.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo c1{};
+        c1.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        c1.bindingCount = 1;
+        c1.pBindings = &ubo_bind;
+        if (!ok("vkCreateDescriptorSetLayout(set1)",
+                api.CreateDescriptorSetLayout(dev, &c1, nullptr, &dsl_set1)))
+            break;
+        VkDescriptorSetLayoutBinding img_binds[2]{};
+        img_binds[0].binding = 0;
+        img_binds[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        img_binds[0].descriptorCount = 1;
+        img_binds[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        img_binds[1].binding = 1;
+        img_binds[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        img_binds[1].descriptorCount = 1;
+        img_binds[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo c2{};
+        c2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        c2.bindingCount = 2;
+        c2.pBindings = img_binds;
+        if (!ok("vkCreateDescriptorSetLayout(set2)",
+                api.CreateDescriptorSetLayout(dev, &c2, nullptr, &dsl_set2)))
+            break;
+        VkDescriptorSetLayout layouts[3] = {dsl_empty, dsl_set1, dsl_set2};
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount = 3;
+        plci.pSetLayouts = layouts;
+        if (!ok("vkCreatePipelineLayout", api.CreatePipelineLayout(dev, &plci, nullptr, &pl)))
+            break;
+
+        VkDescriptorPoolSize pool_sizes[3]{};
+        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pool_sizes[0].descriptorCount = 1;
+        pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        pool_sizes[1].descriptorCount = 1;
+        pool_sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        pool_sizes[2].descriptorCount = 1;
+        VkDescriptorPoolCreateInfo dpci{};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = 4;
+        dpci.poolSizeCount = 3;
+        dpci.pPoolSizes = pool_sizes;
+        if (!ok("vkCreateDescriptorPool", api.CreateDescriptorPool(dev, &dpci, nullptr, &dpool)))
+            break;
+        VkDescriptorSetLayout want[2] = {dsl_set1, dsl_set2};
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = dpool;
+        dsai.descriptorSetCount = 2;
+        dsai.pSetLayouts = want;
+        if (!ok("vkAllocateDescriptorSets", api.AllocateDescriptorSets(dev, &dsai, dsets)))
+            break;
+
+        VkDescriptorBufferInfo ubo_info{};
+        ubo_info.buffer = ubo;
+        ubo_info.offset = 0;
+        ubo_info.range = 16;
+        VkDescriptorImageInfo img_info{};
+        img_info.imageView = t1view;
+        img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet writes[3]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = dsets[0];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &ubo_info;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = dsets[1];
+        writes[1].dstBinding = 0;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        writes[1].pTexelBufferView = &t0view;
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = dsets[1];
+        writes[2].dstBinding = 1;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[2].pImageInfo = &img_info;
+        api.UpdateDescriptorSets(dev, 3, writes, 0, nullptr);
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vs;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fs;
+        stages[1].pName = "main";
+        VkVertexInputBindingDescription bind{};
+        bind.binding = 0;
+        bind.stride = 36;
+        bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        VkVertexInputAttributeDescription attrs[5]{};
+        for (int i = 0; i < 4; ++i) {
+            attrs[i].location = (uint32_t)i;
+            attrs[i].binding = 0;
+            attrs[i].format = VK_FORMAT_R32G32_SFLOAT;
+            attrs[i].offset = (uint32_t)(8 * i);
+        }
+        attrs[4].location = 4;
+        attrs[4].binding = 0;
+        attrs[4].format = VK_FORMAT_R32_SFLOAT;
+        attrs[4].offset = 32;
+        VkPipelineVertexInputStateCreateInfo vist{};
+        vist.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        if (d2d_vs) {
+            vist.vertexBindingDescriptionCount = 1;
+            vist.pVertexBindingDescriptions = &bind;
+            vist.vertexAttributeDescriptionCount = 5;
+            vist.pVertexAttributeDescriptions = attrs;
+        }
+        VkPipelineInputAssemblyStateCreateInfo iast{};
+        iast.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        iast.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkViewport vp{};
+        vp.width = (float)Frame::W;
+        vp.height = (float)Frame::H;
+        vp.maxDepth = 1.0f;
+        VkRect2D sc{};
+        sc.extent = {Frame::W, Frame::H};
+        VkPipelineViewportStateCreateInfo vst{};
+        vst.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vst.viewportCount = 1;
+        vst.pViewports = &vp;
+        vst.scissorCount = 1;
+        vst.pScissors = &sc;
+        VkPipelineRasterizationStateCreateInfo rst{};
+        rst.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rst.polygonMode = VK_POLYGON_MODE_FILL;
+        rst.cullMode = VK_CULL_MODE_NONE;
+        rst.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rst.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo mss{};
+        mss.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        mss.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_FALSE;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cbs{};
+        cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cbs.attachmentCount = 1;
+        cbs.pAttachments = &cba;
+        VkGraphicsPipelineCreateInfo gpci{};
+        gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gpci.stageCount = 2;
+        gpci.pStages = stages;
+        gpci.pVertexInputState = &vist;
+        gpci.pInputAssemblyState = &iast;
+        gpci.pViewportState = &vst;
+        gpci.pRasterizationState = &rst;
+        gpci.pMultisampleState = &mss;
+        gpci.pColorBlendState = &cbs;
+        gpci.layout = pl;
+        gpci.renderPass = frame.rp;
+        gpci.subpass = 0;
+        if (!ok("vkCreateGraphicsPipelines(bisect)",
+                rt.CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe)))
+            break;
+
+        // t1 staging->image upload before the renderpass; bind + draw inside.
+        struct Ctx {
+            const RtApi *rt;
+            const DevApi *api;
+            VkPipeline pipe;
+            VkPipelineLayout pl;
+            VkDescriptorSet *dsets;
+            VkBuffer vb;
+            bool bind_vb;
+            VkBuffer stage;
+            VkImage t1;
+        } ctx{&rt, &api, pipe, pl, dsets, vb, d2d_vs, stage, t1};
+        auto pre = [](VkCommandBuffer cmd, void *ud) {
+            Ctx *c = static_cast<Ctx *>(ud);
+            VkImageMemoryBarrier to_dst{};
+            to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_dst.srcAccessMask = 0;
+            to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_dst.image = c->t1;
+            to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            c->api->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                       nullptr, 1, &to_dst);
+            VkBufferImageCopy cp{};
+            cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            cp.imageExtent = {1024, 4, 1};
+            c->rt->CmdCopyBufferToImage(cmd, c->stage, c->t1,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+            VkImageMemoryBarrier to_shader{};
+            to_shader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_shader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_shader.image = c->t1;
+            to_shader.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            c->api->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                                       0, nullptr, 1, &to_shader);
+        };
+        auto draw = [](VkCommandBuffer cmd, void *ud) {
+            Ctx *c = static_cast<Ctx *>(ud);
+            c->api->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
+            if (c->bind_vb) {
+                VkDeviceSize off = 0;
+                c->api->CmdBindVertexBuffers(cmd, 0, 1, &c->vb, &off);
+            }
+            c->api->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pl,
+                                          1, 2, c->dsets, 0, nullptr);
+            c->rt->CmdDraw(cmd, 3, 1, 0, 0);
+        };
+        if (!render_and_readback(label, dev, queue, api, rt, frame, rb, rbmem,
+                                 draw, &ctx, pre, &ctx))
+            break;
+        if (!readback_pixels(dev, api, rbmem, out))
+            break;
+
+        if (d2d_vs) {
+            // desc_const FS through the real d2d VS: expected everywhere
+            // SIG_DESC {191,255,255,255}.
+            pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
+                    out->n_zero == 0 && samples_match(*out, SIG_DESC));
+        } else {
+            // Real d2d FS through the feed VS: it writes everywhere (the
+            // clear colour is unreachable: its alpha is the G channel value,
+            // never 255), so the criterion is "no clear pixels".  The stats
+            // show whether the written colour is the designed SIG_ZERO.
+            pass = (out->n_clear == 0);
+        }
+    } while (0);
+
+    if (pipe) rt.DestroyPipeline(dev, pipe, nullptr);
+    if (t1view) rt.DestroyImageView(dev, t1view, nullptr);
+    if (t1) rt.DestroyImage(dev, t1, nullptr);
+    if (t1mem) api.FreeMemory(dev, t1mem, nullptr);
+    if (dpool) api.DestroyDescriptorPool(dev, dpool, nullptr);
+    if (pl) api.DestroyPipelineLayout(dev, pl, nullptr);
+    if (dsl_set2) api.DestroyDescriptorSetLayout(dev, dsl_set2, nullptr);
+    if (dsl_set1) api.DestroyDescriptorSetLayout(dev, dsl_set1, nullptr);
+    if (dsl_empty) api.DestroyDescriptorSetLayout(dev, dsl_empty, nullptr);
+    if (fs) api.DestroyShaderModule(dev, fs, nullptr);
+    if (vs) api.DestroyShaderModule(dev, vs, nullptr);
+    if (t0view) rt.DestroyBufferView(dev, t0view, nullptr);
+    if (stage) api.DestroyBuffer(dev, stage, nullptr);
+    if (stagemem) api.FreeMemory(dev, stagemem, nullptr);
+    if (t0buf) api.DestroyBuffer(dev, t0buf, nullptr);
+    if (t0mem) api.FreeMemory(dev, t0mem, nullptr);
+    if (ubo) api.DestroyBuffer(dev, ubo, nullptr);
+    if (ubomem) api.FreeMemory(dev, ubomem, nullptr);
+    if (vb) api.DestroyBuffer(dev, vb, nullptr);
+    if (vbmem) api.FreeMemory(dev, vbmem, nullptr);
+    if (rb) api.DestroyBuffer(dev, rb, nullptr);
+    if (rbmem) api.FreeMemory(dev, rbmem, nullptr);
+    frame.destroy(rt, api, dev);
+    std::printf("MODE=vk-d2d-replay ITEM=%s RESULT=%s\n", label, pass ? "PASS" : "FAIL");
+    print_stats(label, *out);
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
 // replay of the real D2D pair. dataset_zero selects the all-zero u32 texel
 // buffer; otherwise the buffer is min(i,60).
 // ---------------------------------------------------------------------------
@@ -1476,7 +1913,10 @@ static bool run_replay(const char *label, bool dataset_zero, VkDevice dev, VkQue
                                    : 0.15f + 0.5f * ((float)(x - 434) / 216.0f);
                 }
                 float *texel = &lut[((size_t)row * LUT_W + x) * 4];
-                texel[0] = v;
+                // The real FS reads the .z channel of every LUT fetch
+                // (RGBA = t1[x0].z, t1[x1].z, t1[x2].z, t1[x1].z); the row
+                // value must live in component 2, not 0.
+                texel[2] = v;
             }
         }
         if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)lut.size() * 4,
@@ -1801,9 +2241,10 @@ int main(int argc, char **argv) {
     std::printf("probe=vk_d2d_replay\n");
     std::printf("icd_path=%s\n", dll);
     std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u "
-                "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u\n",
+                "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u d2d_feed_vs_spv_len=%u\n",
                 d2d_text_vs_spv_len, d2d_text_fs_spv_len, sanity_vs_spv_len,
-                sanity_fs_spv_len, sanity_novb_vs_spv_len, desc_const_fs_spv_len);
+                sanity_fs_spv_len, sanity_novb_vs_spv_len, desc_const_fs_spv_len,
+                d2d_feed_vs_spv_len);
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) {
@@ -1926,7 +2367,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{};
+    PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{}, st_bvs{},
+             st_bfs{};
     // Order matters: cheapest base controls first so an early death still
     // leaves the most diagnostic evidence in the log.
     bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
@@ -1936,11 +2378,14 @@ int main(int argc, char **argv) {
     bool clear_ok = run_clear_only(dev, queue, api, rt, mp, &st_clear);
     bool zero_ok = run_replay("replay_zero", true, dev, queue, api, rt, mp, &st_zero);
     bool ramp_ok = run_replay("replay_ramp", false, dev, queue, api, rt, mp, &st_ramp);
+    bool bisect_vs = run_bisect("d2d_vs_trivial_fs", true, dev, queue, api, rt, mp, &st_bvs);
+    bool bisect_fs = run_bisect("trivial_vs_d2d_fs", false, dev, queue, api, rt, mp, &st_bfs);
 
-    std::printf("MODE=vk-d2d-replay SUMMARY items=7 novb=%d upload=%d sanity=%d desc=%d "
-                "clear=%d zero=%d ramp=%d\n",
+    std::printf("MODE=vk-d2d-replay SUMMARY items=9 novb=%d upload=%d sanity=%d desc=%d "
+                "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d\n",
                 novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, desc_ok ? 1 : 0,
-                clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0);
+                clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0,
+                bisect_vs ? 1 : 0, bisect_fs ? 1 : 0);
 
     int exit_code = 2;
     if (!novb) {
@@ -1974,14 +2419,41 @@ int main(int argc, char **argv) {
         exit_code = 0;
     } else if (!zero_ok && !ramp_ok && st_zero.n_clear == Frame::W * Frame::H &&
                st_ramp.n_clear == Frame::W * Frame::H) {
-        std::printf("LAYER=SPIRV_EXEC (both datasets render as pure clear while "
-                    "sanity_novb, vertex-buffer sanity and the full descriptor-machinery "
-                    "control desc_const all paint correctly; the real D2D pair fails to "
-                    "execute as compiled - suspect SPIR-V compile or PanVK execution of "
-                    "the texel-buffer fetch / bit-op chain / PhysicalStorageBuffer64 "
-                    "addressing)\n");
-        std::printf("RESULT: VERDICT\n");
-        exit_code = 0;
+        // Pair-level all-clear confirmed; refine with the internal bisect.
+        if (bisect_vs && bisect_fs) {
+            std::printf("LAYER=PAIR_LINKAGE (each half of the pair executes correctly "
+                        "alone - the real d2d VS rasterizes for the desc_const FS and the "
+                        "real d2d FS writes through the d2d_feed VS - but the combined "
+                        "pair paints nothing; suspicion moves to the VS<->FS interface "
+                        "linkage / combined pipeline: Invariant SV_Position + "
+                        "NoPerspective/Flat interface, linkage-time specialization)\n");
+            std::printf("RESULT: VERDICT\n");
+            exit_code = 0;
+        } else if (bisect_vs && !bisect_fs) {
+            std::printf("LAYER=SPIRV_EXEC_FS (the real d2d VS is healthy: it rasterizes "
+                        "the fullscreen triangle and a healthy FS writes through it; the "
+                        "real d2d FS paints nothing even through the proven d2d_feed VS "
+                        "+ verified descriptor path - its 5x u32 texel-buffer fetch + 3x "
+                        "LUT chain fails to execute/write on this PanVK stack)\n");
+            std::printf("RESULT: VERDICT\n");
+            exit_code = 0;
+        } else if (!bisect_vs && bisect_fs) {
+            std::printf("LAYER=SPIRV_EXEC_VS (the real d2d FS is healthy: it writes "
+                        "through the d2d_feed VS + verified descriptor path; the real "
+                        "d2d VS fails to rasterize a fullscreen triangle from the proven "
+                        "vertex input + cb0 - the D2D text ink=0 defect sits in the d2d "
+                        "vertex-shader execution on this PanVK stack)\n");
+            std::printf("RESULT: VERDICT\n");
+            exit_code = 0;
+        } else {
+            std::printf("LAYER=PAIR_LINKAGE_SUSPECT (both halves also paint nothing "
+                        "alone through verified feeds; the common surface of the two "
+                        "modules is suspect: VulkanMemoryModel/PhysicalStorageBuffer64 "
+                        "header, Invariant-decorated SV_Position, entry-point "
+                        "conventions; raw values above; last_step=%s result=%d)\n",
+                        g_last_step, (int)g_last_result);
+            std::printf("RESULT: SUSPECT\n");
+        }
     } else {
         std::printf("LAYER=HARNESS_SUSPECT (replay output inconsistent; raw values above; "
                     "last_step=%s result=%d)\n", g_last_step, (int)g_last_result);
