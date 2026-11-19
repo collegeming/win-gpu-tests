@@ -1180,6 +1180,9 @@ static bool run_replay(const char *label, bool dataset_zero, VkDevice dev, VkQue
 }
 
 int main(int argc, char **argv) {
+    // The device ICD logs to stderr unbuffered and has abnormal-exit paths; keep
+    // our own stdout unbuffered so diagnostics are never lost on early death.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char *dll = "C:\\panvk\\dev_vulkan_virtio.dll";
     for (int i = 1; i < argc; ++i) {
         if (argv[i][0] != '-' && argv[i][0] != '\0')
