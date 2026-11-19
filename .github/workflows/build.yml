@@ -24,6 +24,10 @@ on:
       - 'd2d_feed.vert'
       - 'fiveattr.vert'
       - 'lut_read.frag'
+      - 'oneattr.vert'
+      - 'twoattr.vert'
+      - 'fourattr.vert'
+      - 'flat_echo.frag'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -67,6 +71,10 @@ jobs:
           glslangValidator -V --target-env vulkan1.0 d2d_feed.vert -o d2d_feed_vs.spv
           glslangValidator -V --target-env vulkan1.0 fiveattr.vert -o fiveattr_vs.spv
           glslangValidator -V --target-env vulkan1.0 lut_read.frag -o lut_read_fs.spv
+          glslangValidator -V --target-env vulkan1.0 oneattr.vert -o oneattr_vs.spv
+          glslangValidator -V --target-env vulkan1.0 twoattr.vert -o twoattr_vs.spv
+          glslangValidator -V --target-env vulkan1.0 fourattr.vert -o fourattr_vs.spv
+          glslangValidator -V --target-env vulkan1.0 flat_echo.frag -o flat_echo_fs.spv
           xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
           xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
           xxd -i -n sanity_novb_vs_spv sanity_novb_vert.spv > sanity_novb_vs_spv.h
@@ -74,7 +82,11 @@ jobs:
           xxd -i -n d2d_feed_vs_spv d2d_feed_vs.spv > d2d_feed_vs_spv.h
           xxd -i -n fiveattr_vs_spv fiveattr_vs.spv > fiveattr_vs_spv.h
           xxd -i -n lut_read_fs_spv lut_read_fs.spv > lut_read_fs_spv.h
-          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h
+          xxd -i -n oneattr_vs_spv oneattr_vs.spv > oneattr_vs_spv.h
+          xxd -i -n twoattr_vs_spv twoattr_vs.spv > twoattr_vs_spv.h
+          xxd -i -n fourattr_vs_spv fourattr_vs.spv > fourattr_vs_spv.h
+          xxd -i -n flat_echo_fs_spv flat_echo_fs.spv > flat_echo_fs_spv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h oneattr_vs_spv.h twoattr_vs_spv.h fourattr_vs_spv.h flat_echo_fs_spv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -91,6 +103,10 @@ jobs:
             d2d_feed_vs_spv.h
             fiveattr_vs_spv.h
             lut_read_fs_spv.h
+            oneattr_vs_spv.h
+            twoattr_vs_spv.h
+            fourattr_vs_spv.h
+            flat_echo_fs_spv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -222,6 +238,18 @@ jobs:
                           = LUT upload + 2D fetch healthy -> the real FS's
                           uniform (0,0,0,0) isolates to its own index math;
                           FAIL = harness upload defect, real FS exonerated.
+            vin_1attr_stride36 / vin_2attr_stride16 / vin_4attr_stride32 /
+            vin_5attr_stride40   config bisect: healthy GLSL vertex shaders
+                          identical in every respect (same feed values, same
+                          desc_const FS, same descriptor machinery) except the
+                          attribute-count/stride configuration. PASS anywhere
+                          names the exact vertex-input config dimension that
+                          breaks PanVK vertex fetch (see VIN_BISECT line).
+            flat_echo_control   feed VS + a FS echoing its noperspective/flat
+                          outputs back as colour (all {0,17,136,128} BGRA =
+                          PASS): validates the flat varying delivery the real
+                          d2d FS consumes, so its (0,0,0,0) uniform output can
+                          be attributed to its own index math (or not).
 
           Reading the verdict line:
             LAYER=DXVK_MAPPING       both replays behave as computed -> the D2D text
@@ -240,6 +268,18 @@ jobs:
             LAYER=HARNESS_VERTEX_INPUT  fiveattr_vs_control also all-clear ->
                                      the harness 5-attr vertex input itself is
                                      broken; d2d-VS verdict withdrawn (SUSPECT).
+                                     Refined by the VIN_BISECT line: any vin_*
+                                     PASS -> LAYER=PANVK_VERTEX_FETCH (VERDICT:
+                                     the breakage is a PanVK/ICD vertex-input
+                                     config defect, directly explaining the
+                                     original D2D text ink=0); all vin_* FAIL ->
+                                     LAYER=HARNESS_VERTEX_INPUT_BROAD (SUSPECT:
+                                     single-attr/8B works but everything wider
+                                     breaks; PanVK-side comparison pending).
+            FLAT_ECHO_READING      PASS = flat/noperspective varying delivery
+                                     intact (the real FS's (0,0,0,0) is its own
+                                     index math); FAIL = flat delivery broken,
+                                     no FS-colour conclusion.
             LAYER=SPIRV_EXEC_VS      (legacy label, superseded by
                                      SPIRV_EXEC_VS_CONFIRMED when fiveattr
                                      passes)
