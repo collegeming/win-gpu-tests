@@ -63,6 +63,10 @@
 #include "d2d_feed_vs_spv.h"
 #include "fiveattr_vs_spv.h"
 #include "lut_read_fs_spv.h"
+#include "oneattr_vs_spv.h"
+#include "twoattr_vs_spv.h"
+#include "fourattr_vs_spv.h"
+#include "flat_echo_fs_spv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -454,6 +458,8 @@ static const uint8_t SIG_DESC[4] = {191, 255, 255, 255};
 // lut_read control: FS out (10/255, 0.5, 20/255, 10/255) -> BGRA8 bytes
 // {B=20, G=128, R=10, A=10} when the LUT upload + 2D fetch are healthy.
 static const uint8_t SIG_LUTREAD[4] = {20, 128, 10, 10};
+// flat_echo control: feed VS's flat outputs echoed back as colour.
+static const uint8_t SIG_FLATECHO[4] = {0, 17, 136, 128};
 
 static bool samples_match(const PixStats &s, const uint8_t sig[4]) {
     for (int i = 0; i < 5; ++i)
@@ -1408,6 +1414,24 @@ static bool run_desc_const(VkDevice dev, VkQueue queue,
 //          uniform (0,0,0,0) output isolates to its own index math / flat
 //          input handling; FAIL -> the upload path is the harness defect
 //          and the real FS is exonerated.
+//   mode=4 "vin_1attr_stride36": oneattr VS, 1 attribute (loc0 R32G32,
+//          stride 36) - the stride dimension alone.
+//   mode=5 "vin_2attr_stride16": twoattr VS, 2 attributes, stride 16 -
+//          attribute-count >= 2 at a small stride.
+//   mode=6 "vin_4attr_stride32": fourattr VS, 4 R32G32 attributes, stride
+//          32 - the fiveattr shape minus loc4/R32.
+//   mode=7 "vin_5attr_stride40": fiveattr VS, 5 attributes, stride 40 -
+//          the fiveattr shape at an 8-aligned stride.
+//   Modes 4..7 all pair with the proven desc_const FS and feed values that
+//          make loc0 = (0,0)/(256,0)/(0,256) -> the same covering triangle;
+//          PASS (all SIG_DESC) names a healthy vertex-input config, so a
+//          FAIL pattern across them localizes which attribute-count/stride
+//          dimension breaks PanVK vertex fetch.
+//   mode=8 "flat_echo_control": the d2d_feed VS + a flat_echo FS that
+//          echoes the received noperspective/flat outputs as colour.
+//          PASS (all SIG_FLATECHO {0,17,136,128}) -> flat varying delivery
+//          intact, the real d2d FS's (0,0,0,0) is its own math; FAIL ->
+//          flat delivery broken, FS-colour conclusions suspended.
 // ---------------------------------------------------------------------------
 static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
                        const DevApi &api, const RtApi &rt,
@@ -1432,6 +1456,7 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
 
     const uint32_t LUT_W = 1024, LUT_H = 4, T0_TEXELS = 1024;
     bool pass = false;
+    uint32_t vstride = 0, vattrs = 0;
 
     do {
         if (!frame.init(rt, api, dev, mp))
@@ -1440,13 +1465,24 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb, &rbmem))
             break;
 
-        // Vertex data for the mode!=0 cases: identical to run_replay's
-        // triangle, feeding either the real d2d VS (mode 1) or the healthy
-        // fiveattr control VS (mode 2).
-        if (mode != 0) {
-            float verts[3][9];
+        // Vertex data per mode.  Every vertex-fed variant encodes the same
+        // covering triangle: loc0 carries 0/256 as raw f32 bits (read as
+        // ordinary floats 0.0/256.0 by the healthy control shaders, or
+        // bitcast by the real d2d VS), giving NDC corners (-1,-1),
+        // (511,-1), (-1,511).
+        //   mode 1,2: 5 attrs, stride 36 (the d2d-shaped config)
+        //   mode 4:   1 attr,  stride 36   (stride dimension alone)
+        //   mode 5:   2 attrs, stride 16   (count>=2 at a small stride)
+        //   mode 6:   4 attrs, stride 32   (5-attr shape minus loc4/R32)
+        //   mode 7:   5 attrs, stride 40   (5-attr shape, 8-aligned stride)
+        //   modes 0,3,8: no vertex buffer.
+        // Flat packing: row v starts at float index v*nfloats, so the
+        // rows sit exactly vstride bytes apart for every mode.
+        float verts[30];
+        uint32_t nfloats = 0;
+        if (mode == 1 || mode == 2 || mode == 4) {
             for (int v = 0; v < 3; ++v) {
-                float *f = verts[v];
+                float *f = &verts[v * 9];
                 f[0] = int_bits_float(v == 1 ? 256u : 0u);
                 f[1] = int_bits_float(v == 2 ? 256u : 0u);
                 f[2] = 0.0f;
@@ -1457,10 +1493,59 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
                 f[7] = 0.0f;
                 f[8] = 0.0f;
             }
-            if (!create_buffer_mem(api, dev, mp, sizeof verts,
+            nfloats = 9; /* modes 1,2 read all 9; mode 4 reads only loc0 */
+            vstride = 36;
+            vattrs = (mode == 4) ? 1 : 5;
+        } else if (mode == 5) {
+            for (int v = 0; v < 3; ++v) {
+                float *f = &verts[v * 4];
+                f[0] = int_bits_float(v == 1 ? 256u : 0u);
+                f[1] = int_bits_float(v == 2 ? 256u : 0u);
+                f[2] = 0.0f;
+                f[3] = 0.0f;
+            }
+            nfloats = 4;
+            vstride = 16;
+            vattrs = 2;
+        } else if (mode == 6) {
+            for (int v = 0; v < 3; ++v) {
+                float *f = &verts[v * 8];
+                f[0] = int_bits_float(v == 1 ? 256u : 0u);
+                f[1] = int_bits_float(v == 2 ? 256u : 0u);
+                f[2] = 0.0f;
+                f[3] = 0.0f;
+                f[4] = int_bits_float(1u);
+                f[5] = int_bits_float(1u);
+                f[6] = int_bits_float(0x8001u);
+                f[7] = 0.0f;
+            }
+            nfloats = 8;
+            vstride = 32;
+            vattrs = 4;
+        } else if (mode == 7) {
+            for (int v = 0; v < 3; ++v) {
+                float *f = &verts[v * 10];
+                f[0] = int_bits_float(v == 1 ? 256u : 0u);
+                f[1] = int_bits_float(v == 2 ? 256u : 0u);
+                f[2] = 0.0f;
+                f[3] = 0.0f;
+                f[4] = int_bits_float(1u);
+                f[5] = int_bits_float(1u);
+                f[6] = int_bits_float(0x8001u);
+                f[7] = 0.0f;
+                f[8] = 0.0f;
+                f[9] = 0.0f;
+            }
+            nfloats = 10;
+            vstride = 40;
+            vattrs = 5;
+        }
+        if (nfloats) {
+            const VkDeviceSize vbsize = (VkDeviceSize)sizeof(float) * 3 * nfloats;
+            if (!create_buffer_mem(api, dev, mp, vbsize,
                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &vb, &vbmem))
                 break;
-            if (!fill_host_buffer(api, dev, vbmem, verts, sizeof verts))
+            if (!fill_host_buffer(api, dev, vbmem, verts, vbsize))
                 break;
         }
 
@@ -1473,8 +1558,9 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         if (!fill_host_buffer(api, dev, ubomem, cb0, sizeof cb0))
             break;
 
-        // t0: mode!=0 pairs with the desc_const FS (texel 0 = 63); the
-        // mode-0 real d2d FS gets the all-zero dataset.
+        // t0: modes!=0 pair with the desc_const or flat_echo FS (desc_const
+        // reads texel 0 = 63 -> G=255); the mode-0 real d2d FS gets the
+        // all-zero dataset.
         std::vector<uint32_t> t0(T0_TEXELS, 0u);
         if (mode != 0)
             t0[0] = 63u;
@@ -1492,9 +1578,10 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         if (!ok("vkCreateBufferView(t0)", rt.CreateBufferView(dev, &bvci, nullptr, &t0view)))
             break;
 
-        // t1: modes 1,2 pair with the desc_const FS (never samples; upload
-        // zeros); modes 0 and 3 upload the .z LUT rows 0/1 identical as
-        // run_replay (mode 3 = lut_read control reads known texels back).
+        // t1: modes 1,2,4,5,6,7,8 pair with desc_const/flat_echo FS (never
+        // samples; upload zeros); modes 0 and 3 upload the .z LUT rows 0/1
+        // identical as run_replay (mode 3 = lut_read control reads known
+        // texels back).
         std::vector<float> lut((size_t)LUT_W * LUT_H * 4, 0.0f);
         if (mode == 0 || mode == 3) {
             for (uint32_t row = 0; row <= 1; ++row) {
@@ -1543,6 +1630,18 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         } else if (mode == 3) {
             smci.codeSize = sanity_novb_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(sanity_novb_vs_spv);
+        } else if (mode == 4) {
+            smci.codeSize = oneattr_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(oneattr_vs_spv);
+        } else if (mode == 5) {
+            smci.codeSize = twoattr_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(twoattr_vs_spv);
+        } else if (mode == 6) {
+            smci.codeSize = fourattr_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(fourattr_vs_spv);
+        } else if (mode == 7) {
+            smci.codeSize = fiveattr_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(fiveattr_vs_spv);
         } else {
             smci.codeSize = d2d_feed_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(d2d_feed_vs_spv);
@@ -1556,6 +1655,9 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         } else if (mode == 3) {
             smci.codeSize = lut_read_fs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(lut_read_fs_spv);
+        } else if (mode == 8) {
+            smci.codeSize = flat_echo_fs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(flat_echo_fs_spv);
         } else {
             smci.codeSize = desc_const_fs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(desc_const_fs_spv);
@@ -1669,25 +1771,27 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         stages[1].pName = "main";
         VkVertexInputBindingDescription bind{};
         bind.binding = 0;
-        bind.stride = 36;
+        bind.stride = vstride;
         bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
         VkVertexInputAttributeDescription attrs[5]{};
-        for (int i = 0; i < 4; ++i) {
-            attrs[i].location = (uint32_t)i;
+        for (uint32_t i = 0; i < vattrs && i < 4; ++i) {
+            attrs[i].location = i;
             attrs[i].binding = 0;
             attrs[i].format = VK_FORMAT_R32G32_SFLOAT;
-            attrs[i].offset = (uint32_t)(8 * i);
+            attrs[i].offset = 8 * i;
         }
-        attrs[4].location = 4;
-        attrs[4].binding = 0;
-        attrs[4].format = VK_FORMAT_R32_SFLOAT;
-        attrs[4].offset = 32;
+        if (vattrs == 5) {
+            attrs[4].location = 4;
+            attrs[4].binding = 0;
+            attrs[4].format = VK_FORMAT_R32_SFLOAT;
+            attrs[4].offset = 32;
+        }
         VkPipelineVertexInputStateCreateInfo vist{};
         vist.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        if (mode == 1 || mode == 2) {
+        if (vattrs) {
             vist.vertexBindingDescriptionCount = 1;
             vist.pVertexBindingDescriptions = &bind;
-            vist.vertexAttributeDescriptionCount = 5;
+            vist.vertexAttributeDescriptionCount = vattrs;
             vist.pVertexAttributeDescriptions = attrs;
         }
         VkPipelineInputAssemblyStateCreateInfo iast{};
@@ -1750,7 +1854,7 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
             bool bind_vb;
             VkBuffer stage;
             VkImage t1;
-        } ctx{&rt, &api, pipe, pl, dsets, vb, (mode == 1 || mode == 2), stage, t1};
+        } ctx{&rt, &api, pipe, pl, dsets, vb, (vattrs != 0), stage, t1};
         auto pre = [](VkCommandBuffer cmd, void *ud) {
             Ctx *c = static_cast<Ctx *>(ud);
             VkImageMemoryBarrier to_dst{};
@@ -1802,10 +1906,10 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         if (!readback_pixels(dev, api, rbmem, out))
             break;
 
-        if (mode == 1 || mode == 2) {
-            // desc_const FS through a 5-attr-fed VS (real d2d or healthy
-            // fiveattr control): expected everywhere SIG_DESC
-            // {191,255,255,255}.
+        if (mode == 1 || mode == 2 || (mode >= 4 && mode <= 7)) {
+            // desc_const FS through a vertex-fed VS (real d2d, healthy
+            // fiveattr, or one of the vin_* config-bisect variants):
+            // expected everywhere SIG_DESC {191,255,255,255}.
             pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
                     out->n_zero == 0 && samples_match(*out, SIG_DESC));
         } else if (mode == 3) {
@@ -1814,6 +1918,12 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
             // everywhere.
             pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
                     out->n_zero == 0 && samples_match(*out, SIG_LUTREAD));
+        } else if (mode == 8) {
+            // flat_echo control: the feed VS's flat/noperspective outputs
+            // echoed back as colour -> SIG_FLATECHO {0,17,136,128} iff the
+            // flat varying delivery the real FS consumes is intact.
+            pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
+                    out->n_zero == 0 && samples_match(*out, SIG_FLATECHO));
         } else {
             // Real d2d FS through the feed VS: it writes everywhere (the
             // clear colour is unreachable: its alpha is the G channel value,
@@ -2281,10 +2391,13 @@ int main(int argc, char **argv) {
     std::printf("icd_path=%s\n", dll);
     std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u "
                 "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u d2d_feed_vs_spv_len=%u "
-                "fiveattr_vs_spv_len=%u lut_read_fs_spv_len=%u\n",
+                "fiveattr_vs_spv_len=%u lut_read_fs_spv_len=%u oneattr_vs_spv_len=%u "
+                "twoattr_vs_spv_len=%u fourattr_vs_spv_len=%u flat_echo_fs_spv_len=%u\n",
                 d2d_text_vs_spv_len, d2d_text_fs_spv_len, sanity_vs_spv_len,
                 sanity_fs_spv_len, sanity_novb_vs_spv_len, desc_const_fs_spv_len,
-                d2d_feed_vs_spv_len, fiveattr_vs_spv_len, lut_read_fs_spv_len);
+                d2d_feed_vs_spv_len, fiveattr_vs_spv_len, lut_read_fs_spv_len,
+                oneattr_vs_spv_len, twoattr_vs_spv_len, fourattr_vs_spv_len,
+                flat_echo_fs_spv_len);
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) {
@@ -2408,7 +2521,8 @@ int main(int argc, char **argv) {
     }
 
     PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{}, st_bvs{},
-             st_bfs{}, st_five{}, st_lut{};
+             st_bfs{}, st_five{}, st_lut{}, st_vin1{}, st_vin2{}, st_vin4{}, st_vin5{},
+             st_fecho{};
     // Order matters: cheapest base controls first so an early death still
     // leaves the most diagnostic evidence in the log.
     bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
@@ -2422,18 +2536,36 @@ int main(int argc, char **argv) {
     bool bisect_fs = run_bisect("trivial_vs_d2d_fs", 0, dev, queue, api, rt, mp, &st_bfs);
     bool fiveattr_ok = run_bisect("fiveattr_vs_control", 2, dev, queue, api, rt, mp, &st_five);
     bool lut_ok = run_bisect("lut_read_control", 3, dev, queue, api, rt, mp, &st_lut);
+    bool vin1_ok = run_bisect("vin_1attr_stride36", 4, dev, queue, api, rt, mp, &st_vin1);
+    bool vin2_ok = run_bisect("vin_2attr_stride16", 5, dev, queue, api, rt, mp, &st_vin2);
+    bool vin4_ok = run_bisect("vin_4attr_stride32", 6, dev, queue, api, rt, mp, &st_vin4);
+    bool vin5_ok = run_bisect("vin_5attr_stride40", 7, dev, queue, api, rt, mp, &st_vin5);
+    bool fecho_ok = run_bisect("flat_echo_control", 8, dev, queue, api, rt, mp, &st_fecho);
 
-    std::printf("MODE=vk-d2d-replay SUMMARY items=11 novb=%d upload=%d sanity=%d desc=%d "
-                "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d fiveattr=%d lut=%d\n",
+    std::printf("MODE=vk-d2d-replay SUMMARY items=16 novb=%d upload=%d sanity=%d desc=%d "
+                "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d fiveattr=%d lut=%d "
+                "vin1=%d vin2=%d vin4=%d vin5=%d fecho=%d\n",
                 novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, desc_ok ? 1 : 0,
                 clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0,
                 bisect_vs ? 1 : 0, bisect_fs ? 1 : 0, fiveattr_ok ? 1 : 0,
-                lut_ok ? 1 : 0);
+                lut_ok ? 1 : 0, vin1_ok ? 1 : 0, vin2_ok ? 1 : 0, vin4_ok ? 1 : 0,
+                vin5_ok ? 1 : 0, fecho_ok ? 1 : 0);
     std::printf("CONTROLS fiveattr=%d lut_read=%d (fiveattr PASS closes the 5-attr "
                 "vertex-input loophole behind the d2d-VS verdict; lut_read PASS "
                 "validates the LUT staging->image upload + 2D fetch that the "
                 "real FS's (0,0,0,0) output put in question)\n",
                 fiveattr_ok ? 1 : 0, lut_ok ? 1 : 0);
+    std::printf("VIN_BISECT 1attr_s36=%d 2attr_s16=%d 4attr_s32=%d 5attr_s40=%d "
+                "(healthy GLSL vertex shaders that differ only in the "
+                "attribute-count/stride configuration; all clear = the failure "
+                "is not specific to the d2d VS at all but to the vertex-input "
+                "config; any pass names the dimension that breaks PanVK "
+                "vertex fetch)\n",
+                vin1_ok ? 1 : 0, vin2_ok ? 1 : 0, vin4_ok ? 1 : 0, vin5_ok ? 1 : 0);
+    std::printf("FLAT_ECHO %d (PASS: the flat/noperspective varying delivery the real "
+                "FS consumes is intact, so its (0,0,0,0) output is its own "
+                "index math; FAIL: flat delivery broken, FS output judgement "
+                "suspended)\n", fecho_ok ? 1 : 0);
 
     int exit_code = 2;
     if (!novb) {
@@ -2506,15 +2638,47 @@ int main(int argc, char **argv) {
                 std::printf("RESULT: VERDICT\n");
                 exit_code = 0;
             } else {
-                std::printf("LAYER=HARNESS_VERTEX_INPUT (the healthy fiveattr "
-                            "control VS ALSO paints nothing through the same "
-                            "5-attribute / 36-byte vertex input that feeds the real "
-                            "d2d VS - the harness vertex-input wiring, not the d2d "
-                            "VS execution, is the defect; the SPIRV_EXEC_VS verdict "
-                            "is WITHDRAWN and the replay all-clear becomes a harness "
-                            "artifact)\n");
-                std::printf("RESULT: SUSPECT\n");
+                const int vin_any = (vin1_ok ? 1 : 0) + (vin2_ok ? 1 : 0) +
+                                    (vin4_ok ? 1 : 0) + (vin5_ok ? 1 : 0);
+                if (vin_any) {
+                    std::printf("LAYER=PANVK_VERTEX_FETCH (the healthy fiveattr "
+                                "control VS paints nothing through the 5-attr/36B "
+                                "input, but healthy GLSL vertex shaders DO paint "
+                                "through the vin_* config variants - passing: ");
+                    if (vin1_ok) std::printf("1attr/stride36 ");
+                    if (vin2_ok) std::printf("2attr/stride16 ");
+                    if (vin4_ok) std::printf("4attr/stride32 ");
+                    if (vin5_ok) std::printf("5attr/stride40 ");
+                    std::printf("- so general vertex fetch + descriptor feeding + "
+                                "rasterization are all ALIVE, and the breakage is "
+                                "specific to a vertex-input configuration dimension "
+                                "the d2d text pipeline also uses; this PanVK/ICD "
+                                "vertex-fetch config defect is the leading "
+                                "explanation for the original D2D text ink=0 "
+                                "(the real pipeline feeds its VS through the same "
+                                "kind of multi-attribute input state))\n");
+                    std::printf("RESULT: VERDICT\n");
+                    exit_code = 0;
+                } else {
+                    std::printf("LAYER=HARNESS_VERTEX_INPUT_BROAD (the healthy "
+                                "fiveattr control VS AND every vin_* healthy "
+                                "variant paints nothing - the failure is not "
+                                "specific to the d2d VS nor to one config "
+                                "dimension: something broader in the PanVK/ICD "
+                                "vertex-fetch/IDVS path breaks any draw beyond the "
+                                "single-attr/8B proven shape; the SPIRV_EXEC_VS "
+                                "verdict stays WITHDRAWN; PanVK-side pending "
+                                "upstream comparison)\n");
+                    std::printf("RESULT: SUSPECT\n");
+                }
             }
+            std::printf("FLAT_ECHO_READING %s (controls the real d2d FS's "
+                        "(0,0,0,0) uniform output: PASS means the flat varying "
+                        "delivery it consumes is intact and the wrong colour is "
+                        "its own index-math result; FAIL means flat delivery "
+                        "itself is broken and no FS-colour conclusion can be "
+                        "drawn)\n",
+                        fecho_ok ? "PASS" : "FAIL");
         } else {
             std::printf("LAYER=PAIR_LINKAGE_SUSPECT (both halves also paint nothing "
                         "alone through verified feeds; the common surface of the two "
