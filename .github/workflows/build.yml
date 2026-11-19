@@ -28,6 +28,12 @@ on:
       - 'twoattr.vert'
       - 'fourattr.vert'
       - 'flat_echo.frag'
+      - 'fiveattr_invariant.vert'
+      - 'vs_noinv_spv.h'
+      - 'vs_nophys_spv.h'
+      - 'vs_trunc_spv.h'
+      - 'vs_keephead_spv.h'
+      - 'fiveattr_psb_spv.h'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -75,6 +81,7 @@ jobs:
           glslangValidator -V --target-env vulkan1.0 twoattr.vert -o twoattr_vs.spv
           glslangValidator -V --target-env vulkan1.0 fourattr.vert -o fourattr_vs.spv
           glslangValidator -V --target-env vulkan1.0 flat_echo.frag -o flat_echo_fs.spv
+          glslangValidator -V --target-env vulkan1.0 fiveattr_invariant.vert -o fiveattr_inv_vs.spv
           xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
           xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
           xxd -i -n sanity_novb_vs_spv sanity_novb_vert.spv > sanity_novb_vs_spv.h
@@ -86,7 +93,8 @@ jobs:
           xxd -i -n twoattr_vs_spv twoattr_vs.spv > twoattr_vs_spv.h
           xxd -i -n fourattr_vs_spv fourattr_vs.spv > fourattr_vs_spv.h
           xxd -i -n flat_echo_fs_spv flat_echo_fs.spv > flat_echo_fs_spv.h
-          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h oneattr_vs_spv.h twoattr_vs_spv.h fourattr_vs_spv.h flat_echo_fs_spv.h
+          xxd -i -n fiveattr_inv_vs_spv fiveattr_inv_vs.spv > fiveattr_inv_vs_spv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h oneattr_vs_spv.h twoattr_vs_spv.h fourattr_vs_spv.h flat_echo_fs_spv.h fiveattr_inv_vs_spv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -107,6 +115,7 @@ jobs:
             twoattr_vs_spv.h
             fourattr_vs_spv.h
             flat_echo_fs_spv.h
+            fiveattr_inv_vs_spv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -253,6 +262,31 @@ jobs:
                           PASS): validates the flat varying delivery the real
                           d2d FS consumes, so its (0,0,0,0) uniform output can
                           be attributed to its own index math (or not).
+            Round-11 surgical VS probes (m01662): all six run the same
+                          5-attr/36B data + cb0 + replay descriptor machinery
+                          + desc_const FS; SIG_DESC paint = the module survives.
+            surg_vs_noinv        real d2d VS minus the OpDecorate Invariant on
+                          SV_Position. PAINT -> Invariant is the lethal feature.
+            surg_vs_nophys       real d2d VS minus PhysicalStorageBuffer64
+                          addressing (Logical; cap removed). PAINT -> the PSB64
+                          /VulkanMemoryModel header is the lethal feature.
+            surg_vs_trunc        real interface/declarations + minimal healthy
+                          body (same Bitcast->ConvertSToF decode of loc0).
+                          PAINT -> the lethal thing lives in the real body's
+                          math, not the interface or decorations.
+            surg_vs_keephead     real body kept through the input decodes
+                          (ax/ay %64/%65), minimal healthy tail after. PAINT
+                          while trunc FAILS -> the lethal thing is in the real
+                          body AFTER the decodes (position FMix / glyph-coord
+                          outputs); FAILS while trunc PAINTS -> the lethal
+                          thing is in the decode block itself.
+            rev_fiveattr_invariant  healthy fiveattr VS + invariant
+                          gl_Position (reverse probe). FAIL -> Invariant alone
+                          kills even a healthy VS (sufficiency confirmed);
+                          PAINT -> Invariant alone is innocent (combination).
+            rev_fiveattr_psb     healthy fiveattr VS + PSB64/VulkanMemoryModel
+                          header patch (reverse probe). FAIL -> the header alone
+                          kills even a healthy VS; PAINT -> innocent alone.
 
           Reading the verdict line:
             LAYER=DXVK_MAPPING       both replays behave as computed -> the D2D text
@@ -285,6 +319,18 @@ jobs:
                                      intact (the real FS's (0,0,0,0) is its own
                                      index math); FAIL = flat delivery broken,
                                      no FS-colour conclusion.
+            SURGERY / LETHAL_FEATURE   round-11 refinement of the
+                                     SPIRV_EXEC_VS_CONFIRMED verdict: each
+                                     surg_* item deletes exactly one suspect
+                                     feature from the real VS, each rev_*
+                                     adds one to the healthy VS.  LETHAL_
+                                     FEATURE names the isolated killer
+                                     (INVARIANT / PSB64_HEADER / HEAD_DECODE_
+                                     BLOCK / REAL_BODY_MATH) with its
+                                     reverse-confirm reading; NONE_ISOLATED =
+                                     no single feature is sufficient (multi-
+                                     feature combination or deeper PanVK
+                                     defect -> final NIR/disassembly diff).
             LAYER=SPIRV_EXEC_VS      (legacy label, superseded by
                                      SPIRV_EXEC_VS_CONFIRMED when fiveattr
                                      passes)
