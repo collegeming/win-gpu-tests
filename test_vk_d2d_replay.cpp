@@ -53,6 +53,7 @@
 #include "d2d_text_fs_spv.h"
 #include "sanity_vs_spv.h"
 #include "sanity_fs_spv.h"
+#include "sanity_novb_vs_spv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -154,6 +155,7 @@ struct DevApi {
     PFN_vkCmdBindPipeline CmdBindPipeline;
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdBindVertexBuffers CmdBindVertexBuffers;
+    PFN_vkCmdCopyBuffer CmdCopyBuffer;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
     PFN_vkCreateFence CreateFence;
     PFN_vkDestroyFence DestroyFence;
@@ -223,6 +225,7 @@ static int load_dev_api(DevApi &a, PFN_vkGetDeviceProcAddr gdpa, VkDevice dev, V
     LOAD(CmdBindPipeline);
     LOAD(CmdBindDescriptorSets);
     LOAD(CmdBindVertexBuffers);
+    LOAD(CmdCopyBuffer);
     LOAD(CmdPipelineBarrier);
     LOAD(CreateFence);
     LOAD(DestroyFence);
@@ -729,7 +732,240 @@ static bool run_sanity(VkDevice dev, VkQueue queue,
     if (vbmem) api.FreeMemory(dev, vbmem, nullptr);
     frame.destroy(rt, api, dev);
     std::printf("MODE=vk-d2d-replay ITEM=sanity_const RESULT=%s\n", pass ? "PASS" : "FAIL");
-    if (pass) print_stats("sanity_const", *out);
+    print_stats("sanity_const", *out);
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
+// sanity_novb: the proven-on-device control shape (same as test_vk_uint_rt):
+// gl_VertexIndex fullscreen triangle, constant FS, NO vertex buffer, NO
+// descriptors, NO CPU->GPU upload of any kind. If this paints while
+// sanity_const does not, the draw path itself is healthy and the failure
+// isolates to CPU-uploaded data (vertex fetch / upload direction).
+// ---------------------------------------------------------------------------
+static bool run_sanity_novb(VkDevice dev, VkQueue queue,
+                             const DevApi &api, const RtApi &rt,
+                             const VkPhysicalDeviceMemoryProperties &mp,
+                             PixStats *out) {
+    Frame frame;
+    VkBuffer rb = VK_NULL_HANDLE;
+    VkDeviceMemory rbmem = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    bool pass = false;
+    do {
+        if (!frame.init(rt, api, dev, mp))
+            break;
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)Frame::W * Frame::H * 4,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb, &rbmem))
+            break;
+
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = sanity_novb_vs_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t *>(sanity_novb_vs_spv);
+        if (!ok("vkCreateShaderModule(sanity_novb vs)",
+                api.CreateShaderModule(dev, &smci, nullptr, &vs)))
+            break;
+        smci.codeSize = sanity_fs_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t *>(sanity_fs_spv);
+        if (!ok("vkCreateShaderModule(sanity_novb fs)",
+                api.CreateShaderModule(dev, &smci, nullptr, &fs)))
+            break;
+
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        if (!ok("vkCreatePipelineLayout", api.CreatePipelineLayout(dev, &plci, nullptr, &pl)))
+            break;
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vs;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fs;
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vist{};
+        vist.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        VkPipelineInputAssemblyStateCreateInfo iast{};
+        iast.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        iast.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkViewport vp{};
+        vp.width = (float)Frame::W;
+        vp.height = (float)Frame::H;
+        vp.maxDepth = 1.0f;
+        VkRect2D sc{};
+        sc.extent = {Frame::W, Frame::H};
+        VkPipelineViewportStateCreateInfo vst{};
+        vst.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vst.viewportCount = 1;
+        vst.pViewports = &vp;
+        vst.scissorCount = 1;
+        vst.pScissors = &sc;
+        VkPipelineRasterizationStateCreateInfo rst{};
+        rst.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rst.polygonMode = VK_POLYGON_MODE_FILL;
+        rst.cullMode = VK_CULL_MODE_NONE;
+        rst.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rst.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo mss{};
+        mss.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        mss.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_FALSE;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cbs{};
+        cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cbs.attachmentCount = 1;
+        cbs.pAttachments = &cba;
+        VkGraphicsPipelineCreateInfo gpci{};
+        gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gpci.stageCount = 2;
+        gpci.pStages = stages;
+        gpci.pVertexInputState = &vist;
+        gpci.pInputAssemblyState = &iast;
+        gpci.pViewportState = &vst;
+        gpci.pRasterizationState = &rst;
+        gpci.pMultisampleState = &mss;
+        gpci.pColorBlendState = &cbs;
+        gpci.layout = pl;
+        gpci.renderPass = frame.rp;
+        gpci.subpass = 0;
+        if (!ok("vkCreateGraphicsPipelines(sanity_novb)",
+                rt.CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe)))
+            break;
+
+        struct Ctx {
+            const RtApi *rt;
+            VkPipeline pipe;
+        } ctx{&rt, pipe};
+        auto draw = [](VkCommandBuffer cmd, void *ud) {
+            Ctx *c = static_cast<Ctx *>(ud);
+            c->rt->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
+            c->rt->CmdDraw(cmd, 3, 1, 0, 0);
+        };
+        if (!render_and_readback("sanity_novb", dev, queue, api, rt, frame, rb, rbmem,
+                                 draw, &ctx, nullptr, nullptr))
+            break;
+        if (!readback_pixels(dev, api, rbmem, out))
+            break;
+        pass = (out->n_other == 0 && out->n_clear == 0 && out->n_zero == 0);
+    } while (0);
+
+    if (pipe) rt.DestroyPipeline(dev, pipe, nullptr);
+    if (pl) api.DestroyPipelineLayout(dev, pl, nullptr);
+    if (fs) api.DestroyShaderModule(dev, fs, nullptr);
+    if (vs) api.DestroyShaderModule(dev, vs, nullptr);
+    if (rb) api.DestroyBuffer(dev, rb, nullptr);
+    if (rbmem) api.FreeMemory(dev, rbmem, nullptr);
+    frame.destroy(rt, api, dev);
+    std::printf("MODE=vk-d2d-replay ITEM=sanity_novb RESULT=%s\n", pass ? "PASS" : "FAIL");
+    print_stats("sanity_novb", *out);
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
+// vb_roundtrip: CPU-write -> GPU-read direction probe without any draw.
+// (a) fill a buffer through the mapped blob, re-map and compare (CPU echo);
+// (b) CmdCopyBuffer it GPU-side into a second HOST_VISIBLE buffer and read
+// that back (GPU read). (a) failing means the blob mapping does not even
+// hold CPU writes; (b) failing with (a) passing means the GPU cannot see
+// CPU-written memory — the upload path is lost.
+// ---------------------------------------------------------------------------
+static bool run_vb_roundtrip(VkDevice dev, VkQueue queue,
+                              const DevApi &api,
+                              const VkPhysicalDeviceMemoryProperties &mp) {
+    const uint32_t words[6] = {0xBF800000u, 0xBF800000u, 0x40400000u,
+                               0xBF800000u, 0xBF800000u, 0x40400000u};
+    bool cpu_echo = false, gpu_copy = false;
+    uint32_t back_cpu[6] = {}, back_gpu[6] = {};
+    VkBuffer vb = VK_NULL_HANDLE, dst = VK_NULL_HANDLE;
+    VkDeviceMemory vbmem = VK_NULL_HANDLE, dstmem = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    do {
+        if (!create_buffer_mem(api, dev, mp, sizeof words,
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                &vb, &vbmem))
+            break;
+        if (!fill_host_buffer(api, dev, vbmem, words, sizeof words))
+            break;
+        {
+            void *map = nullptr;
+            if (!ok("vkMapMemory(vb echo)", api.MapMemory(dev, vbmem, 0, VK_WHOLE_SIZE, 0, &map)))
+                break;
+            std::memcpy(back_cpu, map, sizeof back_cpu);
+            api.UnmapMemory(dev, vbmem);
+            cpu_echo = (std::memcmp(back_cpu, words, sizeof words) == 0);
+        }
+        if (!create_buffer_mem(api, dev, mp, sizeof words,
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dst, &dstmem))
+            break;
+
+        VkCommandPoolCreateInfo cpci{};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        if (!ok("vkCreateCommandPool", api.CreateCommandPool(dev, &cpci, nullptr, &pool)))
+            break;
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = pool;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        if (!ok("vkAllocateCommandBuffers", api.AllocateCommandBuffers(dev, &cbai, &cmd)))
+            break;
+        VkCommandBufferBeginInfo cbbi{};
+        cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (!ok("vkBeginCommandBuffer", api.BeginCommandBuffer(cmd, &cbbi)))
+            break;
+        api.CmdCopyBuffer(cmd, vb, dst, sizeof words);
+        if (!ok("vkEndCommandBuffer", api.EndCommandBuffer(cmd)))
+            break;
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (!ok("vkCreateFence", api.CreateFence(dev, &fci, nullptr, &fence)))
+            break;
+        VkSubmitInfo si{};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        if (!ok("vkQueueSubmit", api.QueueSubmit(queue, 1, &si, fence)))
+            break;
+        if (!ok("vkWaitForFences", api.WaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX)))
+            break;
+        {
+            void *map = nullptr;
+            if (!ok("vkMapMemory(vb gpu copy)", api.MapMemory(dev, dstmem, 0, VK_WHOLE_SIZE, 0, &map)))
+                break;
+            std::memcpy(back_gpu, map, sizeof back_gpu);
+            api.UnmapMemory(dev, dstmem);
+            gpu_copy = (std::memcmp(back_gpu, words, sizeof words) == 0);
+        }
+    } while (0);
+
+    if (fence) api.DestroyFence(dev, fence, nullptr);
+    if (pool) api.DestroyCommandPool(dev, pool, nullptr);
+    if (dst) api.DestroyBuffer(dev, dst, nullptr);
+    if (dstmem) api.FreeMemory(dev, dstmem, nullptr);
+    if (vb) api.DestroyBuffer(dev, vb, nullptr);
+    if (vbmem) api.FreeMemory(dev, vbmem, nullptr);
+
+    std::printf("vb_roundtrip words=%08x %08x %08x %08x %08x %08x\n",
+                words[0], words[1], words[2], words[3], words[4], words[5]);
+    std::printf("vb_roundtrip cpu_echo=%d back=%08x %08x %08x %08x %08x %08x\n",
+                cpu_echo ? 1 : 0,
+                back_cpu[0], back_cpu[1], back_cpu[2], back_cpu[3], back_cpu[4], back_cpu[5]);
+    std::printf("vb_roundtrip gpu_copy=%d back=%08x %08x %08x %08x %08x %08x\n",
+                gpu_copy ? 1 : 0,
+                back_gpu[0], back_gpu[1], back_gpu[2], back_gpu[3], back_gpu[4], back_gpu[5]);
+    const bool pass = cpu_echo && gpu_copy;
+    std::printf("MODE=vk-d2d-replay ITEM=vb_roundtrip RESULT=%s\n", pass ? "PASS" : "FAIL");
     return pass;
 }
 
@@ -1190,9 +1426,10 @@ int main(int argc, char **argv) {
     }
     std::printf("probe=vk_d2d_replay\n");
     std::printf("icd_path=%s\n", dll);
-    std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u\n",
+    std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u "
+                "sanity_novb_vs_spv_len=%u\n",
                 d2d_text_vs_spv_len, d2d_text_fs_spv_len, sanity_vs_spv_len,
-                sanity_fs_spv_len);
+                sanity_fs_spv_len, sanity_novb_vs_spv_len);
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) {
@@ -1315,19 +1552,38 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    PixStats st_sanity, st_clear, st_zero, st_ramp;
+    PixStats st_sanity{}, st_novb{}, st_clear{}, st_zero{}, st_ramp{};
+    // Order matters: cheapest base controls first so an early death still
+    // leaves the most diagnostic evidence in the log.
+    bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
+    bool upload_ok = run_vb_roundtrip(dev, queue, api, mp);
     bool sanity = run_sanity(dev, queue, api, rt, mp, &st_sanity);
     bool clear_ok = run_clear_only(dev, queue, api, rt, mp, &st_clear);
     bool zero_ok = run_replay("replay_zero", true, dev, queue, api, rt, mp, &st_zero);
     bool ramp_ok = run_replay("replay_ramp", false, dev, queue, api, rt, mp, &st_ramp);
 
-    std::printf("MODE=vk-d2d-replay SUMMARY items=4 sanity=%d clear=%d zero=%d ramp=%d\n",
-                sanity ? 1 : 0, clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0);
+    std::printf("MODE=vk-d2d-replay SUMMARY items=6 novb=%d upload=%d sanity=%d clear=%d "
+                "zero=%d ramp=%d\n",
+                novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, clear_ok ? 1 : 0,
+                zero_ok ? 1 : 0, ramp_ok ? 1 : 0);
 
     int exit_code = 2;
-    if (!sanity) {
-        std::printf("LAYER=HARNESS_SUSPECT (ICD pipeline basics broken before the D2D pair; "
-                    "last_step=%s result=%d)\n", g_last_step, (int)g_last_result);
+    if (!novb) {
+        std::printf("LAYER=HARNESS_SUSPECT (base no-upload draw paints nothing: ICD draw "
+                    "path broken at a level below any upload question; last_step=%s "
+                    "result=%d)\n", g_last_step, (int)g_last_result);
+        std::printf("RESULT: SUSPECT\n");
+    } else if (!upload_ok) {
+        std::printf("LAYER=UPLOAD_BROKEN (draws themselves are fine per sanity_novb, but "
+                    "CPU-written mapped memory is not seen by the GPU: the D2D replay "
+                    "cannot be fed through this path; next step is a compute-filled "
+                    "replay with zero CPU->GPU uploads)\n");
+        std::printf("RESULT: SUSPECT\n");
+    } else if (!sanity) {
+        std::printf("LAYER=VERTEX_FETCH_BROKEN (uploads verified by vb_roundtrip, base "
+                    "draw verified by sanity_novb, but a draw fed from a CPU-filled "
+                    "vertex buffer paints nothing: PanVK/ICD vertex fetch suspect; the "
+                    "D2D pair cannot be replayed with a host-filled vertex buffer)\n");
         std::printf("RESULT: SUSPECT\n");
     } else if (zero_ok && ramp_ok) {
         std::printf("LAYER=DXVK_MAPPING (real D2D FS executes correctly when fed directly; "
