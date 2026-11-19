@@ -12,9 +12,14 @@
 // (cb0, set 1 binding 0) and produces SV_Position plus the FS interface.
 //
 // Items:
-//   sanity_const  handcrafted trivial VS/FS pair writing a constant colour;
-//                proves instance/device/pipeline/renderpass/readback on the
-//                ICD independent of the D2D modules.
+//   sanity_novb  gl_VertexIndex fullscreen triangle + constant FS, no vertex
+//                buffer, no descriptors, no uploads: the zero-dependency draw.
+//   vb_roundtrip CPU-write -> GPU-read probe without any draw.
+//   sanity_const trivial VS/FS pair writing a constant colour through a
+//                CPU-filled vertex buffer: proves vertex fetch + uploads.
+//   desc_const  trivial shaders through the FULL replay descriptor machinery
+//                (3-set layout, UBO + texel buffer + sampled image, pre-pass
+//                LUT upload): proves the replay feeding path itself.
 //   clear_only   the BGRA8 target cleared (R=10,G=200,B=20,A=255) and copied
 //                back without any draw.
 //   replay_zero  the real D2D pair with the u32 texel buffer all zero. The
@@ -54,6 +59,7 @@
 #include "sanity_vs_spv.h"
 #include "sanity_fs_spv.h"
 #include "sanity_novb_vs_spv.h"
+#include "desc_const_fs_spv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -439,6 +445,16 @@ struct PixStats {
 static const uint8_t SIG_CLEAR[4] = {20, 200, 10, 255};
 static const uint8_t SIG_ZERO[4] = {20, 200, 10, 200};
 static const uint8_t SIG_SANITY[4] = {191, 128, 64, 255};
+// desc_const FS expected output: R=-m.z=1.0 (cb0.z=-1 delivered), G=(t0[0]&63)/63=1.0
+// (texel 0 = 63 delivered), B=0.75, A=1.0.
+static const uint8_t SIG_DESC[4] = {191, 255, 255, 255};
+
+static bool samples_match(const PixStats &s, const uint8_t sig[4]) {
+    for (int i = 0; i < 5; ++i)
+        for (int c = 0; c < 4; ++c)
+            if (s.samples[i][c] != sig[c]) return false;
+    return true;
+}
 
 static PixStats classify(const uint8_t *map) {
     PixStats s;
@@ -719,7 +735,10 @@ static bool run_sanity(VkDevice dev, VkQueue queue,
         if (!readback_pixels(dev, api, rbmem, out))
             break;
         // Every pixel must be the constant colour (191,128,64,255) in BGRA.
-        pass = (out->n_other == 0 && out->n_clear == 0 && out->n_zero == 0);
+        // The classifier puts that colour in the "other" bucket, so the
+        // criterion is: all pixels "other" and all 5 samples exact.
+        pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
+                out->n_zero == 0 && samples_match(*out, SIG_SANITY));
     } while (0);
 
     if (pipe) rt.DestroyPipeline(dev, pipe, nullptr);
@@ -854,7 +873,9 @@ static bool run_sanity_novb(VkDevice dev, VkQueue queue,
             break;
         if (!readback_pixels(dev, api, rbmem, out))
             break;
-        pass = (out->n_other == 0 && out->n_clear == 0 && out->n_zero == 0);
+        // Same fixed criterion: sanity colour classifies as "other".
+        pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
+                out->n_zero == 0 && samples_match(*out, SIG_SANITY));
     } while (0);
 
     if (pipe) rt.DestroyPipeline(dev, pipe, nullptr);
@@ -1001,6 +1022,356 @@ static bool run_clear_only(VkDevice dev, VkQueue queue,
     frame.destroy(rt, api, dev);
     std::printf("MODE=vk-d2d-replay ITEM=clear_only RESULT=%s\n", pass ? "PASS" : "FAIL");
     if (pass) print_stats("clear_only", *out);
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
+// desc_const: descriptor-feeding control. Trivial shaders (gl_VertexIndex
+// fullscreen triangle VS = the sanity_novb module; FS reads cb0.m.z and
+// texel 0 of the u32 texel buffer) but the FULL run_replay descriptor
+// machinery: 3-set pipeline layout (set0 empty, set1 UBO, set2 texel buffer
+// + sampled image), descriptor pool with all three types, UpdateDescriptorSets
+// writes (UBO + buffer view + image view), CmdBindDescriptorSets(firstSet=1,
+// count=2), and the t1 staging->image pre-pass upload. If this paints its
+// expected colour the descriptor path is proven and the d2d pair's all-clear
+// output in run_replay cannot be blamed on harness descriptor feeding.
+// Expected: BGRA {191,255,255,255} (R=-m.z with cb0.z=-1; G=(t0[0]&63)/63
+// with t0[0]=63; B=0.75; A=1.0).
+// ---------------------------------------------------------------------------
+static bool run_desc_const(VkDevice dev, VkQueue queue,
+                           const DevApi &api, const RtApi &rt,
+                           const VkPhysicalDeviceMemoryProperties &mp,
+                           PixStats *out) {
+    Frame frame;
+    VkBuffer rb = VK_NULL_HANDLE, ubo = VK_NULL_HANDLE, t0buf = VK_NULL_HANDLE,
+            stage = VK_NULL_HANDLE;
+    VkDeviceMemory rbmem = VK_NULL_HANDLE, ubomem = VK_NULL_HANDLE,
+                   t0mem = VK_NULL_HANDLE, stagemem = VK_NULL_HANDLE;
+    VkBufferView t0view = VK_NULL_HANDLE;
+    VkImage t1 = VK_NULL_HANDLE;
+    VkDeviceMemory t1mem = VK_NULL_HANDLE;
+    VkImageView t1view = VK_NULL_HANDLE;
+    VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl_empty = VK_NULL_HANDLE, dsl_set1 = VK_NULL_HANDLE,
+                          dsl_set2 = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkDescriptorSet dsets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkPipeline pipe = VK_NULL_HANDLE;
+
+    const uint32_t LUT_W = 1024, LUT_H = 4, T0_TEXELS = 1024;
+    bool pass = false;
+
+    do {
+        if (!frame.init(rt, api, dev, mp))
+            break;
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)Frame::W * Frame::H * 4,
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT, &rb, &rbmem))
+            break;
+
+        // cb0 UBO, identical fill to run_replay.
+        const float cb0[4] = {1.0f / 64.0f, 1.0f / 64.0f, -1.0f, -1.0f};
+        if (!create_buffer_mem(api, dev, mp, sizeof cb0, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                               &ubo, &ubomem))
+            break;
+        if (!fill_host_buffer(api, dev, ubomem, cb0, sizeof cb0))
+            break;
+
+        // t0: texel 0 = 63 (so G=1.0 -> 255 when delivered); rest zero.
+        std::vector<uint32_t> t0(T0_TEXELS, 0u);
+        t0[0] = 63u;
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)T0_TEXELS * 4,
+                               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, &t0buf, &t0mem))
+            break;
+        if (!fill_host_buffer(api, dev, t0mem, t0.data(), (VkDeviceSize)t0.size() * 4))
+            break;
+        VkBufferViewCreateInfo bvci{};
+        bvci.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+        bvci.buffer = t0buf;
+        bvci.format = VK_FORMAT_R32_UINT;
+        bvci.offset = 0;
+        bvci.range = (VkDeviceSize)T0_TEXELS * 4;
+        if (!ok("vkCreateBufferView(t0)", rt.CreateBufferView(dev, &bvci, nullptr, &t0view)))
+            break;
+
+        // t1: same dev-local image + staging upload as run_replay (content is
+        // irrelevant to this FS, the upload path itself is the control).
+        std::vector<float> lut((size_t)LUT_W * LUT_H * 4, 0.0f);
+        if (!create_buffer_mem(api, dev, mp, (VkDeviceSize)lut.size() * 4,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &stage, &stagemem))
+            break;
+        if (!fill_host_buffer(api, dev, stagemem, lut.data(), (VkDeviceSize)lut.size() * 4))
+            break;
+        if (!create_image_dev_local(rt, api, dev, mp, LUT_W, LUT_H,
+                                   VK_FORMAT_R32G32B32A32_SFLOAT,
+                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   &t1, &t1mem))
+            break;
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = t1;
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (!ok("vkCreateImageView(t1)", rt.CreateImageView(dev, &ivci, nullptr, &t1view)))
+            break;
+
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = sanity_novb_vs_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t *>(sanity_novb_vs_spv);
+        if (!ok("vkCreateShaderModule(desc vs)",
+                api.CreateShaderModule(dev, &smci, nullptr, &vs)))
+            break;
+        smci.codeSize = desc_const_fs_spv_len;
+        smci.pCode = reinterpret_cast<const uint32_t *>(desc_const_fs_spv);
+        if (!ok("vkCreateShaderModule(desc fs)",
+                api.CreateShaderModule(dev, &smci, nullptr, &fs)))
+            break;
+
+        // Set layouts: mirror run_replay (set0 empty placeholder; set1 UBO —
+        // the desc_const FS reads it from the fragment stage, so the stage
+        // mask widens to VERTEX|FRAGMENT; set2 texel buffer + sampled image).
+        VkDescriptorSetLayoutCreateInfo eci{};
+        eci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        if (!ok("vkCreateDescriptorSetLayout(empty)",
+                api.CreateDescriptorSetLayout(dev, &eci, nullptr, &dsl_empty)))
+            break;
+        VkDescriptorSetLayoutBinding ubo_bind{};
+        ubo_bind.binding = 0;
+        ubo_bind.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ubo_bind.descriptorCount = 1;
+        ubo_bind.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo c1{};
+        c1.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        c1.bindingCount = 1;
+        c1.pBindings = &ubo_bind;
+        if (!ok("vkCreateDescriptorSetLayout(set1)",
+                api.CreateDescriptorSetLayout(dev, &c1, nullptr, &dsl_set1)))
+            break;
+        VkDescriptorSetLayoutBinding img_binds[2]{};
+        img_binds[0].binding = 0;
+        img_binds[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        img_binds[0].descriptorCount = 1;
+        img_binds[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        img_binds[1].binding = 1;
+        img_binds[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        img_binds[1].descriptorCount = 1;
+        img_binds[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo c2{};
+        c2.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        c2.bindingCount = 2;
+        c2.pBindings = img_binds;
+        if (!ok("vkCreateDescriptorSetLayout(set2)",
+                api.CreateDescriptorSetLayout(dev, &c2, nullptr, &dsl_set2)))
+            break;
+        VkDescriptorSetLayout layouts[3] = {dsl_empty, dsl_set1, dsl_set2};
+        VkPipelineLayoutCreateInfo plci{};
+        plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plci.setLayoutCount = 3;
+        plci.pSetLayouts = layouts;
+        if (!ok("vkCreatePipelineLayout", api.CreatePipelineLayout(dev, &plci, nullptr, &pl)))
+            break;
+
+        VkDescriptorPoolSize pool_sizes[3]{};
+        pool_sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        pool_sizes[0].descriptorCount = 1;
+        pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        pool_sizes[1].descriptorCount = 1;
+        pool_sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        pool_sizes[2].descriptorCount = 1;
+        VkDescriptorPoolCreateInfo dpci{};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = 4;
+        dpci.poolSizeCount = 3;
+        dpci.pPoolSizes = pool_sizes;
+        if (!ok("vkCreateDescriptorPool", api.CreateDescriptorPool(dev, &dpci, nullptr, &dpool)))
+            break;
+        VkDescriptorSetLayout want[2] = {dsl_set1, dsl_set2};
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = dpool;
+        dsai.descriptorSetCount = 2;
+        dsai.pSetLayouts = want;
+        if (!ok("vkAllocateDescriptorSets", api.AllocateDescriptorSets(dev, &dsai, dsets)))
+            break;
+
+        VkDescriptorBufferInfo ubo_info{};
+        ubo_info.buffer = ubo;
+        ubo_info.offset = 0;
+        ubo_info.range = 16;
+        VkDescriptorImageInfo img_info{};
+        img_info.imageView = t1view;
+        img_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet writes[3]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = dsets[0];
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &ubo_info;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = dsets[1];
+        writes[1].dstBinding = 0;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        writes[1].pTexelBufferView = &t0view;
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = dsets[1];
+        writes[2].dstBinding = 1;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[2].pImageInfo = &img_info;
+        api.UpdateDescriptorSets(dev, 3, writes, 0, nullptr);
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vs;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fs;
+        stages[1].pName = "main";
+        VkPipelineVertexInputStateCreateInfo vist{};
+        vist.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        VkPipelineInputAssemblyStateCreateInfo iast{};
+        iast.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        iast.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkViewport vp{};
+        vp.width = (float)Frame::W;
+        vp.height = (float)Frame::H;
+        vp.maxDepth = 1.0f;
+        VkRect2D sc{};
+        sc.extent = {Frame::W, Frame::H};
+        VkPipelineViewportStateCreateInfo vst{};
+        vst.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vst.viewportCount = 1;
+        vst.pViewports = &vp;
+        vst.scissorCount = 1;
+        vst.pScissors = &sc;
+        VkPipelineRasterizationStateCreateInfo rst{};
+        rst.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rst.polygonMode = VK_POLYGON_MODE_FILL;
+        rst.cullMode = VK_CULL_MODE_NONE;
+        rst.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rst.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo mss{};
+        mss.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        mss.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_FALSE;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cbs{};
+        cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        cbs.attachmentCount = 1;
+        cbs.pAttachments = &cba;
+        VkGraphicsPipelineCreateInfo gpci{};
+        gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        gpci.stageCount = 2;
+        gpci.pStages = stages;
+        gpci.pVertexInputState = &vist;
+        gpci.pInputAssemblyState = &iast;
+        gpci.pViewportState = &vst;
+        gpci.pRasterizationState = &rst;
+        gpci.pMultisampleState = &mss;
+        gpci.pColorBlendState = &cbs;
+        gpci.layout = pl;
+        gpci.renderPass = frame.rp;
+        gpci.subpass = 0;
+        if (!ok("vkCreateGraphicsPipelines(desc_const)",
+                rt.CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe)))
+            break;
+
+        // Same pre/draw split as run_replay: t1 staging->image upload runs
+        // before CmdBeginRenderPass; binding + draw inside.
+        struct Ctx {
+            const RtApi *rt;
+            const DevApi *api;
+            VkPipeline pipe;
+            VkPipelineLayout pl;
+            VkDescriptorSet *dsets;
+            VkBuffer stage;
+            VkImage t1;
+        } ctx{&rt, &api, pipe, pl, dsets, stage, t1};
+        auto pre = [](VkCommandBuffer cmd, void *ud) {
+            Ctx *c = static_cast<Ctx *>(ud);
+            VkImageMemoryBarrier to_dst{};
+            to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_dst.srcAccessMask = 0;
+            to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_dst.image = c->t1;
+            to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            c->api->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                                       nullptr, 1, &to_dst);
+            VkBufferImageCopy cp{};
+            cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            cp.imageExtent = {1024, 4, 1};
+            c->rt->CmdCopyBufferToImage(cmd, c->stage, c->t1,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+            VkImageMemoryBarrier to_shader{};
+            to_shader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            to_shader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_shader.image = c->t1;
+            to_shader.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            c->api->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                                       0, nullptr, 1, &to_shader);
+        };
+        auto draw = [](VkCommandBuffer cmd, void *ud) {
+            Ctx *c = static_cast<Ctx *>(ud);
+            c->api->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipe);
+            c->api->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pl,
+                                          1, 2, c->dsets, 0, nullptr);
+            c->rt->CmdDraw(cmd, 3, 1, 0, 0);
+        };
+        if (!render_and_readback("desc_const", dev, queue, api, rt, frame, rb, rbmem,
+                                 draw, &ctx, pre, &ctx))
+            break;
+        if (!readback_pixels(dev, api, rbmem, out))
+            break;
+
+        // Expected everywhere: BGRA {191,255,255,255}. R encodes the cb0 UBO
+        // delivery, G the texel-buffer delivery; either failing shifts the
+        // byte away from 255 and fails the sample match.
+        pass = (out->n_other == Frame::W * Frame::H && out->n_clear == 0 &&
+                out->n_zero == 0 && samples_match(*out, SIG_DESC));
+    } while (0);
+
+    if (pipe) rt.DestroyPipeline(dev, pipe, nullptr);
+    if (t1view) rt.DestroyImageView(dev, t1view, nullptr);
+    if (t1) rt.DestroyImage(dev, t1, nullptr);
+    if (t1mem) api.FreeMemory(dev, t1mem, nullptr);
+    if (dpool) api.DestroyDescriptorPool(dev, dpool, nullptr);
+    if (pl) api.DestroyPipelineLayout(dev, pl, nullptr);
+    if (dsl_set2) api.DestroyDescriptorSetLayout(dev, dsl_set2, nullptr);
+    if (dsl_set1) api.DestroyDescriptorSetLayout(dev, dsl_set1, nullptr);
+    if (dsl_empty) api.DestroyDescriptorSetLayout(dev, dsl_empty, nullptr);
+    if (fs) api.DestroyShaderModule(dev, fs, nullptr);
+    if (vs) api.DestroyShaderModule(dev, vs, nullptr);
+    if (t0view) rt.DestroyBufferView(dev, t0view, nullptr);
+    if (stage) api.DestroyBuffer(dev, stage, nullptr);
+    if (stagemem) api.FreeMemory(dev, stagemem, nullptr);
+    if (t0buf) api.DestroyBuffer(dev, t0buf, nullptr);
+    if (t0mem) api.FreeMemory(dev, t0mem, nullptr);
+    if (ubo) api.DestroyBuffer(dev, ubo, nullptr);
+    if (ubomem) api.FreeMemory(dev, ubomem, nullptr);
+    if (rb) api.DestroyBuffer(dev, rb, nullptr);
+    if (rbmem) api.FreeMemory(dev, rbmem, nullptr);
+    frame.destroy(rt, api, dev);
+    std::printf("MODE=vk-d2d-replay ITEM=desc_const RESULT=%s\n", pass ? "PASS" : "FAIL");
+    print_stats("desc_const", *out);
     return pass;
 }
 
@@ -1430,9 +1801,9 @@ int main(int argc, char **argv) {
     std::printf("probe=vk_d2d_replay\n");
     std::printf("icd_path=%s\n", dll);
     std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u "
-                "sanity_novb_vs_spv_len=%u\n",
+                "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u\n",
                 d2d_text_vs_spv_len, d2d_text_fs_spv_len, sanity_vs_spv_len,
-                sanity_fs_spv_len, sanity_novb_vs_spv_len);
+                sanity_fs_spv_len, sanity_novb_vs_spv_len, desc_const_fs_spv_len);
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) {
@@ -1555,20 +1926,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    PixStats st_sanity{}, st_novb{}, st_clear{}, st_zero{}, st_ramp{};
+    PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{};
     // Order matters: cheapest base controls first so an early death still
     // leaves the most diagnostic evidence in the log.
     bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
     bool upload_ok = run_vb_roundtrip(dev, queue, api, mp);
     bool sanity = run_sanity(dev, queue, api, rt, mp, &st_sanity);
+    bool desc_ok = run_desc_const(dev, queue, api, rt, mp, &st_desc);
     bool clear_ok = run_clear_only(dev, queue, api, rt, mp, &st_clear);
     bool zero_ok = run_replay("replay_zero", true, dev, queue, api, rt, mp, &st_zero);
     bool ramp_ok = run_replay("replay_ramp", false, dev, queue, api, rt, mp, &st_ramp);
 
-    std::printf("MODE=vk-d2d-replay SUMMARY items=6 novb=%d upload=%d sanity=%d clear=%d "
-                "zero=%d ramp=%d\n",
-                novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, clear_ok ? 1 : 0,
-                zero_ok ? 1 : 0, ramp_ok ? 1 : 0);
+    std::printf("MODE=vk-d2d-replay SUMMARY items=7 novb=%d upload=%d sanity=%d desc=%d "
+                "clear=%d zero=%d ramp=%d\n",
+                novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, desc_ok ? 1 : 0,
+                clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0);
 
     int exit_code = 2;
     if (!novb) {
@@ -1588,6 +1960,13 @@ int main(int argc, char **argv) {
                     "vertex buffer paints nothing: PanVK/ICD vertex fetch suspect; the "
                     "D2D pair cannot be replayed with a host-filled vertex buffer)\n");
         std::printf("RESULT: SUSPECT\n");
+    } else if (!desc_ok) {
+        std::printf("LAYER=HARNESS_SUSPECT (descriptor feeding: the trivial-shader draw "
+                    "that consumes cb0 UBO + texel-buffer view + sampled-image bind "
+                    "through the exact replay machinery paints nothing or wrong colour; "
+                    "the D2D pair replays cannot be judged through this path; "
+                    "last_step=%s result=%d)\n", g_last_step, (int)g_last_result);
+        std::printf("RESULT: SUSPECT\n");
     } else if (zero_ok && ramp_ok) {
         std::printf("LAYER=DXVK_MAPPING (real D2D FS executes correctly when fed directly; "
                     "text ink failure suspect sits in DXVK descriptor/pipeline mapping)\n");
@@ -1595,9 +1974,12 @@ int main(int argc, char **argv) {
         exit_code = 0;
     } else if (!zero_ok && !ramp_ok && st_zero.n_clear == Frame::W * Frame::H &&
                st_ramp.n_clear == Frame::W * Frame::H) {
-        std::printf("LAYER=SPIRV_EXEC (both datasets render as pure clear; FS does not "
-                    "execute as compiled - suspect SPIR-V compile or PanVK execution of the "
-                    "texel-buffer fetch / bit-op chain)\n");
+        std::printf("LAYER=SPIRV_EXEC (both datasets render as pure clear while "
+                    "sanity_novb, vertex-buffer sanity and the full descriptor-machinery "
+                    "control desc_const all paint correctly; the real D2D pair fails to "
+                    "execute as compiled - suspect SPIR-V compile or PanVK execution of "
+                    "the texel-buffer fetch / bit-op chain / PhysicalStorageBuffer64 "
+                    "addressing)\n");
         std::printf("RESULT: VERDICT\n");
         exit_code = 0;
     } else {
