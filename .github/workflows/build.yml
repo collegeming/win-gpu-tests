@@ -239,12 +239,15 @@ jobs:
                           uniform (0,0,0,0) isolates to its own index math;
                           FAIL = harness upload defect, real FS exonerated.
             vin_1attr_stride36 / vin_2attr_stride16 / vin_4attr_stride32 /
-            vin_5attr_stride40   config bisect: healthy GLSL vertex shaders
-                          identical in every respect (same feed values, same
-                          desc_const FS, same descriptor machinery) except the
-                          attribute-count/stride configuration. PASS anywhere
-                          names the exact vertex-input config dimension that
-                          breaks PanVK vertex fetch (see VIN_BISECT line).
+            vin_5attr_stride40 / vin_1attr_stride8   config bisect: healthy
+                          GLSL vertex shaders identical in every respect (same
+                          feed values, same desc_const FS, same descriptor
+                          machinery) except the attribute-count/stride
+                          configuration. PASS anywhere names the exact
+                          vertex-input config dimension that breaks PanVK
+                          vertex fetch (see VIN_BISECT line); the stride-8
+                          twin of vin_1attr_stride36 isolates the stride
+                          dimension alone.
             flat_echo_control   feed VS + a FS echoing its noperspective/flat
                           outputs back as colour (all {0,17,136,128} BGRA =
                           PASS): validates the flat varying delivery the real
@@ -268,11 +271,13 @@ jobs:
             LAYER=HARNESS_VERTEX_INPUT  fiveattr_vs_control also all-clear ->
                                      the harness 5-attr vertex input itself is
                                      broken; d2d-VS verdict withdrawn (SUSPECT).
-                                     Refined by the VIN_BISECT line: any vin_*
-                                     PASS -> LAYER=PANVK_VERTEX_FETCH (VERDICT:
-                                     the breakage is a PanVK/ICD vertex-input
-                                     config defect, directly explaining the
-                                     original D2D text ink=0); all vin_* FAIL ->
+                                     Refined by the VIN_BISECT line: vin_1attr_
+                                     stride8 PASS -> LAYER=PANVK_VERTEX_FETCH_
+                                     STRIDE (VERDICT: stride>8 vertex fetch is
+                                     broken on this PanVK stack - the direct
+                                     mechanism of the D2D text ink=0); other
+                                     vin_* PASS -> LAYER=PANVK_VERTEX_FETCH
+                                     (config-dimension verdict); all FAIL ->
                                      LAYER=HARNESS_VERTEX_INPUT_BROAD (SUSPECT:
                                      single-attr/8B works but everything wider
                                      breaks; PanVK-side comparison pending).
