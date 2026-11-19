@@ -19,6 +19,7 @@ on:
       - 'd2d_text_fs_spv.h'
       - 'sanity.vert'
       - 'sanity.frag'
+      - 'sanity_novb.vert'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -57,9 +58,11 @@ jobs:
           # the symbols sanity_vs_spv[] + sanity_vs_spv_len (same for fs).
           glslangValidator -V --target-env vulkan1.0 sanity.vert -o sanity_vert.spv
           glslangValidator -V --target-env vulkan1.0 sanity.frag -o sanity_frag.spv
+          glslangValidator -V --target-env vulkan1.0 sanity_novb.vert -o sanity_novb_vert.spv
           xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
           xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
-          ls -l sanity_vert.spv sanity_frag.spv sanity_vs_spv.h sanity_fs_spv.h
+          xxd -i -n sanity_novb_vs_spv sanity_novb_vert.spv > sanity_novb_vs_spv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -71,6 +74,7 @@ jobs:
             float_rt_frag_spirv.h
             sanity_vs_spv.h
             sanity_fs_spv.h
+            sanity_novb_vs_spv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -153,10 +157,16 @@ jobs:
           swapchain, 256x256 offscreen BGRA8, all readback via HOST_VISIBLE copy.
 
           Items (fixed order):
-            sanity_const  trivial VS/FS constant write (GLSL sources sanity.vert /
-                          sanity.frag, compiled to SPIR-V in the spirv job);
-                          must cover every pixel (191,128,64,255 in BGRA bytes)
-                          or the whole run is SUSPECT.
+            sanity_novb   gl_VertexIndex fullscreen triangle, constant FS, NO vertex
+                          buffer, NO upload (the proven test_vk_uint_rt shape);
+                          must cover every pixel (191,128,64,255 BGRA) or the run is
+                          HARNESS_SUSPECT at the base draw level.
+            vb_roundtrip  no draw: map-write 6 words into a vertex buffer, re-map and
+                          compare (cpu_echo), then CmdCopyBuffer GPU-side into a
+                          second buffer and compare (gpu_copy). Both must match or
+                          the run is UPLOAD_BROKEN.
+            sanity_const  trivial VS/FS fed from a CPU-filled vertex buffer; same
+                          coverage expectation as sanity_novb.
             clear_only    clear (10,200,20,255) with no draw; must be 65536 clear pixels.
             replay_zero   the real dumped D2D text VS+FS pair (vs.fdce93f5...spv /
                           fs.8ed1f4d2...spv), u32 texel buffer 1024 texels all zero,
@@ -167,12 +177,20 @@ jobs:
                           LUT gradient band; x1 index = sum(t0[b..b+2]) + 217).
 
           Reading the verdict line:
-            LAYER=DXVK_MAPPING     both replays behave as computed -> the D2D text ink
-                                   defect sits in DXVK descriptor/pipeline mapping.
-            LAYER=SPIRV_EXEC       both replays render as pure clear colour regardless
-                                   of buffer content -> SPIR-V/PanVK execution defect.
-            LAYER=HARNESS_SUSPECT  replay output inconsistent with either story; treat
-                                   as inconclusive (harness or driver mis-fed).
+            LAYER=DXVK_MAPPING       both replays behave as computed -> the D2D text
+                                     ink defect sits in DXVK descriptor/pipeline mapping.
+            LAYER=SPIRV_EXEC         both replays render as pure clear colour regardless
+                                     of buffer content -> SPIR-V/PanVK execution defect.
+            LAYER=UPLOAD_BROKEN      sanity_novb paints but CPU-written mapped memory
+                                     is not seen by the GPU (cpu_echo / gpu_copy
+                                     evidence above) -> replay unfed; redo with
+                                     GPU-side (compute) fills.
+            LAYER=VERTEX_FETCH_BROKEN  sanity_novb paints and uploads verify, but the
+                                     vertex-buffer-fed draw paints nothing -> PanVK/ICD
+                                     vertex fetch suspect; replay needs GPU-side
+                                     vertex fill.
+            LAYER=HARNESS_SUSPECT    base draw broken, or replay output inconsistent
+                                     with either story; treat as inconclusive.
           Exit 0 = verdict reached; 1 = setup failure; 2 = SUSPECT.
           '@ | Set-Content usage-d2d-replay.txt -Encoding ascii
           @"
