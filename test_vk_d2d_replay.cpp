@@ -1432,6 +1432,10 @@ static bool run_desc_const(VkDevice dev, VkQueue queue,
 //          PASS (all SIG_FLATECHO {0,17,136,128}) -> flat varying delivery
 //          intact, the real d2d FS's (0,0,0,0) is its own math; FAIL ->
 //          flat delivery broken, FS-colour conclusions suspended.
+//   mode=9 "vin_1attr_stride8": stride-8 twin of vin_1attr_stride36 - the
+//          same oneattr VS + same 0/256 data + same buffer path, ONLY the
+//          binding stride (8 vs 36) differs.  PASS here + FAIL at 36
+//          convicts the stride dimension of PanVK vertex fetch alone.
 // ---------------------------------------------------------------------------
 static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
                        const DevApi &api, const RtApi &rt,
@@ -1539,6 +1543,19 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
             nfloats = 10;
             vstride = 40;
             vattrs = 5;
+        } else if (mode == 9) {
+            // Stride-8 twin of vin_1attr_stride36: same oneattr VS, same
+            // 0/256 data encoding, same buffer path - ONLY the binding
+            // stride (8 vs 36) differs.  PASS here + FAIL at stride 36
+            // convicts the stride dimension alone.
+            for (int v = 0; v < 3; ++v) {
+                float *f = &verts[v * 2];
+                f[0] = int_bits_float(v == 1 ? 256u : 0u);
+                f[1] = int_bits_float(v == 2 ? 256u : 0u);
+            }
+            nfloats = 2;
+            vstride = 8;
+            vattrs = 1;
         }
         if (nfloats) {
             const VkDeviceSize vbsize = (VkDeviceSize)sizeof(float) * 3 * nfloats;
@@ -1631,6 +1648,9 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
             smci.codeSize = sanity_novb_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(sanity_novb_vs_spv);
         } else if (mode == 4) {
+            smci.codeSize = oneattr_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(oneattr_vs_spv);
+        } else if (mode == 9) {
             smci.codeSize = oneattr_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(oneattr_vs_spv);
         } else if (mode == 5) {
@@ -1906,7 +1926,7 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         if (!readback_pixels(dev, api, rbmem, out))
             break;
 
-        if (mode == 1 || mode == 2 || (mode >= 4 && mode <= 7)) {
+        if (mode == 1 || mode == 2 || (mode >= 4 && mode <= 7) || mode == 9) {
             // desc_const FS through a vertex-fed VS (real d2d, healthy
             // fiveattr, or one of the vin_* config-bisect variants):
             // expected everywhere SIG_DESC {191,255,255,255}.
@@ -2522,7 +2542,7 @@ int main(int argc, char **argv) {
 
     PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{}, st_bvs{},
              st_bfs{}, st_five{}, st_lut{}, st_vin1{}, st_vin2{}, st_vin4{}, st_vin5{},
-             st_fecho{};
+             st_fecho{}, st_vin8{};
     // Order matters: cheapest base controls first so an early death still
     // leaves the most diagnostic evidence in the log.
     bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
@@ -2541,27 +2561,29 @@ int main(int argc, char **argv) {
     bool vin4_ok = run_bisect("vin_4attr_stride32", 6, dev, queue, api, rt, mp, &st_vin4);
     bool vin5_ok = run_bisect("vin_5attr_stride40", 7, dev, queue, api, rt, mp, &st_vin5);
     bool fecho_ok = run_bisect("flat_echo_control", 8, dev, queue, api, rt, mp, &st_fecho);
+    bool vin8_ok = run_bisect("vin_1attr_stride8", 9, dev, queue, api, rt, mp, &st_vin8);
 
-    std::printf("MODE=vk-d2d-replay SUMMARY items=16 novb=%d upload=%d sanity=%d desc=%d "
+    std::printf("MODE=vk-d2d-replay SUMMARY items=17 novb=%d upload=%d sanity=%d desc=%d "
                 "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d fiveattr=%d lut=%d "
-                "vin1=%d vin2=%d vin4=%d vin5=%d fecho=%d\n",
+                "vin1=%d vin2=%d vin4=%d vin5=%d fecho=%d vin8s=%d\n",
                 novb ? 1 : 0, upload_ok ? 1 : 0, sanity ? 1 : 0, desc_ok ? 1 : 0,
                 clear_ok ? 1 : 0, zero_ok ? 1 : 0, ramp_ok ? 1 : 0,
                 bisect_vs ? 1 : 0, bisect_fs ? 1 : 0, fiveattr_ok ? 1 : 0,
                 lut_ok ? 1 : 0, vin1_ok ? 1 : 0, vin2_ok ? 1 : 0, vin4_ok ? 1 : 0,
-                vin5_ok ? 1 : 0, fecho_ok ? 1 : 0);
+                vin5_ok ? 1 : 0, fecho_ok ? 1 : 0, vin8_ok ? 1 : 0);
     std::printf("CONTROLS fiveattr=%d lut_read=%d (fiveattr PASS closes the 5-attr "
                 "vertex-input loophole behind the d2d-VS verdict; lut_read PASS "
                 "validates the LUT staging->image upload + 2D fetch that the "
                 "real FS's (0,0,0,0) output put in question)\n",
                 fiveattr_ok ? 1 : 0, lut_ok ? 1 : 0);
     std::printf("VIN_BISECT 1attr_s36=%d 2attr_s16=%d 4attr_s32=%d 5attr_s40=%d "
-                "(healthy GLSL vertex shaders that differ only in the "
-                "attribute-count/stride configuration; all clear = the failure "
-                "is not specific to the d2d VS at all but to the vertex-input "
-                "config; any pass names the dimension that breaks PanVK "
-                "vertex fetch)\n",
-                vin1_ok ? 1 : 0, vin2_ok ? 1 : 0, vin4_ok ? 1 : 0, vin5_ok ? 1 : 0);
+                "1attr_s8=%d (healthy GLSL vertex shaders that differ only in "
+                "the attribute-count/stride configuration; all clear = the "
+                "failure is not specific to the d2d VS at all but to the "
+                "vertex-input config; any pass names the dimension that "
+                "breaks PanVK vertex fetch)\n",
+                vin1_ok ? 1 : 0, vin2_ok ? 1 : 0, vin4_ok ? 1 : 0,
+                vin5_ok ? 1 : 0, vin8_ok ? 1 : 0);
     std::printf("FLAT_ECHO %d (PASS: the flat/noperspective varying delivery the real "
                 "FS consumes is intact, so its (0,0,0,0) output is its own "
                 "index math; FAIL: flat delivery broken, FS output judgement "
@@ -2640,7 +2662,21 @@ int main(int argc, char **argv) {
             } else {
                 const int vin_any = (vin1_ok ? 1 : 0) + (vin2_ok ? 1 : 0) +
                                     (vin4_ok ? 1 : 0) + (vin5_ok ? 1 : 0);
-                if (vin_any) {
+                if (vin8_ok) {
+                    std::printf("LAYER=PANVK_VERTEX_FETCH_STRIDE (stride control: the "
+                                "identical oneattr VS + 0/256 data + buffer path "
+                                "paints SIG_DESC at binding stride 8 while every "
+                                "stride>8 config - 16/32/36/40 bytes, ANY attribute "
+                                "count 1..5, healthy or real d2d - produces zero "
+                                "rasterization; PanVK/ICD vertex fetch on this stack "
+                                "breaks as soon as the vertex binding stride exceeds "
+                                "the 8-byte single-R32G32 shape; the real D2D text "
+                                "pipeline feeds its VS through 36-byte-stride "
+                                "attributes, so THIS is the mechanism of the text "
+                                "ink=0 defect)\n");
+                    std::printf("RESULT: VERDICT\n");
+                    exit_code = 0;
+                } else if (vin_any) {
                     std::printf("LAYER=PANVK_VERTEX_FETCH (the healthy fiveattr "
                                 "control VS paints nothing through the 5-attr/36B "
                                 "input, but healthy GLSL vertex shaders DO paint "
