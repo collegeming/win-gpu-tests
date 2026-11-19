@@ -14,6 +14,11 @@ on:
       - 'text_glyph_probe.cpp'
       - 'compute.comp'
       - 'compute_nop.comp'
+      - 'test_vk_d2d_replay.cpp'
+      - 'd2d_text_vs_spv.h'
+      - 'd2d_text_fs_spv.h'
+      - 'sanity_vs_spv.h'
+      - 'sanity_fs_spv.h'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -115,6 +120,73 @@ jobs:
             vk_uint_rt_arm64.exe
             SHA256SUMS-vk-rt.txt
           if-no-files-found: error
+      - name: Build Vulkan D2D text shader replay test
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /std:c++17 /I third_party\vulkan\include test_vk_d2d_replay.cpp /Fe:vk_replay_arm64.exe
+          if errorlevel 1 exit /b 1
+      - name: Package D2D replay evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path .\vk_replay_arm64.exe).Path
+          $b = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          if ($machine -ne 0xaa64) { throw 'Expected ARM64 PE' }
+          @'
+          vk_replay_arm64.exe [icd_dll_path]
+
+          icd_dll_path defaults to C:\panvk\dev_vulkan_virtio.dll (direct ICD load via
+          vk_icdGetInstanceProcAddr, no Vulkan loader). Console ARM64, no window, no
+          swapchain, 256x256 offscreen BGRA8, all readback via HOST_VISIBLE copy.
+
+          Items (fixed order):
+            sanity_const  handcrafted trivial VS/FS constant write; must cover every pixel
+                          (191,128,64,255 in BGRA bytes) or the whole run is SUSPECT.
+            clear_only    clear (10,200,20,255) with no draw; must be 65536 clear pixels.
+            replay_zero   the real dumped D2D text VS+FS pair (vs.fdce93f5...spv /
+                          fs.8ed1f4d2...spv), u32 texel buffer 1024 texels all zero,
+                          LUT row 1; expects uniform SIG_ZERO (20,200,10,200 BGRA)
+                          on >= 64512 of 65536 pixels.
+            replay_ramp   same pair, texel buffer min(i,60); expects varying non-clear,
+                          non-SIG_ZERO output on >= 64512 pixels (G channel walks a
+                          LUT gradient band; x1 index = sum(t0[b..b+2]) + 217).
+
+          Reading the verdict line:
+            LAYER=DXVK_MAPPING     both replays behave as computed -> the D2D text ink
+                                   defect sits in DXVK descriptor/pipeline mapping.
+            LAYER=SPIRV_EXEC       both replays render as pure clear colour regardless
+                                   of buffer content -> SPIR-V/PanVK execution defect.
+            LAYER=HARNESS_SUSPECT  replay output inconsistent with either story; treat
+                                   as inconclusive (harness or driver mis-fed).
+          Exit 0 = verdict reached; 1 = setup failure; 2 = SUSPECT.
+          '@ | Set-Content usage-d2d-replay.txt -Encoding ascii
+          @"
+          source_commit=$env:GITHUB_SHA
+          source_branch=$env:GITHUB_REF_NAME
+          run=https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          run_attempt=$env:GITHUB_RUN_ATTEMPT
+          build_utc=$([DateTime]::UtcNow.ToString('o'))
+          runner=$env:RUNNER_OS/$env:RUNNER_ARCH
+          machine=0x$($machine.ToString('x4')) subsystem=console
+          compiler=MSVC cl /EHsc /O2 /std:c++17
+          shaders=dumped D2D text pair embedded verbatim (d2d_text_vs_spv 2908B, d2d_text_fs_spv 3260B)
+          device_run=NOT_TESTED (verdict requires the target GPU; runner has no GPU)
+          "@ | Set-Content build-info-d2d-replay.txt -Encoding utf8
+          '{0}  vk_replay_arm64.exe' -f (Get-FileHash $exe -Algorithm SHA256).Hash |
+            Set-Content SHA256SUMS-d2d-replay.txt -Encoding ascii
+          Get-Content SHA256SUMS-d2d-replay.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d2d-replay-arm64
+          path: |
+            vk_replay_arm64.exe
+            usage-d2d-replay.txt
+            build-info-d2d-replay.txt
+            SHA256SUMS-d2d-replay.txt
+          if-no-files-found: error
+          retention-days: 30
       - name: Build offscreen text glyph probe (D3D11+D2D/DirectWrite, GDI)
         shell: cmd
         run: |
