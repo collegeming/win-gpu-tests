@@ -17,8 +17,8 @@ on:
       - 'test_vk_d2d_replay.cpp'
       - 'd2d_text_vs_spv.h'
       - 'd2d_text_fs_spv.h'
-      - 'sanity_vs_spv.h'
-      - 'sanity_fs_spv.h'
+      - 'sanity.vert'
+      - 'sanity.frag'
       - 'third_party/**'
       - '.github/workflows/build.yml'
 permissions:
@@ -51,6 +51,15 @@ jobs:
           xxd -i -n uint_rt_frag_spirv uint_rt_frag.spv > uint_rt_frag_spirv.h
           xxd -i -n float_rt_frag_spirv float_rt_frag.spv > float_rt_frag_spirv.h
           ls -l uint_rt_vert_spirv.h uint_rt_frag_spirv.h float_rt_frag_spirv.h
+          # Sanity control for the D2D text shader replay. Generated here by
+          # glslangValidator so the module layout is compiler-guaranteed; the
+          # replay harness includes sanity_vs_spv.h / sanity_fs_spv.h and reads
+          # the symbols sanity_vs_spv[] + sanity_vs_spv_len (same for fs).
+          glslangValidator -V --target-env vulkan1.0 sanity.vert -o sanity_vert.spv
+          glslangValidator -V --target-env vulkan1.0 sanity.frag -o sanity_frag.spv
+          xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
+          xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_vs_spv.h sanity_fs_spv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -60,6 +69,8 @@ jobs:
             uint_rt_vert_spirv.h
             uint_rt_frag_spirv.h
             float_rt_frag_spirv.h
+            sanity_vs_spv.h
+            sanity_fs_spv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -142,8 +153,10 @@ jobs:
           swapchain, 256x256 offscreen BGRA8, all readback via HOST_VISIBLE copy.
 
           Items (fixed order):
-            sanity_const  handcrafted trivial VS/FS constant write; must cover every pixel
-                          (191,128,64,255 in BGRA bytes) or the whole run is SUSPECT.
+            sanity_const  trivial VS/FS constant write (GLSL sources sanity.vert /
+                          sanity.frag, compiled to SPIR-V in the spirv job);
+                          must cover every pixel (191,128,64,255 in BGRA bytes)
+                          or the whole run is SUSPECT.
             clear_only    clear (10,200,20,255) with no draw; must be 65536 clear pixels.
             replay_zero   the real dumped D2D text VS+FS pair (vs.fdce93f5...spv /
                           fs.8ed1f4d2...spv), u32 texel buffer 1024 texels all zero,
