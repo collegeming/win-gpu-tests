@@ -67,6 +67,12 @@
 #include "twoattr_vs_spv.h"
 #include "fourattr_vs_spv.h"
 #include "flat_echo_fs_spv.h"
+#include "vs_noinv_spv.h"
+#include "vs_nophys_spv.h"
+#include "vs_trunc_spv.h"
+#include "vs_keephead_spv.h"
+#include "fiveattr_inv_vs_spv.h"
+#include "fiveattr_psb_spv.h"
 
 typedef PFN_vkVoidFunction(VKAPI_PTR *PFN_icdGetInstanceProcAddr_t)(VkInstance, const char *);
 
@@ -1481,11 +1487,20 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         //   mode 6:   4 attrs, stride 32   (5-attr shape minus loc4/R32)
         //   mode 7:   5 attrs, stride 40   (5-attr shape, 8-aligned stride)
         //   modes 0,3,8: no vertex buffer.
+        //   mode 9:   1 attr,  stride 8    (stride-8 twin of mode 4)
+        //   modes 10-13: surgical real-VS variants, 5 attrs, stride 36:
+        //     10 = real VS minus OpDecorate Invariant on SV_Position
+        //     11 = real VS minus PSB64 addressing (Logical + no cap)
+        //     12 = real interface/declarations + minimal healthy body
+        //     13 = real body kept through the input decodes (ax/ay),
+        //          minimal healthy tail after
+        //   mode 14: fiveattr VS + invariant gl_Position (reverse probe)
+        //   mode 15: fiveattr VS + PSB64/VulkanMemoryModel header (reverse)
         // Flat packing: row v starts at float index v*nfloats, so the
         // rows sit exactly vstride bytes apart for every mode.
         float verts[30];
         uint32_t nfloats = 0;
-        if (mode == 1 || mode == 2 || mode == 4) {
+        if (mode == 1 || mode == 2 || mode == 4 || (mode >= 10 && mode <= 15)) {
             for (int v = 0; v < 3; ++v) {
                 float *f = &verts[v * 9];
                 f[0] = int_bits_float(v == 1 ? 256u : 0u);
@@ -1663,6 +1678,24 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         } else if (mode == 7) {
             smci.codeSize = fiveattr_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(fiveattr_vs_spv);
+        } else if (mode == 10) {
+            smci.codeSize = vs_noinv_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(vs_noinv_spv);
+        } else if (mode == 11) {
+            smci.codeSize = vs_nophys_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(vs_nophys_spv);
+        } else if (mode == 12) {
+            smci.codeSize = vs_trunc_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(vs_trunc_spv);
+        } else if (mode == 13) {
+            smci.codeSize = vs_keephead_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(vs_keephead_spv);
+        } else if (mode == 14) {
+            smci.codeSize = fiveattr_inv_vs_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(fiveattr_inv_vs_spv);
+        } else if (mode == 15) {
+            smci.codeSize = fiveattr_psb_spv_len;
+            smci.pCode = reinterpret_cast<const uint32_t *>(fiveattr_psb_spv);
         } else {
             smci.codeSize = d2d_feed_vs_spv_len;
             smci.pCode = reinterpret_cast<const uint32_t *>(d2d_feed_vs_spv);
@@ -1927,7 +1960,8 @@ static bool run_bisect(const char *label, int mode, VkDevice dev, VkQueue queue,
         if (!readback_pixels(dev, api, rbmem, out))
             break;
 
-        if (mode == 1 || mode == 2 || (mode >= 4 && mode <= 7) || mode == 9) {
+        if (mode == 1 || mode == 2 || (mode >= 4 && mode <= 7) || mode == 9 ||
+            (mode >= 10 && mode <= 15)) {
             // desc_const FS through a vertex-fed VS (real d2d, healthy
             // fiveattr, or one of the vin_* config-bisect variants):
             // expected everywhere SIG_DESC {191,255,255,255}.
@@ -2413,12 +2447,17 @@ int main(int argc, char **argv) {
     std::printf("d2d_vs_spv_len=%u d2d_fs_spv_len=%u sanity_vs_spv_len=%u sanity_fs_spv_len=%u "
                 "sanity_novb_vs_spv_len=%u desc_const_fs_spv_len=%u d2d_feed_vs_spv_len=%u "
                 "fiveattr_vs_spv_len=%u lut_read_fs_spv_len=%u oneattr_vs_spv_len=%u "
-                "twoattr_vs_spv_len=%u fourattr_vs_spv_len=%u flat_echo_fs_spv_len=%u\n",
+                "twoattr_vs_spv_len=%u fourattr_vs_spv_len=%u flat_echo_fs_spv_len=%u "
+                "vs_noinv_spv_len=%u vs_nophys_spv_len=%u vs_trunc_spv_len=%u "
+                "vs_keephead_spv_len=%u fiveattr_inv_vs_spv_len=%u "
+                "fiveattr_psb_spv_len=%u\n",
                 d2d_text_vs_spv_len, d2d_text_fs_spv_len, sanity_vs_spv_len,
                 sanity_fs_spv_len, sanity_novb_vs_spv_len, desc_const_fs_spv_len,
                 d2d_feed_vs_spv_len, fiveattr_vs_spv_len, lut_read_fs_spv_len,
                 oneattr_vs_spv_len, twoattr_vs_spv_len, fourattr_vs_spv_len,
-                flat_echo_fs_spv_len);
+                flat_echo_fs_spv_len,
+                vs_noinv_spv_len, vs_nophys_spv_len, vs_trunc_spv_len,
+                vs_keephead_spv_len, fiveattr_inv_vs_spv_len, fiveattr_psb_spv_len);
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) {
@@ -2543,7 +2582,8 @@ int main(int argc, char **argv) {
 
     PixStats st_sanity{}, st_novb{}, st_desc{}, st_clear{}, st_zero{}, st_ramp{}, st_bvs{},
              st_bfs{}, st_five{}, st_lut{}, st_vin1{}, st_vin2{}, st_vin4{}, st_vin5{},
-             st_fecho{}, st_vin8{};
+             st_fecho{}, st_vin8{}, st_snoinv{}, st_snophys{}, st_strunc{},
+             st_skeep{}, st_rinv{}, st_rpsb{};
     // Order matters: cheapest base controls first so an early death still
     // leaves the most diagnostic evidence in the log.
     bool novb = run_sanity_novb(dev, queue, api, rt, mp, &st_novb);
@@ -2563,6 +2603,17 @@ int main(int argc, char **argv) {
     bool vin5_ok = run_bisect("vin_5attr_stride40", 7, dev, queue, api, rt, mp, &st_vin5);
     bool fecho_ok = run_bisect("flat_echo_control", 8, dev, queue, api, rt, mp, &st_fecho);
     bool vin8_ok = run_bisect("vin_1attr_stride8", 9, dev, queue, api, rt, mp, &st_vin8);
+    // Round-11 surgical probes (m01662): the real d2d VS with exactly one
+    // suspect feature removed, and the healthy fiveattr VS with exactly one
+    // suspect feature added.  All run the same 5-attr/36B data + cb0 +
+    // replay descriptor machinery + desc_const FS; SIG_DESC paint == the
+    // module survives PanVK execution.
+    bool surg_noinv = run_bisect("surg_vs_noinv", 10, dev, queue, api, rt, mp, &st_snoinv);
+    bool surg_nophys = run_bisect("surg_vs_nophys", 11, dev, queue, api, rt, mp, &st_snophys);
+    bool surg_trunc = run_bisect("surg_vs_trunc", 12, dev, queue, api, rt, mp, &st_strunc);
+    bool surg_keep = run_bisect("surg_vs_keephead", 13, dev, queue, api, rt, mp, &st_skeep);
+    bool rev_inv = run_bisect("rev_fiveattr_invariant", 14, dev, queue, api, rt, mp, &st_rinv);
+    bool rev_psb = run_bisect("rev_fiveattr_psb", 15, dev, queue, api, rt, mp, &st_rpsb);
 
     std::printf("MODE=vk-d2d-replay SUMMARY items=17 novb=%d upload=%d sanity=%d desc=%d "
                 "clear=%d zero=%d ramp=%d bisect_vs=%d bisect_fs=%d fiveattr=%d lut=%d "
@@ -2589,6 +2640,57 @@ int main(int argc, char **argv) {
                 "FS consumes is intact, so its (0,0,0,0) output is its own "
                 "index math; FAIL: flat delivery broken, FS output judgement "
                 "suspended)\n", fecho_ok ? 1 : 0);
+    std::printf("SURGERY noinv=%d nophys=%d trunc=%d keephead=%d rev_inv=%d rev_psb=%d "
+                "(noinv/nophys/trunc/keephead = the real d2d VS with exactly one "
+                "suspect feature deleted - Invariant decoration / PSB64 addressing "
+                "header / whole body / body after the input-decode block; rev_* = "
+                "the healthy fiveattr VS with exactly one suspect feature added - "
+                "invariant gl_Position / PSB64+VulkanMemoryModel header.  PAINT = "
+                "the deleted feature was the killer, or the added feature alone "
+                "is innocent; ALL-CLEAR = that single feature is not the whole "
+                "story)\n",
+                surg_noinv ? 1 : 0, surg_nophys ? 1 : 0, surg_trunc ? 1 : 0,
+                surg_keep ? 1 : 0, rev_inv ? 1 : 0, rev_psb ? 1 : 0);
+    {
+        const char *lethal = nullptr;
+        if (surg_noinv)
+            lethal = "INVARIANT (removing the OpDecorate Invariant from SV_Position "
+                     "alone lets the real d2d VS rasterize)";
+        else if (surg_nophys)
+            lethal = "PSB64_HEADER (switching PhysicalStorageBuffer64 addressing + "
+                     "VulkanMemoryModel to Logical alone lets the real d2d VS "
+                     "rasterize)";
+        else if (surg_trunc && !surg_keep)
+            lethal = "HEAD_DECODE_BLOCK (interface + a healthy body paint, but "
+                     "keeping the real body's input-decode chains kills it)";
+        else if (surg_trunc)
+            lethal = "REAL_BODY_MATH (interface + input decodes survive; the real "
+                     "body's position-FMix/glyph-coord math section is lethal)";
+        if (lethal) {
+            std::printf("LETHAL_FEATURE: %s; reverse-confirm: inv=%s psb=%s\n",
+                        lethal,
+                        rev_inv ? "PAINTS (Invariant alone does NOT kill the healthy "
+                                   "fiveattr VS - combination factor)"
+                                : "FAILS (Invariant alone kills the healthy "
+                                   "fiveattr VS - sufficiency confirmed)",
+                        rev_psb ? "PAINTS (PSB64 header alone does NOT kill the "
+                                   "healthy fiveattr VS - combination factor)"
+                                : "FAILS (PSB64 header alone kills the healthy "
+                                   "fiveattr VS - sufficiency confirmed)");
+        } else if (surg_keep) {
+            std::printf("LETHAL_FEATURE: TAIL_ONLY (keephead paints but trunc does "
+                        "not: the real body survives through its input decodes; "
+                        "the self-decoded minimal tail is the difference - "
+                        "combination analysis in the report)\n");
+        } else {
+            std::printf("LETHAL_FEATURE: NONE_ISOLATED (no single-feature deletion "
+                        "revives the real d2d VS; rev_inv=%d rev_psb=%d; either a "
+                        "multi-feature combination or a deeper PanVK/SPIR-V "
+                        "execution defect - final NIR/disassembly comparison is "
+                        "the next instrument)\n",
+                        rev_inv ? 1 : 0, rev_psb ? 1 : 0);
+        }
+    }
 
     int exit_code = 2;
     if (!novb) {
