@@ -16,9 +16,9 @@
 // ASCII plus UTF-8 adapter names.
 //
 // Exit codes: 0 = every executed path PASS (or --self-test PASS), 2 = setup or
-// render or readback failure, or any path FAIL. Nothing is fabricated: on
-// failure the exact stage, HRESULT and Win32 code are printed and the path is
-// reported FAIL.
+// render or readback failure, or any path FAIL, 3 = soak watchdog stall, 4 =
+// soak could not create a device. Nothing is fabricated: on failure the exact
+// stage, HRESULT and Win32 code are printed and the path is reported FAIL.
 //
 // A PASS means "dark pixels of a plausible size were found in the readback
 // surface for this exact offscreen path". It does not prove on-screen
@@ -34,12 +34,16 @@
 #include <d3dcompiler.h>
 #include <winver.h>
 #include <wrl/client.h>
+#include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <process.h>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -787,6 +791,11 @@ int run_self_test() {
 //                           its own target: a solid fill measured correct while
 //                           a 1px stroke measured white points at the coverage
 //                           rasterizer rather than at the D2D surface path.
+//   --mode soak             long-run repetition of the d2d-primitives,
+//                           d2d-aa-modes and text-paths bodies on ONE device
+//                           for the whole process lifetime (--minutes N,
+//                           default 10), one SOAK_HEARTBEAT line per round and
+//                           a 240 s stall watchdog (SOAK_STALL, exit 3).
 //
 // Items are judged by presence of the expected pixels, not by the full-mode
 // text rule: a solid fill is expected to be 100% dark and single-coloured, so
@@ -1062,15 +1071,14 @@ const char* print_color_item(const char* mode, const char* item, Rgba want, Rgba
 }
 
 // Item 1: one target, one readback, three independently judged items.
-int run_d2d_primitives(bool warp, bool debug_layer) {
+// Body shared by the standalone mode and by soak: the caller already created
+// the Gpu (standalone: one per invocation; soak: one for the whole process),
+// so repeated calls keep one D3D11/D2D/DirectWrite stack alive like a
+// long-lived compositor session instead of rebuilding the device every
+// round. Targets are still created per call, so per-item target churn and
+// readback behaviour are exactly what the standalone mode does.
+int run_d2d_primitives_body(Gpu& g, bool warp) {
     const char* path = "d2d-primitives";
-    Gpu g;
-    if (!gpu_create(path, warp, debug_layer, g)) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
-        return 2;
-    }
-    gpu_adapter(path, g.device.Get());
     Target t;
     if (!target_create(path, g, warp, t)) {
         ++g_failures;
@@ -1136,6 +1144,18 @@ int run_d2d_primitives(bool warp, bool debug_layer) {
         " all_draws_lost=%s\n", path, failed, geometry_ink ? "yes" : "no",
         glyph_ink ? "yes" : "no", (!geometry_ink && !glyph_ink) ? "yes" : "no");
     return failed ? 2 : 0;
+}
+
+int run_d2d_primitives(bool warp, bool debug_layer) {
+    const char* path = "d2d-primitives";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    return run_d2d_primitives_body(g, warp);
 }
 
 // Item 2: one glyph draw per text antialias mode, each on its own texture.
@@ -2788,16 +2808,9 @@ struct AaItem {
     const char* expected;
 };
 
-int run_d2d_aa_modes(bool warp, bool debug_layer) {
+// Body shared by the standalone mode and by soak; see run_d2d_primitives_body.
+int run_d2d_aa_modes_body(Gpu& g, bool warp) {
     const char* path = "d2d-aa-modes";
-    Gpu g;
-    if (!gpu_create(path, warp, debug_layer, g)) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
-        return 2;
-    }
-    gpu_adapter(path, g.device.Get());
-
     ComPtr<ID2D1PathGeometry> triangle;
     HRESULT hr = g.d2d->CreatePathGeometry(&triangle);
     out("MODE=%s stage=create_path_geometry hr=0x%08lx\n", path,
@@ -2932,6 +2945,18 @@ int run_d2d_aa_modes(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+int run_d2d_aa_modes(bool warp, bool debug_layer) {
+    const char* path = "d2d-aa-modes";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    return run_d2d_aa_modes_body(g, warp);
+}
+
 // target_create with an explicit D2D alpha mode. A separate function on purpose:
 // the v2/v3 modes keep calling target_create and their output lines are not
 // touched by the alpha-mode cases.
@@ -3062,16 +3087,9 @@ int finish_text_item(const char* path, const char* item, const char* extra, Gpu&
     return print_ink_item(path, item, extra, s) ? 1 : 0;
 }
 
-int run_text_paths(bool warp, bool debug_layer) {
+// Body shared by the standalone mode and by soak; see run_d2d_primitives_body.
+int run_text_paths_body(Gpu& g, bool warp) {
     const char* path = "text-paths";
-    Gpu g;
-    if (!gpu_create(path, warp, debug_layer, g)) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
-        return 2;
-    }
-    gpu_adapter(path, g.device.Get());
-
     int failed = 0;
     ComPtr<IDWriteTextLayout> layout;
     HRESULT hr = g.dwrite->CreateTextLayout(kText, kTextLen, g.format.Get(), 496.0f, 112.0f,
@@ -3359,6 +3377,18 @@ int run_text_paths(bool warp, bool debug_layer) {
         " text=\"TEST 123\" font=\"Segoe UI\" size_px=48\n", path, failed);
     if (failed) ++g_failures;
     return failed ? 2 : 0;
+}
+
+int run_text_paths(bool warp, bool debug_layer) {
+    const char* path = "text-paths";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    return run_text_paths_body(g, warp);
 }
 
 // ============================================================================
@@ -8473,6 +8503,115 @@ int run_int_attribs(bool warp, bool debug_layer) {
     return failed ? 2 : 0;
 }
 
+// ============================================================================
+// Soak mode. The short single-shot runs pass against the experimental ICD
+// while a real DWM session freezes minutes after login, and one aliased-text
+// case has hung for 18 minutes inside this probe before. Both symptoms point
+// at something only long, repeated D2D traffic on ONE long-lived device
+// exposes: a leak that accumulates, a lazy path that only trips on the Nth
+// round, or a GPU-side retry spin. Short probes cannot hit those.
+//
+// --mode soak loops the three D2D/DirectWrite suites (d2d-primitives,
+// d2d-aa-modes, text-paths) through their existing bodies on one
+// process-lifetime Gpu; per-suite output and verdicts are unchanged, and
+// text-paths keeps its historical hang case on purpose, because skipping it
+// would not soak the real risk. The watchdog turns a hang into a
+// machine-greppable stall instead of an 18-minute silence.
+//
+// Contract lines (via out(), so stdout and --log are flushed immediately):
+//   SOAK_HEARTBEAT iter=%d elapsed=%us suite=fail%d/%d   after every round
+//   SOAK_STALL last_iter=%d elapsed=%us                   240 s without a
+//                                                         heartbeat, then
+//                                                         _exit(3)
+//   SOAK_NO_DEVICE                                        gpu_create failed,
+//                                                         exit 4
+//   SOAK_DONE iters=%d minutes=%d fails=%d                normal end, exit 0
+// ============================================================================
+
+constexpr int kSoakDefaultMinutes = 10;
+constexpr int kSoakSuites = 3;
+constexpr long long kSoakStallMs = 240ll * 1000ll;
+
+struct SoakState {
+    std::atomic<int> last_iter{0};
+    std::atomic<long long> last_beat_ms{0};
+    std::atomic<bool> done{false};
+};
+
+long long soak_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// std::thread + std::atomic only, no CRT timer: the stall detector must not
+// depend on CRT timer differences on the guest image. SOAK_STALL leaves via
+// _exit on purpose, skipping CRT teardown, so a wedged CRT cannot gate the
+// rescue path.
+void soak_watchdog(SoakState* st, long long start_ms) {
+    while (!st->done.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (st->done.load(std::memory_order_acquire)) return;
+        const long long now = soak_now_ms();
+        if (now - st->last_beat_ms.load(std::memory_order_acquire) >= kSoakStallMs) {
+            out("SOAK_STALL last_iter=%d elapsed=%us\n",
+                st->last_iter.load(std::memory_order_acquire),
+                static_cast<unsigned>((now - start_ms) / 1000ll));
+            fflush(stdout);
+            if (g_log) fflush(g_log);
+            _exit(3);
+        }
+    }
+}
+
+int run_soak(bool warp, bool debug_layer, int minutes) {
+    const char* path = "soak";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        out("SOAK_NO_DEVICE\n");
+        return 4;
+    }
+    gpu_adapter(path, g.device.Get());
+    out("MODE=%s stage=soak_begin minutes=%d stall_seconds=240"
+        " suites=d2d-primitives,d2d-aa-modes,text-paths device=process_lifetime\n",
+        path, minutes);
+
+    SoakState st;
+    const long long start_ms = soak_now_ms();
+    st.last_beat_ms.store(start_ms, std::memory_order_release);
+    std::thread watchdog(soak_watchdog, &st, start_ms);
+
+    const long long deadline_ms =
+        start_ms + static_cast<long long>(minutes) * 60ll * 1000ll;
+    int iters = 0;
+    int fails = 0;
+    for (;;) {
+        const int r_prims = run_d2d_primitives_body(g, warp);
+        const int r_aa = run_d2d_aa_modes_body(g, warp);
+        const int r_text = run_text_paths_body(g, warp);
+        ++iters;
+        const int round_fails = (r_prims != 0 ? 1 : 0) + (r_aa != 0 ? 1 : 0) +
+                                (r_text != 0 ? 1 : 0);
+        fails += round_fails;
+        // last_iter first, then the beat: when the watchdog sees a fresh beat,
+        // last_iter already names the round that produced it.
+        st.last_iter.store(iters, std::memory_order_release);
+        const long long now = soak_now_ms();
+        st.last_beat_ms.store(now, std::memory_order_release);
+        out("SOAK_HEARTBEAT iter=%d elapsed=%us suite=fail%d/%d\n", iters,
+            static_cast<unsigned>((now - start_ms) / 1000ll), round_fails,
+            kSoakSuites);
+        fflush(stdout);
+        if (now >= deadline_ms) break;
+    }
+    st.done.store(true, std::memory_order_release);
+    watchdog.join();
+    out("SOAK_DONE iters=%d minutes=%d fails=%d\n", iters, minutes, fails);
+    return 0;
+}
+
 int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "a8-upload") return run_a8_upload(warp, debug_layer);
     if (mode == "rt-to-srv") return run_rt_to_srv(warp, debug_layer);
@@ -8598,6 +8737,16 @@ void usage() {
         "                    as the D2D text shader does: float4 control, uint4 in\n"
         "                    one slot, uint4 across two slots, uint4 per instance,\n"
         "                    and R16_UINT, each judged by the exact centre pixel\n"
+        "  --mode soak       long-run repetition of d2d-primitives, d2d-aa-modes\n"
+        "                    and text-paths on ONE device for the whole process\n"
+        "                    (no per-round rebuild); --minutes N sets the duration.\n"
+        "                    One SOAK_HEARTBEAT line per round; 240 s without a\n"
+        "                    heartbeat prints SOAK_STALL and exits 3; a\n"
+        "                    device-creation failure prints SOAK_NO_DEVICE and\n"
+        "                    exits 4; a normal end prints SOAK_DONE and exits 0.\n"
+        "                    Runs alone: other --mode values in the same\n"
+        "                    invocation are ignored\n"
+        "  --minutes N       soak duration in minutes, 1..1440 (default 10)\n"
         "  --driver warp     control run through WARP; does not prove GPU support\n"
         "  --debug-layer     request D3D11 debug device (fails if SDK layer absent)\n"
         "  --log PATH        also append the same lines to PATH (truncating)\n"
@@ -8616,6 +8765,8 @@ int wmain(int argc, wchar_t** argv) {
     bool self_test = false;
     bool full = false;
     bool saw_mode = false;
+    bool soak = false;
+    int soak_minutes = kSoakDefaultMinutes;
     std::wstring log_path;
     std::vector<std::string> modes;
 
@@ -8630,6 +8781,8 @@ int wmain(int argc, wchar_t** argv) {
             saw_mode = true;
             if (value == L"full") {
                 full = true;
+            } else if (value == L"soak") {
+                soak = true;
             } else if (value == L"d2d-primitives") {
                 modes.push_back("d2d-primitives");
             } else if (value == L"dwrite-offscreen") {
@@ -8690,6 +8843,20 @@ int wmain(int argc, wchar_t** argv) {
             }
         } else if (arg == L"--log" && i + 1 < argc) {
             log_path = argv[++i];
+        } else if (arg == L"--minutes" && i + 1 < argc) {
+            const std::wstring value = argv[++i];
+            long long minutes = 0;
+            bool valid = !value.empty();
+            for (const wchar_t c : value) {
+                if (c < L'0' || c > L'9') valid = false;
+                minutes = minutes * 10 + (c - L'0');
+            }
+            if (!valid || minutes < 1 || minutes > 1440) {
+                out("invalid --minutes=%s\n", utf8(value.c_str()).c_str());
+                usage();
+                return 2;
+            }
+            soak_minutes = static_cast<int>(minutes);
         } else if (arg == L"--help" || arg == L"-h") {
             usage();
             return 0;
@@ -8716,6 +8883,15 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     print_environment();
+    // Soak owns the invocation, exactly like --self-test: it runs its own
+    // loop to the minute deadline and returns its own exit code (0 normal,
+    // 4 no device; 3 comes only from the watchdog's _exit). Additional
+    // --mode values on the same command line are ignored.
+    if (soak) {
+        const int rc = run_soak(warp, debug_layer, soak_minutes);
+        if (g_log) fclose(g_log);
+        return rc;
+    }
     // No --mode at all keeps the v1 behaviour byte for byte: full paths only.
     if (!saw_mode) full = true;
     int failed = 0;
