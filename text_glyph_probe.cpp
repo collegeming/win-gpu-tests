@@ -4363,8 +4363,13 @@ int run_forced_sample(bool warp, bool debug_layer) {
     rd.DepthClipEnable = TRUE;
     rd.ForcedSampleCount = 16;
     rd.AntialiasedLineEnable = FALSE;
+    // CreateRasterizerState1 wants its own interface; RSSetState on the context
+    // takes the base one, so keep both and hand the derived state to the base
+    // pointer once it exists.
+    ComPtr<ID3D11RasterizerState1> raster1;
+    hr = device1->CreateRasterizerState1(&rd, &raster1);
     ComPtr<ID3D11RasterizerState> raster;
-    hr = device1->CreateRasterizerState1(&rd, &raster);
+    if (SUCCEEDED(hr)) hr = raster1.As(&raster);
     out("MODE=%s stage=create_rasterizer forced_sample_count=16 msaa_attachment=1"
         " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
     if (FAILED(hr)) {
