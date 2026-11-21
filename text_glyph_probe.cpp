@@ -4260,6 +4260,129 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// channel-probe: where does D2D's text coverage actually land?
+// ---------------------------------------------------------------------------
+// Every text item so far judged RGB only. On a B8G8R8A8 target with ALPHA_MODE
+// IGNORE, D2D is free to write the glyph coverage into alpha and leave RGB at
+// the brush colour, which reads as "one flat colour" in an RGB-only statistic
+// while the coverage is in fact present. This mode draws the same text layout
+// and reports each channel separately: min/max/distinct per channel plus how
+// many pixels have a non-constant alpha. If alpha varies while RGB does not, the
+// defect is in the probe's judgement, not in the stack.
+struct ChannelStats {
+    int min = 255;
+    int max = 0;
+    size_t distinct = 0;
+    unsigned long long varying_pixels = 0;
+};
+
+ChannelStats channel_stats(const uint8_t* data, int pitch, RECT rect, int channel) {
+    ChannelStats cs;
+    std::unordered_set<unsigned char> values;
+    rect = clipped(rect, kWidth, kHeight);
+    for (int y = rect.top; y < rect.bottom; ++y) {
+        const uint8_t* row = data + static_cast<size_t>(y) * static_cast<size_t>(pitch);
+        for (int x = rect.left; x < rect.right; ++x) {
+            const int v = static_cast<int>(row[x * 4 + channel]);
+            if (v < cs.min) cs.min = v;
+            if (v > cs.max) cs.max = v;
+            values.insert(row[x * 4 + channel]);
+        }
+    }
+    cs.distinct = values.size();
+    cs.varying_pixels = (cs.max > cs.min) ? 1ull : 0ull;
+    return cs;
+}
+
+int run_channel_probe(bool warp, bool debug_layer) {
+    const char* path = "channel-probe";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<IDWriteTextLayout> layout;
+    HRESULT hr = g.dwrite->CreateTextLayout(kText, kTextLen, g.format.Get(), 496.0f, 112.0f,
+                                            &layout);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=text_layout_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    const D2D1_COLOR_F white = D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+    Target t;
+    if (!target_create(path, g, warp, t)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID2D1SolidColorBrush> black;
+    hr = t.rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &black);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=solid_brush_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    t.rt->BeginDraw();
+    t.rt->Clear(white);
+    t.rt->DrawTextLayout(D2D1::Point2F(8.0f, 8.0f), layout.Get(), black.Get(),
+                         D2D1_DRAW_TEXT_OPTIONS_NONE);
+    const HRESULT hr_end = t.rt->EndDraw();
+    out("MODE=%s stage=end_draw hr=0x%08lx\n", path, static_cast<unsigned long>(hr_end));
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (!target_map(path, g, t, mapped)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
+        return 2;
+    }
+    const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
+    const int pitch = static_cast<int>(mapped.RowPitch);
+
+    // The text region, reported per channel. BGRA byte order means 0=B, 1=G,
+    // 2=R, 3=A.
+    const RECT text_rect_value = text_rect();
+    const ChannelStats ch[4] = {
+        channel_stats(base, pitch, text_rect_value, 0),
+        channel_stats(base, pitch, text_rect_value, 1),
+        channel_stats(base, pitch, text_rect_value, 2),
+        channel_stats(base, pitch, text_rect_value, 3),
+    };
+    const PixelStats s = analyze(base, pitch, kWidth, kHeight, text_rect_value);
+    g.context->Unmap(t.staging.Get(), 0);
+
+    out("MODE=%s ITEM=text_channels region=%d,%d,%d,%d"
+        " b_min=%d b_max=%d b_distinct=%zu"
+        " g_min=%d g_max=%d g_distinct=%zu"
+        " r_min=%d r_max=%d r_distinct=%zu"
+        " a_min=%d a_max=%d a_distinct=%zu"
+        " rgb_distinct=%zu dark_pixels=%llu unique_rgb=%zu expected=coverage_in_some_channel"
+        " hr_end=0x%08lx\n",
+        path, text_rect_value.left, text_rect_value.top, text_rect_value.right,
+        text_rect_value.bottom, ch[0].min, ch[0].max, ch[0].distinct, ch[1].min, ch[1].max,
+        ch[1].distinct, ch[2].min, ch[2].max, ch[2].distinct, ch[3].min, ch[3].max,
+        ch[3].distinct, s.unique_colors, s.dark, s.unique_colors,
+        static_cast<unsigned long>(hr_end));
+
+    // The pass condition is only "some channel carries more than one value":
+    // this mode exists to find where the coverage went, not to grade the stack.
+    const bool any_varying = ch[0].max > ch[0].min || ch[1].max > ch[1].min ||
+                             ch[2].max > ch[2].min || ch[3].max > ch[3].min;
+    out("MODE=%s ITEM=text_channels_verdict RESULT=%s reason=%s\n", path,
+        any_varying ? "PASS" : "FAIL",
+        any_varying ? "some_channel_varies" : "all_channels_constant");
+    if (!any_varying) ++g_failures;
+    out("MODE=%s SUMMARY items=1 failed=%d\n", path, any_varying ? 0 : 1);
+    return any_varying ? 0 : 2;
+}
+
+// ---------------------------------------------------------------------------
 // caps-probe: the capability surface D2D consults before picking a path
 // ---------------------------------------------------------------------------
 int run_caps_probe(bool warp, bool debug_layer) {
@@ -9170,6 +9293,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "interp-probe") return run_interp_probe(warp, debug_layer);
     if (mode == "coverage-mask") return run_coverage_mask(warp, debug_layer);
     if (mode == "caps-probe") return run_caps_probe(warp, debug_layer);
+    if (mode == "channel-probe") return run_channel_probe(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -9229,6 +9353,9 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode channel-probe  the same text layout with per-channel min, max and\n"
+        "                    distinct counts, to see whether D2D put the coverage in\n"
+        "                    alpha while RGB stayed flat\n"
         "  --mode caps-probe   every format and device capability D2D consults, so a\n"
         "                    capability that differs from the reference driver shows\n"
         "                    up before chasing the path it selects\n"
@@ -9363,6 +9490,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("interp-probe");
             } else if (value == L"caps-probe") {
                 modes.push_back("caps-probe");
+            } else if (value == L"channel-probe") {
+                modes.push_back("channel-probe");
             } else if (value == L"coverage-mask") {
                 modes.push_back("coverage-mask");
             } else if (value == L"vb-paths") {
