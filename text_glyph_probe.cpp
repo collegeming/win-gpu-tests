@@ -28,6 +28,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi.h>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -4342,14 +4343,28 @@ int run_forced_sample(bool warp, bool debug_layer) {
         return 2;
     }
 
-    D3D11_RASTERIZER_DESC rd{};
+    // ForcedSampleCount lives in D3D11_RASTERIZER_DESC1 and needs the D3D11.1
+    // device, so the state is created through ID3D11Device1. A device that
+    // cannot be queried for D3D11.1 is itself worth reporting: that is one way
+    // the count could never be set.
+    ComPtr<ID3D11Device1> device1;
+    const HRESULT hr_dev1 = g.device.As(&device1);
+    out("MODE=%s stage=query_device1 hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr_dev1));
+    if (FAILED(hr_dev1)) {
+        ++g_failures;
+        out("MODE=%s ITEM=coverage_full_quad RESULT=FAIL reason=no_d3d11_1_device\n", path);
+        return 2;
+    }
+
+    D3D11_RASTERIZER_DESC1 rd{};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = TRUE;
     rd.ForcedSampleCount = 16;
     rd.AntialiasedLineEnable = FALSE;
     ComPtr<ID3D11RasterizerState> raster;
-    hr = g.device->CreateRasterizerState(&rd, &raster);
+    hr = device1->CreateRasterizerState1(&rd, &raster);
     out("MODE=%s stage=create_rasterizer forced_sample_count=16 msaa_attachment=1"
         " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
     if (FAILED(hr)) {
