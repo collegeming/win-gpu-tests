@@ -4431,6 +4431,196 @@ int run_forced_sample(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// msaa-aa: the antialiasing path a feature level 11.0 device is left with
+// ---------------------------------------------------------------------------
+// ForcedSampleCount is an 11.1 feature: this stack reports 11.0 (DXVK's default
+// probe list in d3d11_main.cpp omits 11_1), so D2D cannot use it and has to fall
+// back to a multisampled target plus resolve. If MSAA silently degrades to one
+// sample, every edge comes out hard, which is what the AA cases show.
+//
+// A triangle covers half the target with a diagonal edge. Sampling along that
+// edge on a resolved target gives intermediate colours only when more than one
+// sample per pixel was actually shaded.
+const char* kMsaaVs =
+    "struct VSOut { float4 pos : SV_POSITION; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    // p is (0,0) (2,0) (0,2); p-1 gives (-1,-1) (1,-1) (-1,1), so the\n"
+    "    // triangle fills the lower-left half and its hypotenuse is the pixel\n"
+    "    // diagonal from (0,63) to (63,63)... no: from (0,0) to (63,63).\n"
+    "    o.pos = float4(p.x - 1.0, p.y - 1.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kMsaaPs =
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    return float4(1.0, 1.0, 1.0, 1.0);\n"
+    "}\n";
+
+constexpr int kMsaaSize = 64;
+
+// Draws a single triangle whose hypotenuse crosses the target diagonally, at the
+// given sample count, resolves it and reports the colour spread along the edge.
+static void run_msaa_case(const char* path, Gpu& g, int samples,
+                          ID3D11VertexShader* vs, ID3D11PixelShader* ps) {
+    char label[64];
+    _snprintf_s(label, sizeof(label), _TRUNCATE, "msaa%d", samples);
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = kMsaaSize;
+    td.Height = kMsaaSize;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = static_cast<UINT>(samples);
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> msaa;
+    const HRESULT hr_msaa = g.device->CreateTexture2D(&td, nullptr, &msaa);
+    out("MODE=%s ITEM=%s stage=create_msaa samples=%d hr=0x%08lx\n", path, label,
+        samples, static_cast<unsigned long>(hr_msaa));
+    if (FAILED(hr_msaa)) {
+        ++g_failures;
+        out("MODE=%s ITEM=%s RESULT=FAIL reason=msaa_target_unsupported\n", path, label);
+        return;
+    }
+
+    // Resolve target and staging for the readback.
+    td.SampleDesc.Count = 1;
+    td.BindFlags = 0;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> resolved;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(g.device->CreateTexture2D(&td, nullptr, &resolved)) ||
+        FAILED(g.device->CreateTexture2D(&td, nullptr, &staging))) {
+        ++g_failures;
+        out("MODE=%s ITEM=%s RESULT=FAIL reason=resolve_target_create_failed\n", path, label);
+        return;
+    }
+
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(g.device->CreateRenderTargetView(msaa.Get(), nullptr, &rtv))) {
+        ++g_failures;
+        out("MODE=%s ITEM=%s RESULT=FAIL reason=msaa_rtv_create_failed\n", path, label);
+        return;
+    }
+
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    rd.MultisampleEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> raster;
+    if (FAILED(g.device->CreateRasterizerState(&rd, &raster))) {
+        ++g_failures;
+        out("MODE=%s ITEM=%s RESULT=FAIL reason=rasterizer_create_failed\n", path, label);
+        return;
+    }
+
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    g.context->ClearRenderTargetView(rtv.Get(), black);
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<FLOAT>(kMsaaSize);
+    vp.Height = static_cast<FLOAT>(kMsaaSize);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    g.context->RSSetViewports(1, &vp);
+    g.context->RSSetState(raster.Get());
+    g.context->IASetInputLayout(nullptr);
+    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.context->VSSetShader(vs, nullptr, 0);
+    g.context->PSSetShader(ps, nullptr, 0);
+    g.context->Draw(3, 0);
+    g.context->OMSetRenderTargets(0, nullptr, nullptr);
+    g.context->ResolveSubresource(resolved.Get(), 0, msaa.Get(), 0,
+                                  DXGI_FORMAT_B8G8R8A8_UNORM);
+    g.context->CopyResource(staging.Get(), resolved.Get());
+    g.context->Flush();
+
+    const SmallRead back =
+        small_read(path, g.context.Get(), resolved.Get(), staging.Get(), kMsaaSize, 4);
+    if (!back.ok) {
+        ++g_failures;
+        out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, label);
+        return;
+    }
+
+    // Walk the hypotenuse and collect the distinct values on it.
+    std::set<int> seen;
+    char edge[512] = {0};
+    size_t edge_len = 0;
+    int min_v = 255, max_v = 0;
+    for (int k = 4; k < kMsaaSize - 4; ++k) {
+        // The edge runs from (63,0) to (0,63): sample exactly on it.
+        const int x = kMsaaSize - 1 - k;
+        const int y = k;
+        const size_t off = static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
+        const int r = back.bytes[off + 2];
+        seen.insert(r);
+        if (r < min_v) min_v = r;
+        if (r > max_v) max_v = r;
+        if (edge_len + 8 < sizeof(edge))
+            edge_len += static_cast<size_t>(_snprintf_s(edge + edge_len,
+                sizeof(edge) - edge_len, _TRUNCATE, "%s%d", edge_len ? "," : "", r));
+    }
+    // One sample per pixel gives two levels (background and fill); four or more
+    // samples give intermediate coverage along the edge as well.
+    const bool multisampled = seen.size() >= 3;
+    out("MODE=%s ITEM=%s samples=%d edge=[%s] distinct=%zu min=%d max=%d"
+        " expected_at_least=3 RESULT=%s reason=%s\n", path, label, samples, edge,
+        seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
+        multisampled ? "ok" : "msaa_resolved_as_one_sample");
+    if (!multisampled) ++g_failures;
+}
+
+int run_msaa_aa(bool warp, bool debug_layer) {
+    const char* path = "msaa-aa";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "msaa_vs", kMsaaVs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "msaa_ps", kMsaaPs, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    if (FAILED(g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                            vs_blob->GetBufferSize(), nullptr, &vs)) ||
+        FAILED(g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                           ps_blob->GetBufferSize(), nullptr, &ps))) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_create_failed\n", path);
+        return 2;
+    }
+
+    const int failed_before = g_failures;
+    run_msaa_case(path, g, 2, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 4, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 8, vs.Get(), ps.Get());
+    const int failed = g_failures - failed_before;
+    out("MODE=%s SUMMARY items=3 failed=%d\n", path, failed);
+    return failed ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // channel-probe: where does D2D's text coverage actually land?
 // ---------------------------------------------------------------------------
 // Every text item so far judged RGB only. On a B8G8R8A8 target with ALPHA_MODE
@@ -9466,6 +9656,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "caps-probe") return run_caps_probe(warp, debug_layer);
     if (mode == "channel-probe") return run_channel_probe(warp, debug_layer);
     if (mode == "forced-sample") return run_forced_sample(warp, debug_layer);
+    if (mode == "msaa-aa") return run_msaa_aa(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -9526,6 +9717,10 @@ void usage() {
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
         "  --mode forced-sample  D3D11 ForcedSampleCount 16 on a single sampled target;\n"
+        "  --mode msaa-aa    2/4/8-sample targets resolved to one sample; a diagonal
+"
+        "                    edge must show intermediates, or the resolve collapsed
+"
         "                    the PS writes countbits(SV_Coverage)/16, so a constant\n"
         "                    16/255 means the forced count never reached the rasterizer\n"
         "  --mode channel-probe  the same text layout with per-channel min, max and\n"
@@ -9669,6 +9864,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("channel-probe");
             } else if (value == L"forced-sample") {
                 modes.push_back("forced-sample");
+            } else if (value == L"msaa-aa") {
+                modes.push_back("msaa-aa");
             } else if (value == L"coverage-mask") {
                 modes.push_back("coverage-mask");
             } else if (value == L"vb-paths") {
