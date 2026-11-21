@@ -4209,6 +4209,32 @@ const char* kInterpVs =
     "    return o;\n"
     "}\n";
 
+// The same geometry with the gradient reversed. Under real interpolation this
+// falls from 255 to 0 across the row; under flat semantics every fragment takes
+// the provoking vertex value, so the ramp turns into a constant 255 instead of a
+// decreasing one. The pair is what separates "interpolates" from "is flat".
+const char* kInterpVsReversed =
+    "struct VSOut { float4 pos : SV_POSITION; float v : VALUE; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "    o.v = 1.0 - p.x;\n"
+    "    return o;\n"
+    "}\n";
+
+// A diagonal gradient weights both axes, so a single flattened coordinate cannot
+// mimic the expected slope.
+const char* kInterpVsDiagonal =
+    "struct VSOut { float4 pos : SV_POSITION; float v : VALUE; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "    o.v = (p.x + p.y) * 0.5;\n"
+    "    return o;\n"
+    "}\n";
+
 const char* kInterpPsFloat =
     "float4 main(float v : VALUE) : SV_Target { return float4(v, v, v, 1.0); }\n";
 
@@ -4230,108 +4256,126 @@ int run_interp_probe(bool warp, bool debug_layer) {
     }
     gpu_adapter(path, g.device.Get());
 
-    ComPtr<ID3DBlob> vs_blob, ps_blob;
-    const char* used_profile = nullptr;
-    HRESULT hr = a8_compile(path, "interp_vs", kInterpVs, "vs_5_0", "vs_4_0",
-                            vs_blob.GetAddressOf(), &used_profile);
-    if (SUCCEEDED(hr))
-        hr = a8_compile(path, "interp_ps", kInterpPsFloat, "ps_5_0", "ps_4_0",
-                        ps_blob.GetAddressOf(), &used_profile);
-    if (FAILED(hr)) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
-            static_cast<unsigned long>(hr));
-        return 2;
-    }
-    ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> ps;
-    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
-                                      nullptr, &vs);
-    if (SUCCEEDED(hr))
-        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
-                                         ps_blob->GetBufferSize(), nullptr, &ps);
-    if (FAILED(hr)) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=shader_create_failed hr=0x%08lx\n", path,
-            static_cast<unsigned long>(hr));
-        return 2;
+    struct InterpCase {
+        const char* item;
+        const char* vs_src;
+        bool expect_ramp;
+        const char* expected_text;
+    } cases[] = {
+        {"gradient_ramp", kInterpVs, true, "increasing_ramp_spread_ge_96"},
+        {"gradient_reversed", kInterpVsReversed, true, "decreasing_ramp_spread_le_minus_96"},
+        {"gradient_diagonal", kInterpVsDiagonal, true, "diagonal_ramp_spread_ge_96"},
+    };
+
+    int failed = 0;
+    int items = 0;
+    for (const InterpCase& c : cases) {
+        ComPtr<ID3DBlob> vs_blob, ps_blob;
+        const char* used_profile = nullptr;
+        HRESULT hr = a8_compile(path, c.item, c.vs_src, "vs_5_0", "vs_4_0",
+                                vs_blob.GetAddressOf(), &used_profile);
+        if (SUCCEEDED(hr))
+            hr = a8_compile(path, "interp_ps", kInterpPsFloat, "ps_5_0", "ps_4_0",
+                            ps_blob.GetAddressOf(), &used_profile);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n",
+                path, c.item, static_cast<unsigned long>(hr));
+            continue;
+        }
+        ComPtr<ID3D11VertexShader> vs;
+        ComPtr<ID3D11PixelShader> ps;
+        hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(),
+                                          vs_blob->GetBufferSize(), nullptr, &vs);
+        if (SUCCEEDED(hr))
+            hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                             ps_blob->GetBufferSize(), nullptr, &ps);
+        if (FAILED(hr)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=shader_create_failed hr=0x%08lx\n",
+                path, c.item, static_cast<unsigned long>(hr));
+            continue;
+        }
+
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kInterpSize,
+                           D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path, c.item);
+            continue;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (FAILED(g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed\n", path, c.item);
+            continue;
+        }
+
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->ClearRenderTargetView(rtv.Get(), black);
+        g.context->VSSetShader(vs.Get(), nullptr, 0);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        D3D11_VIEWPORT vp{};
+        vp.Width = static_cast<FLOAT>(kInterpSize);
+        vp.Height = static_cast<FLOAT>(kInterpSize);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        g.context->RSSetViewports(1, &vp);
+        g.context->IASetInputLayout(nullptr);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.context->Draw(3, 0);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+        ++items;
+        const SmallRead back =
+            small_read(path, g.context.Get(), tex.Get(), staging.Get(), kInterpSize, 4);
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, c.item);
+            continue;
+        }
+
+        const int y = kInterpSize / 2;
+        int got[5] = {0, 0, 0, 0, 0};
+        const int xs[5] = {0, kInterpSize / 4, kInterpSize / 2, 3 * kInterpSize / 4,
+                           kInterpSize - 1};
+        char ramp[200];
+        size_t used = 0;
+        ramp[0] = 0;
+        for (int i = 0; i < 5; ++i) {
+            const size_t off = static_cast<size_t>(y) * back.pitch +
+                               static_cast<size_t>(xs[i]) * 4;
+            got[i] = back.bytes[off + 2];
+            const int n = _snprintf_s(ramp + used, sizeof(ramp) - used, _TRUNCATE, "%s%d",
+                                      i ? "," : "", got[i]);
+            if (n > 0) used += static_cast<size_t>(n);
+        }
+        const int spread = got[4] - got[0];
+        // A ramp across the triangle must move by most of the 0..255 range; 96
+        // keeps the bar well above one quantisation step while tolerating the row
+        // being sampled inside the triangle rather than at its extremes.
+        const bool ok = c.expect_ramp ? (spread >= 96 || spread <= -96) : (spread == 0);
+        char extra[320];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " row=%d xs=0,%d,%d,%d,%d expected=%s spread=%d hr_draw=0x%08lx", y,
+                    kInterpSize / 4, kInterpSize / 2, 3 * kInterpSize / 4, kInterpSize - 1,
+                    c.expected_text, spread, static_cast<unsigned long>(hr_draw));
+        out("MODE=%s ITEM=%s%s ramp=%s RESULT=%s reason=%s\n", path, c.item, extra, ramp,
+            ok ? "PASS" : "FAIL", ok ? "ok" : "interpolated_value_is_constant");
+        if (!ok) ++failed;
     }
 
-    ComPtr<ID3D11Texture2D> tex, staging;
-    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kInterpSize,
-                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
-        return 2;
-    }
-    ComPtr<ID3D11RenderTargetView> rtv;
-    if (FAILED(g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=rtv_create_failed\n", path);
-        return 2;
-    }
-
-    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-    g.context->ClearRenderTargetView(rtv.Get(), black);
-    g.context->VSSetShader(vs.Get(), nullptr, 0);
-    g.context->PSSetShader(ps.Get(), nullptr, 0);
-    D3D11_VIEWPORT vp{};
-    vp.Width = static_cast<FLOAT>(kInterpSize);
-    vp.Height = static_cast<FLOAT>(kInterpSize);
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-    g.context->RSSetViewports(1, &vp);
-    g.context->IASetInputLayout(nullptr);
-    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g.context->Draw(3, 0);
-    g.context->Flush();
-    const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
-    g.context->OMSetRenderTargets(0, nullptr, nullptr);
-
-    const SmallRead back =
-        small_read(path, g.context.Get(), tex.Get(), staging.Get(), kInterpSize, 4);
-    if (!back.ok) {
-        ++g_failures;
-        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
-        return 2;
-    }
-
-    // Sample the middle row at five x positions: a real ramp rises, a constant
-    // gives five equal values.
-    const int y = kInterpSize / 2;
-    int got[5] = {0, 0, 0, 0, 0};
-    const int xs[5] = {0, kInterpSize / 4, kInterpSize / 2, 3 * kInterpSize / 4, kInterpSize - 1};
-    char ramp[200];
-    size_t used = 0;
-    ramp[0] = 0;
-    for (int i = 0; i < 5; ++i) {
-        const size_t off = static_cast<size_t>(y) * back.pitch +
-                           static_cast<size_t>(xs[i]) * 4;
-        got[i] = back.bytes[off + 2];
-        const int n = _snprintf_s(ramp + used, sizeof(ramp) - used, _TRUNCATE, "%s%d",
-                                  i ? "," : "", got[i]);
-        if (n > 0) used += static_cast<size_t>(n);
-    }
-    const int spread = got[4] - got[0];
-    // A ramp across the triangle must rise by most of the 0..255 range; 96 keeps
-    // the bar well above any single quantisation step while tolerating the row
-    // being sampled inside the triangle rather than at its extremes.
-    const bool ramps = spread >= 96;
-    char extra[320];
-    _snprintf_s(extra, sizeof(extra), _TRUNCATE,
-                " row=%d xs=0,%d,%d,%d,%d expected=increasing_0_to_255_ramp"
-                " spread=%d min_spread=96 hr_draw=0x%08lx", y, kInterpSize / 4,
-                kInterpSize / 2, 3 * kInterpSize / 4, kInterpSize - 1, spread,
-                static_cast<unsigned long>(hr_draw));
-    out("MODE=%s ITEM=gradient_ramp%s ramp=%s RESULT=%s reason=%s\n", path, extra, ramp,
-        ramps ? "PASS" : "FAIL", ramps ? "ok" : "interpolated_value_is_constant");
-    if (!ramps) {
-        ++g_failures;
-        return 2;
-    }
-    out("MODE=%s SUMMARY items=1 failed=0 ramp=%s\n", path, ramp);
-    return 0;
+    if (failed) ++g_failures;
+    out("MODE=%s SUMMARY items=%d failed=%d\n", path, items, failed);
+    return failed ? 2 : 0;
 }
 
 // ---------------------------------------------------------------------------
