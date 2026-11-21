@@ -4191,6 +4191,165 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// coverage-probe: does fixed-function blend read the destination?
+// ---------------------------------------------------------------------------
+// The same premultiplied half-covered red is blended over a white and over a
+// black clear. A blend that reads the destination gives two different results;
+// a blend that was collapsed to "store the source" gives the same result twice,
+// and no coverage amount can ever survive. D2D's text and AA output are both
+// premultiplied, so this single pair separates "blend ignores dst" from "the
+// coverage value itself is wrong".
+const char* kCovPsPremulRed =
+    "float4 main() : SV_Target { return float4(0.5f, 0.0f, 0.0f, 0.5f); }\n";
+
+constexpr int kCovSize = 64;
+
+// Premultiplied 0.5 red over white is (1.0, 0.5, 0.5) and over black is
+// (0.5, 0.0, 0.0); written as BGRA bytes those are 128,128,255 and 0,0,128.
+const Rgba kCovOverWhite{128, 128, 255, 255};
+const Rgba kCovOverBlack{0, 0, 128, 255};
+
+int run_coverage_probe(bool warp, bool debug_layer) {
+    const char* path = "coverage-probe";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "cov_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "cov_ps", kCovPsPremulRed, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                         ps_blob->GetBufferSize(), nullptr, &ps);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    // src=ONE, dst=INV_SRC_ALPHA is the premultiplied over-operator D2D uses.
+    D3D11_BLEND_DESC bd{};
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    ComPtr<ID3D11BlendState> blend;
+    hr = g.device->CreateBlendState(&bd, &blend);
+    out("MODE=%s stage=create_blend_state factors=ONE/INV_SRC_ALPHA hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=blend_state_create_failed\n", path);
+        return 2;
+    }
+
+    struct CovCase {
+        const char* item;
+        float clear[4];
+        Rgba want;
+        const char* expected_text;
+    } cases[] = {
+        {"over_white", {1.0f, 1.0f, 1.0f, 1.0f}, kCovOverWhite,
+         "premultiplied_0.5_red_over_white_128,128,255"},
+        {"over_black", {0.0f, 0.0f, 0.0f, 1.0f}, kCovOverBlack,
+         "premultiplied_0.5_red_over_black_0,0,128"},
+    };
+
+    int failed = 0;
+    int items = 0;
+    for (const CovCase& c : cases) {
+        ComPtr<ID3D11Texture2D> tex, staging;
+        if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kCovSize,
+                           D3D11_BIND_RENDER_TARGET, tex, staging)) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=target_create_failed\n", path, c.item);
+            continue;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        if (FAILED(g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=rtv_create_failed\n", path, c.item);
+            continue;
+        }
+        g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+        g.context->ClearRenderTargetView(rtv.Get(), c.clear);
+        const FLOAT blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        g.context->OMSetBlendState(blend.Get(), blend_factor, 0xffffffff);
+        g.context->VSSetShader(vs.Get(), nullptr, 0);
+        g.context->PSSetShader(ps.Get(), nullptr, 0);
+        D3D11_VIEWPORT vp{};
+        vp.Width = static_cast<FLOAT>(kCovSize);
+        vp.Height = static_cast<FLOAT>(kCovSize);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        g.context->RSSetViewports(1, &vp);
+        g.context->IASetInputLayout(nullptr);
+        g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.context->Draw(3, 0);
+        g.context->Flush();
+        const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+        g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+        const SmallRead back =
+            small_read(path, g.context.Get(), tex.Get(), staging.Get(), kCovSize, 4);
+        ++items;
+        if (!back.ok) {
+            ++failed;
+            ++g_failures;
+            out("MODE=%s ITEM=%s RESULT=FAIL reason=map_read_failed\n", path, c.item);
+            continue;
+        }
+        const RECT rect{0, 0, kCovSize, kCovSize};
+        const PixelStats s = analyze(back.bytes.data(), back.pitch, kCovSize, kCovSize, rect);
+        const unsigned long long matched =
+            count_color_match(back.bytes.data(), back.pitch, rect, c.want, 2);
+        const long long area = static_cast<long long>(kCovSize) * kCovSize;
+        char extra[320];
+        _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                    " region=0,0,%d,%d blend=ONE/INV_SRC_ALPHA ps=premultiplied_0.5_red"
+                    " expected=%s hr_draw=0x%08lx", kCovSize, kCovSize, c.expected_text,
+                    static_cast<unsigned long>(hr_draw));
+        if (print_color_item(path, c.item, c.want,
+                             Rgba{back.bytes[0], back.bytes[1], back.bytes[2],
+                                  back.bytes[3]},
+                             matched, area, s))
+            ++failed;
+    }
+
+    // The verdict line states the one thing the pair is for: whether the two
+    // clears produced different pixels.
+    out("MODE=%s SUMMARY items=%d failed=%d blend_reads_dst=%s\n", path, items, failed,
+        failed ? "unknown" : "see_items");
+    if (failed) ++g_failures;
+    return failed ? 2 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // v6: vertex/index buffer paths
 // ---------------------------------------------------------------------------
 // Every earlier mode drew with SV_VertexID and Draw(3, 0): no input layout, no
@@ -8503,6 +8662,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "clip-contract") return run_clip_contract(warp, debug_layer);
     if (mode == "mask-uint") return run_mask_uint(warp, debug_layer);
     if (mode == "dualsrc-blend") return run_dualsrc_blend(warp, debug_layer);
+    if (mode == "coverage-probe") return run_coverage_probe(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -8562,6 +8722,10 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode coverage-probe  the same premultiplied half-covered red blended\n"
+        "                    with ONE/INV_SRC_ALPHA over a white and over a black\n"
+        "                    clear; if both clears give the same pixels the blend\n"
+        "                    never read the destination and no coverage can survive\n"
         "  --mode vb-paths   explicit vertex/index buffers, which no earlier mode\n"
         "                    used: static and dynamic vertex buffers, R16 and R32\n"
         "                    index buffers, two indexed ranges in one frame, and an\n"
@@ -8676,6 +8840,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("mask-uint");
             } else if (value == L"dualsrc-blend") {
                 modes.push_back("dualsrc-blend");
+            } else if (value == L"coverage-probe") {
+                modes.push_back("coverage-probe");
             } else if (value == L"vb-paths") {
                 modes.push_back("vb-paths");
             } else if (value == L"mask-write-srv") {
