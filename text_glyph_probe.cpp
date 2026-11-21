@@ -9717,12 +9717,10 @@ void usage() {
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
         "  --mode forced-sample  D3D11 ForcedSampleCount 16 on a single sampled target;\n"
-        "  --mode msaa-aa    2/4/8-sample targets resolved to one sample; a diagonal
-"
-        "                    edge must show intermediates, or the resolve collapsed
-"
         "                    the PS writes countbits(SV_Coverage)/16, so a constant\n"
         "                    16/255 means the forced count never reached the rasterizer\n"
+        "  --mode msaa-aa    2/4/8-sample targets resolved to one sample; a diagonal\n"
+        "                    edge must show intermediates, or the resolve collapsed\n"
         "  --mode channel-probe  the same text layout with per-channel min, max and\n"
         "                    distinct counts, to see whether D2D put the coverage in\n"
         "                    alpha while RGB stayed flat\n"
