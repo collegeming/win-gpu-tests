@@ -4260,6 +4260,157 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// forced-sample: does D3D11's ForcedSampleCount survive to the rasterizer?
+// ---------------------------------------------------------------------------
+// D2D asks for deterministic coverage with ForcedSampleCount rather than multi
+// sampling the target: the rasterizer is told to produce 16 coverage samples
+// while the attachment stays single sampled, and the coverage shader reads
+// SV_Coverage. If that count is dropped, SV_Coverage is 0x0001 for every
+// fragment, so every antialiased edge resolves to the same coverage value -- one
+// flat colour instead of a gradient.
+//
+// A full-screen quad covers all samples, so countbits(SV_Coverage)/16 is 1.0 and
+// the target must be white. Two levels means the count reached the shader; a
+// constant 16/255 means only one coverage sample existed.
+const char* kForcedVs =
+    "struct VSOut { float4 pos : SV_POSITION; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kForcedPs =
+    "float4 main(float4 pos : SV_POSITION, uint cov : SV_Coverage) : SV_Target {\n"
+    "    float c = (float)countbits(cov) / 16.0;\n"
+    "    return float4(c, c, c, 1.0);\n"
+    "}\n";
+
+constexpr int kForcedSize = 64;
+
+int run_forced_sample(bool warp, bool debug_layer) {
+    const char* path = "forced-sample";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "forced_vs", kForcedVs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "forced_ps", kForcedPs, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                         ps_blob->GetBufferSize(), nullptr, &ps);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    // Single-sampled target with ForcedSampleCount 16: the combination D2D uses
+    // to get coverage without paying for a multisampled surface.
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kForcedSize,
+                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rtv_create_failed\n", path);
+        return 2;
+    }
+
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    rd.ForcedSampleCount = 16;
+    rd.AntialiasedLineEnable = FALSE;
+    ComPtr<ID3D11RasterizerState> raster;
+    hr = g.device->CreateRasterizerState(&rd, &raster);
+    out("MODE=%s stage=create_rasterizer forced_sample_count=16 msaa_attachment=1"
+        " hr=0x%08lx\n", path, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rasterizer_create_failed\n", path);
+        return 2;
+    }
+
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    g.context->ClearRenderTargetView(rtv.Get(), black);
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<FLOAT>(kForcedSize);
+    vp.Height = static_cast<FLOAT>(kForcedSize);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    g.context->RSSetViewports(1, &vp);
+    g.context->RSSetState(raster.Get());
+    g.context->IASetInputLayout(nullptr);
+    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.context->VSSetShader(vs.Get(), nullptr, 0);
+    g.context->PSSetShader(ps.Get(), nullptr, 0);
+    g.context->Draw(3, 0);
+    g.context->Flush();
+    const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+    g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+    const SmallRead back =
+        small_read(path, g.context.Get(), tex.Get(), staging.Get(), kForcedSize, 4);
+    if (!back.ok) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
+        return 2;
+    }
+    const RECT rect{0, 0, kForcedSize, kForcedSize};
+    const PixelStats s = analyze(back.bytes.data(), back.pitch, kForcedSize, kForcedSize, rect);
+    // The centre pixel is fully covered either way; its value is what tells the
+    // two worlds apart.
+    const size_t off = static_cast<size_t>(kForcedSize / 2) * back.pitch +
+                       static_cast<size_t>(kForcedSize / 2) * 4;
+    const int got_r = back.bytes[off + 2];
+    // countbits(0x0001)/16 = 16/255; countbits(0xffff)/16 = 255/255.
+    const bool sixteen_samples = got_r >= 250;
+    const bool one_sample = got_r >= 8 && got_r <= 24;
+    char extra[320];
+    _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                " region=0,0,%d,%d forced_sample_count=16 expected=255_from_0xffff"
+                " one_sample_would_be_16 unique=%zu hr_draw=0x%08lx", kForcedSize,
+                kForcedSize, s.unique_colors, static_cast<unsigned long>(hr_draw));
+    out("MODE=%s ITEM=coverage_full_quad%s sampled_bgra=%d,%d,%d,%d RESULT=%s"
+        " reason=%s\n", path, extra, back.bytes[off + 0], back.bytes[off + 1],
+        back.bytes[off + 2], back.bytes[off + 3],
+        sixteen_samples ? "PASS" : "FAIL",
+        sixteen_samples ? "ok" : (one_sample ? "forced_sample_count_dropped_one_sample"
+                                            : "unexpected_coverage_value"));
+    if (!sixteen_samples) ++g_failures;
+    out("MODE=%s SUMMARY items=1 failed=%d\n", path, sixteen_samples ? 0 : 1);
+    return sixteen_samples ? 0 : 2;
+}
+
+// ---------------------------------------------------------------------------
 // channel-probe: where does D2D's text coverage actually land?
 // ---------------------------------------------------------------------------
 // Every text item so far judged RGB only. On a B8G8R8A8 target with ALPHA_MODE
@@ -9294,6 +9445,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "coverage-mask") return run_coverage_mask(warp, debug_layer);
     if (mode == "caps-probe") return run_caps_probe(warp, debug_layer);
     if (mode == "channel-probe") return run_channel_probe(warp, debug_layer);
+    if (mode == "forced-sample") return run_forced_sample(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -9353,6 +9505,9 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode forced-sample  D3D11 ForcedSampleCount 16 on a single sampled target;\n"
+        "                    the PS writes countbits(SV_Coverage)/16, so a constant\n"
+        "                    16/255 means the forced count never reached the rasterizer\n"
         "  --mode channel-probe  the same text layout with per-channel min, max and\n"
         "                    distinct counts, to see whether D2D put the coverage in\n"
         "                    alpha while RGB stayed flat\n"
@@ -9492,6 +9647,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("caps-probe");
             } else if (value == L"channel-probe") {
                 modes.push_back("channel-probe");
+            } else if (value == L"forced-sample") {
+                modes.push_back("forced-sample");
             } else if (value == L"coverage-mask") {
                 modes.push_back("coverage-mask");
             } else if (value == L"vb-paths") {
