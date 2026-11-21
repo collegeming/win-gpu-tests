@@ -4446,9 +4446,9 @@ const char* kMsaaVs =
     "VSOut main(uint id : SV_VertexID) {\n"
     "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
     "    VSOut o;\n"
-    "    // p is (0,0) (2,0) (0,2); p-1 gives (-1,-1) (1,-1) (-1,1), so the\n"
-    "    // triangle fills the lower-left half and its hypotenuse is the pixel\n"
-    "    // diagonal from (0,63) to (63,63)... no: from (0,0) to (63,63).\n"
+    "    // p is (0,0) (2,0) (0,2); p-1 gives clip (-1,-1) (1,-1) (-1,1), i.e.\n"
+    "    // bottom-left, bottom-right and top-left, so the hypotenuse is the main\n"
+    "    // pixel diagonal from (0,0) to (63,63).\n"
     "    o.pos = float4(p.x - 1.0, p.y - 1.0, 0.0, 1.0);\n"
     "    return o;\n"
     "}\n";
@@ -4555,8 +4555,8 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
     size_t edge_len = 0;
     int min_v = 255, max_v = 0;
     for (int k = 4; k < kMsaaSize - 4; ++k) {
-        // The edge runs from (63,0) to (0,63): sample exactly on it.
-        const int x = kMsaaSize - 1 - k;
+        // The hypotenuse runs from pixel (0,0) to (63,63); sample exactly on it.
+        const int x = k;
         const int y = k;
         const size_t off = static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
         const int r = back.bytes[off + 2];
