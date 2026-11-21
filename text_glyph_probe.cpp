@@ -986,10 +986,17 @@ const char* ink_reason(const PixelStats& s) {
     const int w = s.dark_right - s.dark_left;
     const int h = s.dark_bottom - s.dark_top;
     if (w < kItemMinBBoxWidth || h < kItemMinBBoxHeight) return "dark_bbox_too_small";
-    // Glyph ink is antialiased or at least a mask, never one flat colour over the
-    // whole region.  A solid fill reports dark == region area with a single
-    // unique colour, which is a lost coverage term, not text; judge it as such or
-    // a blanket of one colour passes as "glyph ink".
+    return nullptr;
+}
+
+// Glyph ink is antialiased or at least a mask, never one flat colour over the
+// whole region.  A solid fill reports dark == region area with a single unique
+// colour, which is a lost coverage term, not text; judge it as such or a blanket
+// of one colour passes as "glyph ink".  Fills are legitimately flat, so this is
+// a separate judge from ink_reason().
+const char* glyph_reason(const PixelStats& s) {
+    const char* base = ink_reason(s);
+    if (base) return base;
     if (s.unique_colors <= 1) return "single_color_no_glyph_structure";
     const long long area = static_cast<long long>(s.dark_right - s.dark_left) *
                            (s.dark_bottom - s.dark_top);
@@ -1049,6 +1056,12 @@ const char* print_ink_item_with(const char* mode, const char* item, const char* 
 const char* print_ink_item(const char* mode, const char* item, const char* extra,
                            const PixelStats& s) {
     return print_ink_item_with(mode, item, extra, s, ink_reason(s));
+}
+
+// Text and glyph draws must show structure, not a flat blanket of one colour.
+const char* print_glyph_item(const char* mode, const char* item, const char* extra,
+                             const PixelStats& s) {
+    return print_ink_item_with(mode, item, extra, s, glyph_reason(s));
 }
 
 const char* print_line_item(const char* mode, const char* item, const char* extra,
@@ -1136,11 +1149,11 @@ int run_d2d_primitives(bool warp, bool debug_layer) {
 
     print_ink_item(path, "rect_fill", " region=4,4,76,76", fill);
     print_ink_item(path, "rect_stroke", " region=76,4,148,76", stroke);
-    print_ink_item(path, "text", " region=152,4,508,124", text);
+    print_glyph_item(path, "text", " region=152,4,508,124", text);
     const bool geometry_ink = fill.dark > kMinDarkPixels || stroke.dark > kMinDarkPixels;
-    const bool glyph_ink = text.dark > kMinDarkPixels;
+    const bool glyph_ink = text.dark > kMinDarkPixels && glyph_reason(text) == nullptr;
     const int failed = (ink_reason(fill) ? 1 : 0) + (ink_reason(stroke) ? 1 : 0) +
-                       (ink_reason(text) ? 1 : 0);
+                       (glyph_reason(text) ? 1 : 0);
     out("MODE=%s SUMMARY items=3 failed=%d geometry_ink=%s glyph_ink=%s"
         " all_draws_lost=%s\n", path, failed, geometry_ink ? "yes" : "no",
         glyph_ink ? "yes" : "no", (!geometry_ink && !glyph_ink) ? "yes" : "no");
@@ -3068,7 +3081,7 @@ int finish_text_item(const char* path, const char* item, const char* extra, Gpu&
                                  static_cast<int>(mapped.RowPitch), kWidth, kHeight,
                                  text_rect());
     g.context->Unmap(t.staging.Get(), 0);
-    return print_ink_item(path, item, extra, s) ? 1 : 0;
+    return print_glyph_item(path, item, extra, s) ? 1 : 0;
 }
 
 int run_text_paths(bool warp, bool debug_layer) {
