@@ -4194,6 +4194,10 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 // ---------------------------------------------------------------------------
 // coverage-mask: D2D's own coverage formula, end to end
 // ---------------------------------------------------------------------------
+// Both coverage modes render into the same size target, so the size is declared
+// here, ahead of its first use.
+constexpr int kCovSize = 64;
+
 // d2d1.dll's embedded shaders compute geometric coverage as
 //     mask = g_coverageTexture[i].Load(...);            // R32_UINT bitmask
 //     cov  = (float)countbits(mask) / 16.0;
@@ -4607,8 +4611,6 @@ const char* kCovPsPremulRed =
 // edges the device reports while WARP keeps the gradient.
 const char* kCovPsOpaqueBlack =
     "float4 main() : SV_Target { return float4(0.0f, 0.0f, 0.0f, 1.0f); }\n";
-
-constexpr int kCovSize = 64;
 
 // Premultiplied 0.5 red over white is (1.0, 0.5, 0.5) and over black is
 // (0.5, 0.0, 0.0); written as BGRA bytes those are 128,128,255 and 0,0,128.
