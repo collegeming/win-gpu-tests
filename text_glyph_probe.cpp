@@ -1465,6 +1465,74 @@ void a8_support(const char* path, ID3D11Device* device) {
         yes_no[(flags & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) ? 1 : 0]);
 }
 
+// D2D chooses between very different internal paths from what the device reports
+// here: an A8 target it believes is blendable is rendered through the coverage
+// shaders, one it believes is not goes elsewhere. A capability that differs from
+// the reference driver silently puts D2D on the wrong path, so the whole surface
+// D2D consults is printed verbatim.
+void d2d_capability_surface(const char* path, ID3D11Device* device) {
+    struct Fmt {
+        const char* name;
+        DXGI_FORMAT fmt;
+    };
+    const Fmt formats[] = {
+        {"B8G8R8A8_UNORM", DXGI_FORMAT_B8G8R8A8_UNORM},
+        {"B8G8R8X8_UNORM", DXGI_FORMAT_B8G8R8X8_UNORM},
+        {"A8_UNORM", DXGI_FORMAT_A8_UNORM},
+        {"R8_UNORM", DXGI_FORMAT_R8_UNORM},
+        {"R32_UINT", DXGI_FORMAT_R32_UINT},
+        {"R32_FLOAT", DXGI_FORMAT_R32_FLOAT},
+        {"R8G8_UNORM", DXGI_FORMAT_R8G8_UNORM},
+    };
+    for (const Fmt& f : formats) {
+        UINT flags = 0;
+        const HRESULT hr = device->CheckFormatSupport(f.fmt, &flags);
+        UINT nviews = 0;
+        const HRESULT hr_views = device->CheckMultisampleQualityLevels(f.fmt, 1, &nviews);
+        out("MODE=%s ITEM=cap_%s hr=0x%08lx flags=0x%08x texture2d=%d texture3d=%d"
+            " texturecube=%d shader_sample=%d shader_load=%d shader_multisample=%d"
+            " render_target=%d blendable=%d depth_stencil=%d"
+            " render_target_multisample=%d display=%d"
+            " cast_inner=%d mip_autogen=%d gather=%d"
+            " typed_uav=%d buffer=%d ms1_hr=0x%08lx\n",
+            path, f.name, static_cast<unsigned long>(hr), flags,
+            (flags & D3D11_FORMAT_SUPPORT_TEXTURE2D) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_TEXTURE3D) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_TEXTURECUBE) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_SHADER_LOAD) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_RENDER_TARGET) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_BLENDABLE) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_DEPTH_STENCIL) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_DISPLAY) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_SHADER_GATHER) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) ? 1 : 0,
+            (flags & D3D11_FORMAT_SUPPORT_BUFFER) ? 1 : 0,
+            static_cast<unsigned long>(hr_views));
+    }
+    D3D11_FEATURE_DATA_THREADING threading{};
+    const HRESULT hr_threading =
+        device->CheckFeatureSupport(D3D11_FEATURE_THREADING, &threading, sizeof(threading));
+    D3D11_FEATURE_DATA_DOUBLES doubles{};
+    const HRESULT hr_doubles =
+        device->CheckFeatureSupport(D3D11_FEATURE_DOUBLES, &doubles, sizeof(doubles));
+    D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS hw10{};
+    const HRESULT hr_hw10 = device->CheckFeatureSupport(D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS,
+                                                        &hw10, sizeof(hw10));
+    out("MODE=%s ITEM=feat_threading hr=0x%08lx driver_concurrent_creates=%d"
+        " driver_command_lists=%d\n", path, static_cast<unsigned long>(hr_threading),
+        threading.DriverConcurrentCreates, threading.DriverCommandLists);
+    out("MODE=%s ITEM=feat_doubles hr=0x%08lx double_precision=%d\n", path,
+        static_cast<unsigned long>(hr_doubles), doubles.DoublePrecisionFloatShaderOps);
+    out("MODE=%s ITEM=feat_hw10 hr=0x%08lx compute_shaders_plus_raw_and_structured=%d\n",
+        path, static_cast<unsigned long>(hr_hw10),
+        hw10.ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x);
+}
+
 bool a8_target(const char* path, ID3D11Device* device, UINT bind_flags,
                ComPtr<ID3D11Texture2D>& tex, ComPtr<ID3D11Texture2D>& staging) {
     D3D11_TEXTURE2D_DESC desc{};
@@ -4192,6 +4260,23 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// caps-probe: the capability surface D2D consults before picking a path
+// ---------------------------------------------------------------------------
+int run_caps_probe(bool warp, bool debug_layer) {
+    const char* path = "caps-probe";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+    d2d_capability_surface(path, g.device.Get());
+    out("MODE=%s SUMMARY items=1 failed=0 note=diff_against_warp_by_item_name\n", path);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // coverage-mask: D2D's own coverage formula, end to end
 // ---------------------------------------------------------------------------
 // Both coverage modes render into the same size target, so the size is declared
@@ -4365,29 +4450,41 @@ int run_coverage_mask(bool warp, bool debug_layer) {
         if (n > 0) used += static_cast<size_t>(n);
     }
 
-    // 0 samples must be clipped away (white stays), 16 samples must be full ink,
-    // and the intermediate steps must differ from both. Requiring at least five
-    // distinct values is the bar a real 16-step coverage ramp clears easily and a
-    // collapsed on/off chain cannot.
+    // 0 samples must be clipped away (white stays) and the rest must form a
+    // rising staircase of distinct levels. Coverage is written as grey here, so
+    // full coverage is white, not ink; the discriminating property is the number
+    // of distinct steps, which a collapsed on/off chain cannot produce.
     const int first = back.bytes[static_cast<size_t>(y) * back.pitch + 2];
+    bool monotonic = true;
+    int prev = first;
+    for (int i = 1; i <= kCovMaskSamples; ++i) {
+        const int x = (i * kCovSize) / kCovMaskWidth;
+        const int px = back.bytes[static_cast<size_t>(y) * back.pitch +
+                                  static_cast<size_t>(x < kCovSize ? x : kCovSize - 1) * 4 +
+                                  2];
+        if (px < prev) monotonic = false;
+        prev = px;
+    }
     const int last_x = (kCovMaskSamples * kCovSize) / kCovMaskWidth;
     const int last = back.bytes[static_cast<size_t>(y) * back.pitch +
                                 static_cast<size_t>(last_x < kCovSize ? last_x
                                                                      : kCovSize - 1) * 4 + 2];
     const bool zero_clipped = first >= 250;
-    const bool full_ink = last <= 8;
+    const bool full_coverage = last >= 250;
     const bool steps = seen.size() >= 5;
-    const bool ok = zero_clipped && full_ink && steps;
+    const bool rising = monotonic && (last >= 240);
+    const bool ok = zero_clipped && full_coverage && steps && rising;
     char extra[360];
     _snprintf_s(extra, sizeof(extra), _TRUNCATE,
-                " row=%d masks=popcount_0_to_16 expected=17_steps_zero_clipped_full_ink"
-                " distinct=%zu zero_clipped=%s full_ink=%s hr_draw=0x%08lx", y, seen.size(),
-                zero_clipped ? "yes" : "no", full_ink ? "yes" : "no",
+                " row=%d masks=popcount_0_to_16 expected=17_step_rising_ramp"
+                " distinct=%zu zero_clipped=%s full_coverage=%s rising=%s"
+                " hr_draw=0x%08lx", y, seen.size(), zero_clipped ? "yes" : "no",
+                full_coverage ? "yes" : "no", rising ? "yes" : "no",
                 static_cast<unsigned long>(hr_draw));
     const char* reason = ok ? "ok"
                             : (!steps ? "coverage_quantised_to_two_levels"
                                       : (!zero_clipped ? "zero_coverage_not_clipped"
-                                                       : "full_coverage_not_ink"));
+                                                       : "coverage_ramp_not_rising"));
     out("MODE=%s ITEM=mask_ramp%s ramp=%s RESULT=%s reason=%s\n", path, extra, ramp,
         ok ? "PASS" : "FAIL", reason);
     if (!ok) ++g_failures;
@@ -9072,6 +9169,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "coverage-probe") return run_coverage_probe(warp, debug_layer);
     if (mode == "interp-probe") return run_interp_probe(warp, debug_layer);
     if (mode == "coverage-mask") return run_coverage_mask(warp, debug_layer);
+    if (mode == "caps-probe") return run_caps_probe(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -9131,6 +9229,9 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode caps-probe   every format and device capability D2D consults, so a\n"
+        "                    capability that differs from the reference driver shows\n"
+        "                    up before chasing the path it selects\n"
         "  --mode coverage-mask  D2D's own coverage formula end to end: an R32_UINT\n"
         "                    mask row with population counts 0..16, sampled with\n"
         "                    countbits(mask)/16 and clipped at 1/32; two output\n"
@@ -9260,6 +9361,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("coverage-probe");
             } else if (value == L"interp-probe") {
                 modes.push_back("interp-probe");
+            } else if (value == L"caps-probe") {
+                modes.push_back("caps-probe");
             } else if (value == L"coverage-mask") {
                 modes.push_back("coverage-mask");
             } else if (value == L"vb-paths") {
