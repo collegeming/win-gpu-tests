@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -4191,6 +4192,206 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// coverage-mask: D2D's own coverage formula, end to end
+// ---------------------------------------------------------------------------
+// d2d1.dll's embedded shaders compute geometric coverage as
+//     mask = g_coverageTexture[i].Load(...);            // R32_UINT bitmask
+//     cov  = (float)countbits(mask) / 16.0;
+//     clip(cov - 1.0/32.0);
+// This mode feeds one row of masks whose population counts run 0..16 and reads
+// the resulting coverage back. A correct chain yields 17 distinct steps; two
+// steps mean coverage is being collapsed to on/off, which is what the device
+// shows for antialiased edges while the reference keeps the gradient.
+const char* kCovMaskPs =
+    "Texture2D<uint> src : register(t0);\n"
+    "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
+    "    uint mask = src.Load(int3(int2(pos.xy), 0));\n"
+    "    float cov = (float)countbits(mask) / 16.0;\n"
+    "    clip(cov - 1.0 / 32.0);\n"
+    "    return float4(cov, cov, cov, 1.0);\n"
+    "}\n";
+
+// Masks with exactly n bits set, for n = 0..16. The low n bits are set, which
+// keeps the value well inside the 16-sample model D2D uses.
+constexpr int kCovMaskSamples = 16;
+// The mask texture matches the render target so pos.xy indexes it directly; the
+// population count depends only on x, so any row shows the whole ramp.
+constexpr int kCovMaskWidth = 64;
+constexpr int kCovMaskHeight = 64;
+
+int run_coverage_mask(bool warp, bool debug_layer) {
+    const char* path = "coverage-mask";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "covmask_vs", kA8Vs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "covmask_ps", kCovMaskPs, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                         ps_blob->GetBufferSize(), nullptr, &ps);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    // The mask texture: one row of population counts 0..16, uploaded as R32_UINT
+    // and read through a uint SRV, which is what D2D's coverage texture is.
+    std::vector<unsigned int> masks(static_cast<size_t>(kCovMaskWidth) * kCovMaskHeight, 0u);
+    for (int y = 0; y < kCovMaskHeight; ++y) {
+        for (int x = 0; x < kCovMaskWidth; ++x) {
+            const int n = x % (kCovMaskSamples + 1);
+            masks[static_cast<size_t>(y) * kCovMaskWidth + x] =
+                (n >= 32) ? 0xffffffffu : ((n == 0) ? 0u : ((1u << n) - 1u));
+        }
+    }
+    D3D11_TEXTURE2D_DESC md{};
+    md.Width = kCovMaskWidth;
+    md.Height = kCovMaskHeight;
+    md.MipLevels = 1;
+    md.ArraySize = 1;
+    md.Format = DXGI_FORMAT_R32_UINT;
+    md.SampleDesc.Count = 1;
+    md.Usage = D3D11_USAGE_DEFAULT;
+    md.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = masks.data();
+    init.SysMemPitch = kCovMaskWidth * 4;
+    ComPtr<ID3D11Texture2D> mask_tex;
+    hr = g.device->CreateTexture2D(&md, &init, &mask_tex);
+    out("MODE=%s stage=create_mask_texture fmt=R32_UINT size=%dx%d hr=0x%08lx\n", path,
+        kCovMaskWidth, kCovMaskHeight, static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=mask_texture_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11ShaderResourceView> mask_srv;
+    hr = g.device->CreateShaderResourceView(mask_tex.Get(), nullptr, &mask_srv);
+    out("MODE=%s stage=create_mask_srv hr=0x%08lx\n", path,
+        static_cast<unsigned long>(hr));
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=mask_srv_failed\n", path);
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kCovSize,
+                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rtv_create_failed\n", path);
+        return 2;
+    }
+
+    const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    g.context->ClearRenderTargetView(rtv.Get(), white);
+    g.context->VSSetShader(vs.Get(), nullptr, 0);
+    g.context->PSSetShader(ps.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* srvs[1] = {mask_srv.Get()};
+    g.context->PSSetShaderResources(0, 1, srvs);
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<FLOAT>(kCovSize);
+    vp.Height = static_cast<FLOAT>(kCovSize);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    g.context->RSSetViewports(1, &vp);
+    g.context->IASetInputLayout(nullptr);
+    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.context->Draw(3, 0);
+    g.context->Flush();
+    const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+    ID3D11ShaderResourceView* no_srv = nullptr;
+    g.context->PSSetShaderResources(0, 1, &no_srv);
+    g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+    const SmallRead back =
+        small_read(path, g.context.Get(), tex.Get(), staging.Get(), kCovSize, 4);
+    if (!back.ok) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
+        return 2;
+    }
+
+    // The mask row is 32 texels over a 64px target, so each texel covers two
+    // pixels; sample the left pixel of each texel and collect the distinct
+    // coverage values in mask order.
+    const int y = kCovSize / 2;
+    std::set<int> seen;
+    char ramp[400];
+    size_t used = 0;
+    ramp[0] = 0;
+    for (int i = 0; i <= kCovMaskSamples; ++i) {
+        const int x = (i * kCovSize) / kCovMaskWidth;
+        const int clamped = x < kCovSize ? x : kCovSize - 1;
+        const size_t off = static_cast<size_t>(y) * back.pitch +
+                           static_cast<size_t>(clamped) * 4;
+        const int v = back.bytes[off + 2];
+        seen.insert(v);
+        const int n = _snprintf_s(ramp + used, sizeof(ramp) - used, _TRUNCATE, "%s%d",
+                                  i ? "," : "", v);
+        if (n > 0) used += static_cast<size_t>(n);
+    }
+
+    // 0 samples must be clipped away (white stays), 16 samples must be full ink,
+    // and the intermediate steps must differ from both. Requiring at least five
+    // distinct values is the bar a real 16-step coverage ramp clears easily and a
+    // collapsed on/off chain cannot.
+    const int first = back.bytes[static_cast<size_t>(y) * back.pitch + 2];
+    const int last_x = (kCovMaskSamples * kCovSize) / kCovMaskWidth;
+    const int last = back.bytes[static_cast<size_t>(y) * back.pitch +
+                                static_cast<size_t>(last_x < kCovSize ? last_x
+                                                                     : kCovSize - 1) * 4 + 2];
+    const bool zero_clipped = first >= 250;
+    const bool full_ink = last <= 8;
+    const bool steps = seen.size() >= 5;
+    const bool ok = zero_clipped && full_ink && steps;
+    char extra[360];
+    _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                " row=%d masks=popcount_0_to_16 expected=17_steps_zero_clipped_full_ink"
+                " distinct=%zu zero_clipped=%s full_ink=%s hr_draw=0x%08lx", y, seen.size(),
+                zero_clipped ? "yes" : "no", full_ink ? "yes" : "no",
+                static_cast<unsigned long>(hr_draw));
+    const char* reason = ok ? "ok"
+                            : (!steps ? "coverage_quantised_to_two_levels"
+                                      : (!zero_clipped ? "zero_coverage_not_clipped"
+                                                       : "full_coverage_not_ink"));
+    out("MODE=%s ITEM=mask_ramp%s ramp=%s RESULT=%s reason=%s\n", path, extra, ramp,
+        ok ? "PASS" : "FAIL", reason);
+    if (!ok) ++g_failures;
+    out("MODE=%s SUMMARY items=1 failed=%d\n", path, ok ? 0 : 1);
+    return ok ? 0 : 2;
+}
+
+// ---------------------------------------------------------------------------
 // interp-probe: does a vertex-varying float actually vary across the triangle?
 // ---------------------------------------------------------------------------
 // Every earlier varying case sent a constant (0.5), so a pipeline that delivered
@@ -4398,6 +4599,15 @@ int run_interp_probe(bool warp, bool debug_layer) {
 const char* kCovPsPremulRed =
     "float4 main() : SV_Target { return float4(0.5f, 0.0f, 0.0f, 0.5f); }\n";
 
+// D2D drives analytic coverage through the blend factor: the pixel shader
+// writes an opaque colour and OMSetBlendState supplies the coverage amount as
+// BLEND_FACTOR/INV_BLEND_FACTOR. If the constant never reaches the hardware the
+// draw collapses to "factor is 0" or "factor is 1", which turns every
+// antialiased edge into either pure ink or no ink -- exactly the binary uniq=2
+// edges the device reports while WARP keeps the gradient.
+const char* kCovPsOpaqueBlack =
+    "float4 main() : SV_Target { return float4(0.0f, 0.0f, 0.0f, 1.0f); }\n";
+
 constexpr int kCovSize = 64;
 
 // Premultiplied 0.5 red over white is (1.0, 0.5, 0.5) and over black is
@@ -4473,7 +4683,6 @@ int run_coverage_probe(bool warp, bool debug_layer) {
         {"over_black", {0.0f, 0.0f, 0.0f, 1.0f}, kCovOverBlack,
          "premultiplied_0.5_red_over_black_0,0,128"},
     };
-
     int failed = 0;
     int items = 0;
     for (const CovCase& c : cases) {
@@ -8860,6 +9069,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "dualsrc-blend") return run_dualsrc_blend(warp, debug_layer);
     if (mode == "coverage-probe") return run_coverage_probe(warp, debug_layer);
     if (mode == "interp-probe") return run_interp_probe(warp, debug_layer);
+    if (mode == "coverage-mask") return run_coverage_mask(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -8919,6 +9129,10 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode coverage-mask  D2D's own coverage formula end to end: an R32_UINT\n"
+        "                    mask row with population counts 0..16, sampled with\n"
+        "                    countbits(mask)/16 and clipped at 1/32; two output\n"
+        "                    levels mean coverage is collapsed to on/off\n"
         "  --mode interp-probe  a real 0..1 gradient in a smooth varying, read back\n"
         "                    as a ramp; a constant result means interpolation, not\n"
         "                    blending or masking, flattens per-pixel coverage\n"
@@ -9044,6 +9258,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("coverage-probe");
             } else if (value == L"interp-probe") {
                 modes.push_back("interp-probe");
+            } else if (value == L"coverage-mask") {
+                modes.push_back("coverage-mask");
             } else if (value == L"vb-paths") {
                 modes.push_back("vb-paths");
             } else if (value == L"mask-write-srv") {
