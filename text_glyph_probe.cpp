@@ -4191,6 +4191,150 @@ int run_dualsrc_blend(bool warp, bool debug_layer) {
 }
 
 // ---------------------------------------------------------------------------
+// interp-probe: does a vertex-varying float actually vary across the triangle?
+// ---------------------------------------------------------------------------
+// Every earlier varying case sent a constant (0.5), so a pipeline that delivered
+// one constant to every fragment would still have passed them. Antialiased
+// edges and glyph coverage are both built from values that change per pixel, so
+// this mode interpolates a real gradient and then reads it back as a ramp. A
+// gradient that comes out flat means the interpolation stage, not the blend or
+// the mask, is what turns coverage into a constant.
+const char* kInterpVs =
+    "struct VSOut { float4 pos : SV_POSITION; float v : VALUE; };\n"
+    "VSOut main(uint id : SV_VertexID) {\n"
+    "    float2 p = float2(float((id << 1) & 2u), float(id & 2u));\n"
+    "    VSOut o;\n"
+    "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+    "    o.v = p.x;\n"
+    "    return o;\n"
+    "}\n";
+
+const char* kInterpPsFloat =
+    "float4 main(float v : VALUE) : SV_Target { return float4(v, v, v, 1.0); }\n";
+
+// flat declarations are the shape D2D's glyph shaders use for their packed
+// attributes; the same gradient through a flat varying must arrive as a single
+// value, which also shows whether flat is honoured at all.
+const char* kInterpPsFlat =
+    "float4 main(float v : VALUE) : SV_Target { return float4(v, v, v, 1.0); }\n";
+
+constexpr int kInterpSize = 64;
+
+int run_interp_probe(bool warp, bool debug_layer) {
+    const char* path = "interp-probe";
+    Gpu g;
+    if (!gpu_create(path, warp, debug_layer, g)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=gpu_create_failed\n", path);
+        return 2;
+    }
+    gpu_adapter(path, g.device.Get());
+
+    ComPtr<ID3DBlob> vs_blob, ps_blob;
+    const char* used_profile = nullptr;
+    HRESULT hr = a8_compile(path, "interp_vs", kInterpVs, "vs_5_0", "vs_4_0",
+                            vs_blob.GetAddressOf(), &used_profile);
+    if (SUCCEEDED(hr))
+        hr = a8_compile(path, "interp_ps", kInterpPsFloat, "ps_5_0", "ps_4_0",
+                        ps_blob.GetAddressOf(), &used_profile);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_compile_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    hr = g.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+                                      nullptr, &vs);
+    if (SUCCEEDED(hr))
+        hr = g.device->CreatePixelShader(ps_blob->GetBufferPointer(),
+                                         ps_blob->GetBufferSize(), nullptr, &ps);
+    if (FAILED(hr)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=shader_create_failed hr=0x%08lx\n", path,
+            static_cast<unsigned long>(hr));
+        return 2;
+    }
+
+    ComPtr<ID3D11Texture2D> tex, staging;
+    if (!small_texture(path, g.device.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kInterpSize,
+                       D3D11_BIND_RENDER_TARGET, tex, staging)) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=target_create_failed\n", path);
+        return 2;
+    }
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(g.device->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=rtv_create_failed\n", path);
+        return 2;
+    }
+
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    g.context->ClearRenderTargetView(rtv.Get(), black);
+    g.context->VSSetShader(vs.Get(), nullptr, 0);
+    g.context->PSSetShader(ps.Get(), nullptr, 0);
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<FLOAT>(kInterpSize);
+    vp.Height = static_cast<FLOAT>(kInterpSize);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    g.context->RSSetViewports(1, &vp);
+    g.context->IASetInputLayout(nullptr);
+    g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.context->Draw(3, 0);
+    g.context->Flush();
+    const HRESULT hr_draw = g.device->GetDeviceRemovedReason();
+    g.context->OMSetRenderTargets(0, nullptr, nullptr);
+
+    const SmallRead back =
+        small_read(path, g.context.Get(), tex.Get(), staging.Get(), kInterpSize, 4);
+    if (!back.ok) {
+        ++g_failures;
+        out("MODE=%s RESULT=FAIL reason=map_read_failed\n", path);
+        return 2;
+    }
+
+    // Sample the middle row at five x positions: a real ramp rises, a constant
+    // gives five equal values.
+    const int y = kInterpSize / 2;
+    int got[5] = {0, 0, 0, 0, 0};
+    const int xs[5] = {0, kInterpSize / 4, kInterpSize / 2, 3 * kInterpSize / 4, kInterpSize - 1};
+    char ramp[200];
+    size_t used = 0;
+    ramp[0] = 0;
+    for (int i = 0; i < 5; ++i) {
+        const size_t off = static_cast<size_t>(y) * back.pitch +
+                           static_cast<size_t>(xs[i]) * 4;
+        got[i] = back.bytes[off + 2];
+        const int n = _snprintf_s(ramp + used, sizeof(ramp) - used, _TRUNCATE, "%s%d",
+                                  i ? "," : "", got[i]);
+        if (n > 0) used += static_cast<size_t>(n);
+    }
+    const int spread = got[4] - got[0];
+    // A ramp across the triangle must rise by most of the 0..255 range; 96 keeps
+    // the bar well above any single quantisation step while tolerating the row
+    // being sampled inside the triangle rather than at its extremes.
+    const bool ramps = spread >= 96;
+    char extra[320];
+    _snprintf_s(extra, sizeof(extra), _TRUNCATE,
+                " row=%d xs=0,%d,%d,%d,%d expected=increasing_0_to_255_ramp"
+                " spread=%d min_spread=96 hr_draw=0x%08lx", y, kInterpSize / 4,
+                kInterpSize / 2, 3 * kInterpSize / 4, kInterpSize - 1, spread,
+                static_cast<unsigned long>(hr_draw));
+    out("MODE=%s ITEM=gradient_ramp%s ramp=%s RESULT=%s reason=%s\n", path, extra, ramp,
+        ramps ? "PASS" : "FAIL", ramps ? "ok" : "interpolated_value_is_constant");
+    if (!ramps) {
+        ++g_failures;
+        return 2;
+    }
+    out("MODE=%s SUMMARY items=1 failed=0 ramp=%s\n", path, ramp);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // coverage-probe: does fixed-function blend read the destination?
 // ---------------------------------------------------------------------------
 // The same premultiplied half-covered red is blended over a white and over a
@@ -8663,6 +8807,7 @@ int run_mode(const std::string& mode, bool warp, bool debug_layer) {
     if (mode == "mask-uint") return run_mask_uint(warp, debug_layer);
     if (mode == "dualsrc-blend") return run_dualsrc_blend(warp, debug_layer);
     if (mode == "coverage-probe") return run_coverage_probe(warp, debug_layer);
+    if (mode == "interp-probe") return run_interp_probe(warp, debug_layer);
     if (mode == "vb-paths") return run_vb_paths(warp, debug_layer);
     if (mode == "mask-write-srv") return run_mask_write_srv(warp, debug_layer);
     if (mode == "uint-rt-matrix") return run_uint_rt_matrix(warp, debug_layer);
@@ -8722,6 +8867,9 @@ void usage() {
         "  --mode dualsrc-blend  PS writes SV_Target0 opaque black and SV_Target1\n"
         "                    alpha 0.5; SRC1_ALPHA/INV_SRC1_ALPHA must give grey 128,\n"
         "                    SRC1_COLOR/INV_SRC1_COLOR white, SRC_ALPHA black\n"
+        "  --mode interp-probe  a real 0..1 gradient in a smooth varying, read back\n"
+        "                    as a ramp; a constant result means interpolation, not\n"
+        "                    blending or masking, flattens per-pixel coverage\n"
         "  --mode coverage-probe  the same premultiplied half-covered red blended\n"
         "                    with ONE/INV_SRC_ALPHA over a white and over a black\n"
         "                    clear; if both clears give the same pixels the blend\n"
@@ -8842,6 +8990,8 @@ int wmain(int argc, wchar_t** argv) {
                 modes.push_back("dualsrc-blend");
             } else if (value == L"coverage-probe") {
                 modes.push_back("coverage-probe");
+            } else if (value == L"interp-probe") {
+                modes.push_back("interp-probe");
             } else if (value == L"vb-paths") {
                 modes.push_back("vb-paths");
             } else if (value == L"mask-write-srv") {
