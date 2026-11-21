@@ -4235,14 +4235,22 @@ const char* kInterpVsDiagonal =
     "    return o;\n"
     "}\n";
 
+// The PS declares SV_POSITION first so VALUE lands in v1, matching the VS's o1.
+// Declaring VALUE alone would put it in v0 while the VS writes o1, and both this
+// stack and the reference then read whatever happens to sit in v0 -- the probe
+// would be measuring the register mismatch instead of the interpolation.
 const char* kInterpPsFloat =
-    "float4 main(float v : VALUE) : SV_Target { return float4(v, v, v, 1.0); }\n";
+    "float4 main(float4 pos : SV_POSITION, float v : VALUE) : SV_Target {\n"
+    "    return float4(v, v, v, 1.0);\n"
+    "}\n";
 
 // flat declarations are the shape D2D's glyph shaders use for their packed
 // attributes; the same gradient through a flat varying must arrive as a single
-// value, which also shows whether flat is honoured at all.
+// value, which also shows whether flat is honoured at all. SV_POSITION is
+// declared first for the same register reason as above.
 const char* kInterpPsFlat =
-    "float4 main(float v : VALUE) : SV_Target { return float4(v, v, v, 1.0); }\n";
+    "float4 main(float4 pos : SV_POSITION, nointerpolation float v : VALUE)"
+    " : SV_Target { return float4(v, v, v, 1.0); }\n";
 
 constexpr int kInterpSize = 64;
 
