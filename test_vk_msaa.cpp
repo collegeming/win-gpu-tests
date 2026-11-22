@@ -504,12 +504,14 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         if (!ok("vkBindBufferMemory", api.BindBufferMemory(dev, buf, bmem, 0)))
             break;
 
+        std::printf("stage=%s pool_begin\n", label);
         VkCommandPoolCreateInfo pci{};
         pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         pci.queueFamilyIndex = g_qf_index;
         if (!ok("vkCreateCommandPool", api.CreateCommandPool(dev, &pci, nullptr, &pool)))
             break;
+        std::printf("stage=%s pool_ok\n", label);
         VkCommandBufferAllocateInfo cbai{};
         cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         cbai.commandPool = pool;
@@ -519,7 +521,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
                 api.AllocateCommandBuffers(dev, &cbai, &cmd)))
             break;
 
-        std::printf("stage=%s resources_ok\n", label);
+        std::printf("stage=%s cb_alloc_ok\n", label);
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -529,6 +531,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         // The attachment starts UNDEFINED and the pass clears it, so no barrier
         // is needed before begin; the resolve attachment's layout comes from the
         // pass itself.
+        std::printf("stage=%s begin_ok\n", label);
         VkClearValue clear{};
         clear.color.float32[0] = 1.0f;  // magenta, so the clear is unmistakable
         clear.color.float32[1] = 0.0f;
@@ -546,6 +549,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         if (draw) {
             rt.CmdDraw(cmd, 3, 1, 0, 0);
         }
+        std::printf("stage=%s draw_ok\n", label);
         rt.CmdEndRenderPass(cmd);
 
         // Resolve image is TRANSFER_SRC_OPTIMAL after the pass; copy it out.
@@ -556,6 +560,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         rt.CmdCopyImageToBuffer(cmd, res_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1,
                                 &region);
 
+        std::printf("stage=%s copy_ok\n", label);
         if (!ok("vkEndCommandBuffer", api.EndCommandBuffer(cmd)))
             break;
 
