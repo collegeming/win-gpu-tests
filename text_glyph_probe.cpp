@@ -4572,7 +4572,7 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
         for (int x = 4; x < kMsaaSize - 4; ++x) {
             const size_t off =
                 static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
-            const int r = back.bytes[off + 2];
+            const int r = back.bytes[off + 1];  // green: fill 255, magenta 0
             seen.insert(r);
             if (r < min_v) min_v = r;
             if (r > max_v) max_v = r;
@@ -4587,16 +4587,20 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
             if (edge_len + 8 < sizeof(edge))
                 edge_len += static_cast<size_t>(_snprintf_s(
                     edge + edge_len, sizeof(edge) - edge_len, _TRUNCATE, "%s%d",
-                    edge_len ? "," : "", back.bytes[off + 2]));
+                    edge_len ? "," : "", back.bytes[off + 1]));
         }
     }
+    // Corner pixel in green: 0 means magenta survived (clear worked, draw lost),
+    // 255 means the pixel was never cleared either, i.e. the whole target is
+    // unreachable.
+    const int corner_g = back.bytes[static_cast<size_t>(1) * back.pitch + 1];
     // Two levels means the resolve came out hard; four or more means the fringe
     // survived. A single-sample target has to show two levels, which is the
     // control that the geometry covers the sampled area at all.
     const bool multisampled = (samples == 1) ? (seen.size() >= 2) : (seen.size() >= 4);
-    out("MODE=%s ITEM=%s samples=%d midrow=[%s] distinct=%zu min=%d max=%d"
-        " expected_at_least=4 RESULT=%s reason=%s\n", path, label, samples, edge,
-        seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
+    out("MODE=%s ITEM=%s samples=%d corner_g=%d midrow=[%s] distinct=%zu min=%d max=%d"
+        " expected_at_least=4 RESULT=%s reason=%s\n", path, label, samples, corner_g,
+        edge, seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
         multisampled ? "ok" : "msaa_resolved_as_one_sample");
     if (!multisampled) ++g_failures;
 }
