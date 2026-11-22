@@ -331,25 +331,33 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         if (!ok("vkCreateImageView(resolve)", rt.CreateImageView(dev, &rvci, nullptr, &res_view)))
             break;
 
-        // Render pass: multisampled colour attachment resolved into a
-        // single-sampled one in the same pass.
+        // Render pass. With more than one sample the colour attachment is
+        // resolved into the single-sampled image inside the same pass; at one
+        // sample a resolve attachment is illegal, so the pass renders straight
+        // into the image that gets copied out.
+        const bool use_resolve = samples != VK_SAMPLE_COUNT_1_BIT;
         VkAttachmentDescription att[2]{};
         att[0].format = fmt;
         att[0].samples = samples;
         att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        att[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;  // resolved, not stored
         att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        att[1].format = fmt;
-        att[1].samples = VK_SAMPLE_COUNT_1_BIT;
-        att[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        att[1].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        if (use_resolve) {
+            att[0].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;  // resolved, not stored
+            att[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            att[1].format = fmt;
+            att[1].samples = VK_SAMPLE_COUNT_1_BIT;
+            att[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            att[1].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        } else {
+            att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        }
 
         VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkAttachmentReference resolve_ref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -357,7 +365,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         sub.colorAttachmentCount = 1;
         sub.pColorAttachments = &color_ref;
-        sub.pResolveAttachments = &resolve_ref;
+        sub.pResolveAttachments = use_resolve ? &resolve_ref : nullptr;
 
         VkSubpassDependency dep{};
         dep.srcSubpass = VK_SUBPASS_EXTERNAL;
@@ -369,7 +377,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         std::printf("stage=%s views_ok\n", label);
         VkRenderPassCreateInfo rpci{};
         rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpci.attachmentCount = 2;
+        rpci.attachmentCount = use_resolve ? 2 : 1;
         rpci.pAttachments = att;
         rpci.subpassCount = 1;
         rpci.pSubpasses = &sub;
@@ -391,8 +399,8 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         VkFramebufferCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fci.renderPass = rp;
-        fci.attachmentCount = 2;
-        fci.pAttachments = views;
+        fci.attachmentCount = use_resolve ? 2 : 1;
+        fci.pAttachments = use_resolve ? views : &views[1];
         fci.width = W;
         fci.height = H;
         fci.layers = 1;
