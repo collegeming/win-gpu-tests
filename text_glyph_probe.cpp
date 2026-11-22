@@ -4590,17 +4590,20 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
                     edge_len ? "," : "", back.bytes[off + 1]));
         }
     }
-    // Corner pixel in green: 0 means magenta survived (clear worked, draw lost),
+    // Corner pixel as R,G: 255,0 is the magenta clear surviving (clear worked,
+    // draw lost); 0,0 is a black target that took neither clear nor draw.
+    const size_t corner_off = static_cast<size_t>(1) * back.pitch + 4;
+    const int corner_r = back.bytes[corner_off + 2];
+    const int corner_g = back.bytes[corner_off + 1];
     // 255 means the pixel was never cleared either, i.e. the whole target is
     // unreachable.
-    const int corner_g = back.bytes[static_cast<size_t>(1) * back.pitch + 1];
     // Two levels means the resolve came out hard; four or more means the fringe
     // survived. A single-sample target has to show two levels, which is the
     // control that the geometry covers the sampled area at all.
     const bool multisampled = (samples == 1) ? (seen.size() >= 2) : (seen.size() >= 4);
-    out("MODE=%s ITEM=%s samples=%d corner_g=%d midrow=[%s] distinct=%zu min=%d max=%d"
-        " expected_at_least=4 RESULT=%s reason=%s\n", path, label, samples, corner_g,
-        edge, seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
+    out("MODE=%s ITEM=%s samples=%d corner_rg=%d,%d midrow=[%s] distinct=%zu min=%d max=%d"
+        " expected_at_least=4 RESULT=%s reason=%s\n", path, label, samples, corner_r,
+        corner_g, edge, seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
         multisampled ? "ok" : "msaa_resolved_as_one_sample");
     if (!multisampled) ++g_failures;
 }
