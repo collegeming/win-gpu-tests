@@ -103,6 +103,7 @@ struct DevApi {
     PFN_vkMapMemory MapMemory;
     PFN_vkUnmapMemory UnmapMemory;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdBindPipeline CmdBindPipeline;
 };
 
 static bool load_dev_api(DevApi &a, PFN_vkGetDeviceProcAddr gdpa, VkDevice dev,
@@ -145,6 +146,7 @@ static bool load_dev_api(DevApi &a, PFN_vkGetDeviceProcAddr gdpa, VkDevice dev,
     LOAD(MapMemory);
     LOAD(UnmapMemory);
     LOAD(CmdPipelineBarrier);
+    LOAD(CmdBindPipeline);
 #undef LOAD
     return missing == 0;
 }
@@ -555,6 +557,8 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         rbi.pClearValues = &clear;
         rt.CmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         std::printf("stage=%s rp_begun\n", label);
+        api.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        std::printf("stage=%s pipe_bound\n", label);
         if (draw) {
             std::printf("stage=%s cmd_draw_enter\n", label);
             rt.CmdDraw(cmd, 3, 1, 0, 0);
