@@ -4487,15 +4487,22 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
         return;
     }
 
-    // Resolve target and staging for the readback.
+    // ResolveSubresource requires a DEFAULT destination; a STAGING texture is
+    // rejected, so the resolve target and the readback staging are separate.
     td.SampleDesc.Count = 1;
     td.BindFlags = 0;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.CPUAccessFlags = 0;
+    ComPtr<ID3D11Texture2D> resolved;
+    const HRESULT hr_resolved = g.device->CreateTexture2D(&td, nullptr, &resolved);
     td.Usage = D3D11_USAGE_STAGING;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ComPtr<ID3D11Texture2D> resolved;
     ComPtr<ID3D11Texture2D> staging;
-    if (FAILED(g.device->CreateTexture2D(&td, nullptr, &resolved)) ||
-        FAILED(g.device->CreateTexture2D(&td, nullptr, &staging))) {
+    const HRESULT hr_staging = g.device->CreateTexture2D(&td, nullptr, &staging);
+    out("MODE=%s ITEM=%s stage=create_resolve hr_resolved=0x%08lx hr_staging=0x%08lx\n",
+        path, label, static_cast<unsigned long>(hr_resolved),
+        static_cast<unsigned long>(hr_staging));
+    if (FAILED(hr_resolved) || FAILED(hr_staging)) {
         ++g_failures;
         out("MODE=%s ITEM=%s RESULT=FAIL reason=resolve_target_create_failed\n", path, label);
         return;
