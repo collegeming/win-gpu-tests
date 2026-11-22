@@ -228,6 +228,7 @@ struct CaseStats {
     int distinct_green = 0;
     int min_green = 255;
     int max_green = 255;
+    int intermediate = 0;
     int corner_r = 0, corner_g = 0;
     char midrow[64] = {0};
     bool created_msaa = false;
@@ -606,17 +607,20 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         int distinct[256] = {0};
         int distinct_count = 0;
         int mn = 255, mx = 0;
+        int intermediate = 0;
         for (uint32_t y = 4; y < H - 4; ++y) {
             for (uint32_t x = 4; x < W - 4; ++x) {
                 const int g = px[(y * W + x) * 4 + 1];
                 if (!distinct[g]++) distinct_count++;
                 if (g < mn) mn = g;
                 if (g > mx) mx = g;
+                if (g > 8 && g < 247) ++intermediate;
             }
         }
         stats->distinct_green = distinct_count;
         stats->min_green = mn;
         stats->max_green = mx;
+        stats->intermediate = intermediate;
         stats->clear_only = !draw;
         {
             const size_t corner = (1 * W + 1) * 4;
@@ -641,16 +645,17 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         // samples must additionally show intermediate coverage on the diagonal.
         const bool drew = (mx > 247) && (mn < 8);
         const bool needs_fringe = samples != VK_SAMPLE_COUNT_1_BIT && draw;
-        pass = draw ? (drew && (!needs_fringe || distinct_count >= 4))
+        pass = draw ? (drew && (!needs_fringe || intermediate >= 1))
                     : (stats->corner_r > 247 && mx < 8);
     } while (false);
 
     std::printf(
         "MODE=vk-msaa ITEM=%s samples=%d draw=%d created=%d create_result=%s "
-        "corner_rg=%d,%d midrow=[%s] distinct_green=%d min=%d max=%d RESULT=%s\n",
+        "corner_rg=%d,%d midrow=[%s] distinct_green=%d min=%d max=%d intermediate=%d RESULT=%s\n",
         label, (int)samples, draw ? 1 : 0, stats->created_msaa ? 1 : 0,
         vkres(stats->msaa_result), stats->corner_r, stats->corner_g, stats->midrow,
         stats->distinct_green, stats->min_green, stats->max_green,
+        stats->intermediate,
         pass ? "PASS" : "FAIL");
 
     if (pipe) api.DestroyPipeline(dev, pipe, nullptr);
