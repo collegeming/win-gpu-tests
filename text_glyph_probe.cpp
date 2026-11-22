@@ -4455,7 +4455,12 @@ const char* kMsaaVs =
 
 const char* kMsaaPs =
     "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
-    "    return float4(1.0, 1.0, 1.0, 1.0);\n"
+    "    // Green, so against the magenta clear the three possible states stay
+"
+    "    // distinguishable in R,G: magenta 255,0 / green 0,255 / untouched 0,0.
+"
+    "    return float4(0.0, 1.0, 0.0, 1.0);
+"
     "}\n";
 
 constexpr int kMsaaSize = 64;
@@ -4584,9 +4589,16 @@ static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw,
         for (int x = kMsaaSize / 2 - 10; x <= kMsaaSize / 2 + 10; ++x) {
             const size_t off =
                 static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
-            if (edge_len + 8 < sizeof(edge))
-                edge_len += static_cast<size_t>(_snprintf_s(
-                    edge + edge_len, sizeof(edge) - edge_len, _TRUNCATE, "%s%d",
+            {
+                // B=untouched black, M=magenta clear, G=green fill, ?=mixed
+                const int pr = back.bytes[off + 2];
+                const int pg = back.bytes[off + 1];
+                const char code = (pr < 8 && pg < 8) ? 'B'
+                                : (pr > 247 && pg < 8) ? 'M'
+                                : (pr < 8 && pg > 247) ? 'G'
+                                : (pr > 8 && pg > 8) ? '?' : '.';
+                if (edge_len + 2 < sizeof(edge)) edge[edge_len++] = code;
+            }
                     edge_len ? "," : "", back.bytes[off + 1]));
         }
     }
