@@ -4596,7 +4596,6 @@ static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw,
                                 : (pr > 8 && pg > 8) ? '?' : '.';
                 if (edge_len + 2 < sizeof(edge)) edge[edge_len++] = code;
             }
-                    edge_len ? "," : "", back.bytes[off + 1]));
         }
     }
     // Corner pixel as R,G: 255,0 is the magenta clear surviving (clear worked,
@@ -4604,7 +4603,7 @@ static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw,
     const size_t corner_off = static_cast<size_t>(1) * back.pitch + 4;
     const int corner_r = back.bytes[corner_off + 2];
     const int corner_g = back.bytes[corner_off + 1];
-    // 255 means the pixel was never cleared either, i.e. the whole target is
+    // Two levels means the resolve came out hard; four or more means the fringe
     // unreachable.
     // Two levels means the resolve came out hard; four or more means the fringe
     // survived. A single-sample target has to show two levels, which is the
