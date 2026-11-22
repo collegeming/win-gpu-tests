@@ -4556,29 +4556,42 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
         return;
     }
 
-    // Walk the hypotenuse and collect the distinct values on it.
+    // Walk the whole interior and count distinct values. Sampling along the edge
+    // itself only ever gives one coverage value (every pixel there is half
+    // covered), so the measurement has to see the fringe as a whole: with more
+    // than one sample the diagonal boundary is spread over several levels, with
+    // one sample it can only be background and fill.
     std::set<int> seen;
     char edge[512] = {0};
     size_t edge_len = 0;
     int min_v = 255, max_v = 0;
-    for (int k = 4; k < kMsaaSize - 4; ++k) {
-        // The hypotenuse runs from pixel (0,0) to (63,63); sample exactly on it.
-        const int x = k;
-        const int y = k;
-        const size_t off = static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
-        const int r = back.bytes[off + 2];
-        seen.insert(r);
-        if (r < min_v) min_v = r;
-        if (r > max_v) max_v = r;
-        if (edge_len + 8 < sizeof(edge))
-            edge_len += static_cast<size_t>(_snprintf_s(edge + edge_len,
-                sizeof(edge) - edge_len, _TRUNCATE, "%s%d", edge_len ? "," : "", r));
+    for (int y = 4; y < kMsaaSize - 4; ++y) {
+        for (int x = 4; x < kMsaaSize - 4; ++x) {
+            const size_t off =
+                static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
+            const int r = back.bytes[off + 2];
+            seen.insert(r);
+            if (r < min_v) min_v = r;
+            if (r > max_v) max_v = r;
+        }
     }
-    // One sample per pixel gives two levels (background and fill); four or more
-    // samples give intermediate coverage along the edge as well.
-    const bool multisampled = seen.size() >= 3;
-    out("MODE=%s ITEM=%s samples=%d edge=[%s] distinct=%zu min=%d max=%d"
-        " expected_at_least=3 RESULT=%s reason=%s\n", path, label, samples, edge,
+    // Also record the row that crosses the edge, as a compact fingerprint.
+    {
+        const int y = kMsaaSize / 2;
+        for (int x = kMsaaSize / 2 - 10; x <= kMsaaSize / 2 + 10; ++x) {
+            const size_t off =
+                static_cast<size_t>(y) * back.pitch + static_cast<size_t>(x) * 4;
+            if (edge_len + 8 < sizeof(edge))
+                edge_len += static_cast<size_t>(_snprintf_s(
+                    edge + edge_len, sizeof(edge) - edge_len, _TRUNCATE, "%s%d",
+                    edge_len ? "," : "", back.bytes[off + 2]));
+        }
+    }
+    // Two levels means the resolve came out hard; four or more means the fringe
+    // survived.
+    const bool multisampled = seen.size() >= 4;
+    out("MODE=%s ITEM=%s samples=%d midrow=[%s] distinct=%zu min=%d max=%d"
+        " expected_at_least=4 RESULT=%s reason=%s\n", path, label, samples, edge,
         seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
         multisampled ? "ok" : "msaa_resolved_as_one_sample");
     if (!multisampled) ++g_failures;
