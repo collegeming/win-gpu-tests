@@ -4455,12 +4455,9 @@ const char* kMsaaVs =
 
 const char* kMsaaPs =
     "float4 main(float4 pos : SV_POSITION) : SV_Target {\n"
-    "    // Green, so against the magenta clear the three possible states stay
-"
-    "    // distinguishable in R,G: magenta 255,0 / green 0,255 / untouched 0,0.
-"
-    "    return float4(0.0, 1.0, 0.0, 1.0);
-"
+    // Green against the magenta clear keeps the three states separable in R,G:
+    // magenta 255,0 / green fill 0,255 / untouched black 0,0.
+    "    return float4(0.0, 1.0, 0.0, 1.0);\n"
     "}\n";
 
 constexpr int kMsaaSize = 64;
