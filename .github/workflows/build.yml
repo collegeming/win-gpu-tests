@@ -29,6 +29,9 @@ on:
       - 'fourattr.vert'
       - 'flat_echo.frag'
       - 'fiveattr_invariant.vert'
+      - 'test_vk_msaa.cpp'
+      - 'msaa_diag.vert'
+      - 'msaa_green.frag'
       - 'vs_noinv_spv.h'
       - 'vs_nophys_spv.h'
       - 'vs_trunc_spv.h'
@@ -82,6 +85,8 @@ jobs:
           glslangValidator -V --target-env vulkan1.0 fourattr.vert -o fourattr_vs.spv
           glslangValidator -V --target-env vulkan1.0 flat_echo.frag -o flat_echo_fs.spv
           glslangValidator -V --target-env vulkan1.0 fiveattr_invariant.vert -o fiveattr_inv_vs.spv
+          glslangValidator -V --target-env vulkan1.0 msaa_diag.vert -o msaa_diag_vert.spv
+          glslangValidator -V --target-env vulkan1.0 msaa_green.frag -o msaa_green_frag.spv
           xxd -i -n sanity_vs_spv sanity_vert.spv > sanity_vs_spv.h
           xxd -i -n sanity_fs_spv sanity_frag.spv > sanity_fs_spv.h
           xxd -i -n sanity_novb_vs_spv sanity_novb_vert.spv > sanity_novb_vs_spv.h
@@ -94,7 +99,9 @@ jobs:
           xxd -i -n fourattr_vs_spv fourattr_vs.spv > fourattr_vs_spv.h
           xxd -i -n flat_echo_fs_spv flat_echo_fs.spv > flat_echo_fs_spv.h
           xxd -i -n fiveattr_inv_vs_spv fiveattr_inv_vs.spv > fiveattr_inv_vs_spv.h
-          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h oneattr_vs_spv.h twoattr_vs_spv.h fourattr_vs_spv.h flat_echo_fs_spv.h fiveattr_inv_vs_spv.h
+          xxd -i -n msaa_diag_vert_spirv msaa_diag_vert.spv > msaa_diag_vert_spirv.h
+          xxd -i -n msaa_green_frag_spirv msaa_green_frag.spv > msaa_green_frag_spirv.h
+          ls -l sanity_vert.spv sanity_frag.spv sanity_novb_vert.spv sanity_vs_spv.h sanity_fs_spv.h sanity_novb_vs_spv.h desc_const_fs_spv.h d2d_feed_vs_spv.h fiveattr_vs_spv.h lut_read_fs_spv.h oneattr_vs_spv.h twoattr_vs_spv.h fourattr_vs_spv.h flat_echo_fs_spv.h fiveattr_inv_vs_spv.h msaa_diag_vert_spirv.h msaa_green_frag_spirv.h
       - uses: actions/upload-artifact@v4
         with:
           name: compute-spirv
@@ -116,6 +123,8 @@ jobs:
             fourattr_vs_spv.h
             flat_echo_fs_spv.h
             fiveattr_inv_vs_spv.h
+            msaa_diag_vert_spirv.h
+            msaa_green_frag_spirv.h
           if-no-files-found: error
   build:
     needs: spirv
@@ -380,6 +389,52 @@ jobs:
             usage-d2d-replay.txt
             build-info-d2d-replay.txt
             SHA256SUMS-d2d-replay.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Build Vulkan multisample probe
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /std:c++17 /I third_party\vulkan\include test_vk_msaa.cpp /Fe:vk_msaa_arm64.exe
+          if errorlevel 1 exit /b 1
+      - name: Package Vulkan multisample evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path .\vk_msaa_arm64.exe).Path
+          $b = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($b, 0x3c)
+          $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+          if ($machine -ne 0xaa64) { throw 'Expected ARM64 PE' }
+          @'
+          vk_msaa_arm64.exe [icd_dll_path]
+
+          icd_dll_path defaults to C:\panvk\umd_c1\vulkan_virtio.dll (direct ICD load via
+          vk_icdGetInstanceProcAddr, no Vulkan loader). Console ARM64, no window, no
+          swapchain, 64x64 offscreen B8G8R8A8_UNORM, readback via HOST_VISIBLE buffer.
+
+          Items (fixed order):
+            msaa1_draw   single sampled control: green triangle over magenta clear
+            msaa4_draw   four samples, same geometry, resolved through the render pass
+            msaa4_clear  four samples, no draw: the clear must reach the resolve image
+
+          Interpretation: msaa1_draw must show ink or the run says nothing. When
+          msaa4_draw comes back untouched while msaa4_clear keeps the magenta, the
+          multisampled draw is being dropped below D3D11 and the single-sampled path
+          is fine. A fringe of intermediate green values on the diagonal in msaa4_draw
+          means coverage arrived and the resolve worked.
+
+          device_run=NOT_TESTED (verdict requires the target GPU; runner has no GPU)
+          '@ | Set-Content usage-vk-msaa.txt -Encoding utf8
+          '{0}  vk_msaa_arm64.exe' -f (Get-FileHash $exe -Algorithm SHA256).Hash |
+            Set-Content SHA256SUMS-vk-msaa.txt -Encoding ascii
+          Get-Content SHA256SUMS-vk-msaa.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk-msaa-arm64
+          path: |
+            vk_msaa_arm64.exe
+            usage-vk-msaa.txt
+            SHA256SUMS-vk-msaa.txt
           if-no-files-found: error
           retention-days: 30
       - name: Build offscreen text glyph probe (D3D11+D2D/DirectWrite, GDI)
