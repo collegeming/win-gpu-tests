@@ -4527,9 +4527,12 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
         return;
     }
 
-    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    // Magenta clear: a target that stays black means the render target view
+    // itself never took the clear, while magenta leaving only the triangle's
+    // half in place means the clear worked and the draw was lost.
+    const float clear_color[4] = {1.0f, 0.0f, 1.0f, 1.0f};
     g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-    g.context->ClearRenderTargetView(rtv.Get(), black);
+    g.context->ClearRenderTargetView(rtv.Get(), clear_color);
     D3D11_VIEWPORT vp{};
     vp.Width = static_cast<FLOAT>(kMsaaSize);
     vp.Height = static_cast<FLOAT>(kMsaaSize);
