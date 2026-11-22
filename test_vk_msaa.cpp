@@ -260,6 +260,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
     VkDeviceMemory bmem = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
 
+    std::printf("stage=%s begin samples=%d draw=%d\n", label, (int)samples, draw ? 1 : 0);
     do {
         // Multisampled colour attachment.
         VkImageCreateInfo ici{};
@@ -297,6 +298,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         if (!ok("vkBindImageMemory(msaa)", rt.BindImageMemory(dev, msaa_img, msaa_mem, 0)))
             break;
 
+        std::printf("stage=%s image_ok\n", label);
         VkImageViewCreateInfo vci{};
         vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vci.image = msaa_img;
@@ -364,6 +366,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
+        std::printf("stage=%s views_ok\n", label);
         VkRenderPassCreateInfo rpci{};
         rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         rpci.attachmentCount = 2;
@@ -409,6 +412,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
                 api.CreateShaderModule(dev, &smci, nullptr, &fs)))
             break;
 
+        std::printf("stage=%s framebuffer_ok\n", label);
         VkPipelineShaderStageCreateInfo stages[2]{};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -474,6 +478,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
                 api.CreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe)))
             break;
 
+        std::printf("stage=%s pipeline_ok\n", label);
         // Host visible readback buffer: W*H*4 bytes.
         const VkDeviceSize bytes = VkDeviceSize(W) * H * 4;
         VkBufferCreateInfo bci{};
@@ -514,6 +519,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
                 api.AllocateCommandBuffers(dev, &cbai, &cmd)))
             break;
 
+        std::printf("stage=%s resources_ok\n", label);
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -553,6 +559,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         if (!ok("vkEndCommandBuffer", api.EndCommandBuffer(cmd)))
             break;
 
+        std::printf("stage=%s recorded\n", label);
         VkFenceCreateInfo fci2{};
         fci2.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         if (!ok("vkCreateFence", api.CreateFence(dev, &fci2, nullptr, &fence)))
@@ -570,6 +577,7 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
             break;
         }
 
+        std::printf("stage=%s submitted\n", label);
         void *mapped = nullptr;
         if (!ok("vkMapMemory", api.MapMemory(dev, bmem, 0, bytes, 0, &mapped)))
             break;
@@ -645,6 +653,8 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
 }
 
 int main(int argc, char **argv) {
+    // Unbuffered: when the driver hangs we still want the stages we reached.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     const char *dll = "C:\\panvk\\umd_c1\\vulkan_virtio.dll";
     for (int i = 1; i < argc; ++i) {
         if (argv[i][0] != '-' && argv[i][0] != '\0')
