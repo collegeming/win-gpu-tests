@@ -4588,8 +4588,9 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
         }
     }
     // Two levels means the resolve came out hard; four or more means the fringe
-    // survived.
-    const bool multisampled = seen.size() >= 4;
+    // survived. A single-sample target has to show two levels, which is the
+    // control that the geometry covers the sampled area at all.
+    const bool multisampled = (samples == 1) ? (seen.size() >= 2) : (seen.size() >= 4);
     out("MODE=%s ITEM=%s samples=%d midrow=[%s] distinct=%zu min=%d max=%d"
         " expected_at_least=4 RESULT=%s reason=%s\n", path, label, samples, edge,
         seen.size(), min_v, max_v, multisampled ? "PASS" : "FAIL",
@@ -4632,11 +4633,14 @@ int run_msaa_aa(bool warp, bool debug_layer) {
     }
 
     const int failed_before = g_failures;
+    // 1 sample first: same geometry and shaders on a plain target. If this comes
+    // out black too, the multisample path was never the problem.
+    run_msaa_case(path, g, 1, vs.Get(), ps.Get());
     run_msaa_case(path, g, 2, vs.Get(), ps.Get());
     run_msaa_case(path, g, 4, vs.Get(), ps.Get());
     run_msaa_case(path, g, 8, vs.Get(), ps.Get());
     const int failed = g_failures - failed_before;
-    out("MODE=%s SUMMARY items=3 failed=%d\n", path, failed);
+    out("MODE=%s SUMMARY items=4 failed=%d\n", path, failed);
     return failed ? 2 : 0;
 }
 
