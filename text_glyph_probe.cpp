@@ -4464,10 +4464,13 @@ constexpr int kMsaaSize = 64;
 
 // Draws a single triangle whose hypotenuse crosses the target diagonally, at the
 // given sample count, resolves it and reports the colour spread along the edge.
-static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw,
+static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw, bool clear,
                           ID3D11VertexShader* vs, ID3D11PixelShader* ps) {
     char label[64];
-    _snprintf_s(label, sizeof(label), _TRUNCATE, draw ? "msaa%d" : "clear%d", samples);
+    // The label carries both flags, since a draw without a clear separates a lost
+    // draw from a lost deferred clear.
+    _snprintf_s(label, sizeof(label), _TRUNCATE, "%s%d%s", draw ? "msaa" : "clear",
+                samples, clear ? "" : "noclr");
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = kMsaaSize;
@@ -4534,7 +4537,7 @@ static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw,
     // half in place means the clear worked and the draw was lost.
     const float clear_color[4] = {1.0f, 0.0f, 1.0f, 1.0f};
     g.context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
-    g.context->ClearRenderTargetView(rtv.Get(), clear_color);
+    if (clear) g.context->ClearRenderTargetView(rtv.Get(), clear_color);
     D3D11_VIEWPORT vp{};
     vp.Width = static_cast<FLOAT>(kMsaaSize);
     vp.Height = static_cast<FLOAT>(kMsaaSize);
@@ -4653,11 +4656,12 @@ int run_msaa_aa(bool warp, bool debug_layer) {
     const int failed_before = g_failures;
     // 1 sample first: same geometry and shaders on a plain target. If this comes
     // out black too, the multisample path was never the problem.
-    run_msaa_case(path, g, 1, true, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 2, true, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 4, true, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 8, true, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 4, false, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 1, true, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 2, true, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 4, true, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 8, true, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 4, false, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 4, true, false, vs.Get(), ps.Get());
     const int failed = g_failures - failed_before;
     out("MODE=%s SUMMARY items=5 failed=%d\n", path, failed);
     return failed ? 2 : 0;
