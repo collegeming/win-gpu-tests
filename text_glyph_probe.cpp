@@ -4462,10 +4462,10 @@ constexpr int kMsaaSize = 64;
 
 // Draws a single triangle whose hypotenuse crosses the target diagonally, at the
 // given sample count, resolves it and reports the colour spread along the edge.
-static void run_msaa_case(const char* path, Gpu& g, int samples,
+static void run_msaa_case(const char* path, Gpu& g, int samples, bool draw,
                           ID3D11VertexShader* vs, ID3D11PixelShader* ps) {
     char label[64];
-    _snprintf_s(label, sizeof(label), _TRUNCATE, "msaa%d", samples);
+    _snprintf_s(label, sizeof(label), _TRUNCATE, draw ? "msaa%d" : "clear%d", samples);
 
     D3D11_TEXTURE2D_DESC td{};
     td.Width = kMsaaSize;
@@ -4544,7 +4544,7 @@ static void run_msaa_case(const char* path, Gpu& g, int samples,
     g.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.context->VSSetShader(vs, nullptr, 0);
     g.context->PSSetShader(ps, nullptr, 0);
-    g.context->Draw(3, 0);
+    if (draw) g.context->Draw(3, 0);
     g.context->OMSetRenderTargets(0, nullptr, nullptr);
     g.context->ResolveSubresource(resolved.Get(), 0, msaa.Get(), 0,
                                   DXGI_FORMAT_B8G8R8A8_UNORM);
@@ -4645,12 +4645,13 @@ int run_msaa_aa(bool warp, bool debug_layer) {
     const int failed_before = g_failures;
     // 1 sample first: same geometry and shaders on a plain target. If this comes
     // out black too, the multisample path was never the problem.
-    run_msaa_case(path, g, 1, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 2, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 4, vs.Get(), ps.Get());
-    run_msaa_case(path, g, 8, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 1, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 2, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 4, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 8, true, vs.Get(), ps.Get());
+    run_msaa_case(path, g, 4, false, vs.Get(), ps.Get());
     const int failed = g_failures - failed_before;
-    out("MODE=%s SUMMARY items=4 failed=%d\n", path, failed);
+    out("MODE=%s SUMMARY items=5 failed=%d\n", path, failed);
     return failed ? 2 : 0;
 }
 
