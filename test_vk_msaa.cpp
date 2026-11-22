@@ -554,8 +554,11 @@ static bool run_case(const char *label, VkSampleCountFlagBits samples, bool draw
         rbi.clearValueCount = 1;
         rbi.pClearValues = &clear;
         rt.CmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        std::printf("stage=%s rp_begun\n", label);
         if (draw) {
+            std::printf("stage=%s cmd_draw_enter\n", label);
             rt.CmdDraw(cmd, 3, 1, 0, 0);
+            std::printf("stage=%s cmd_draw_returned\n", label);
         }
         std::printf("stage=%s draw_ok\n", label);
         rt.CmdEndRenderPass(cmd);
